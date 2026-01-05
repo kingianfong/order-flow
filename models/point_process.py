@@ -30,15 +30,20 @@ def load_data(sym: str) -> pl.DataFrame:
             pl.col('date') >= datetime.date(2025, 12, 1),
         )
         .select('time', count=pl.col('total_count'))
-        .with_columns(elapsed=pl.col('time').diff().cast(pl.Duration('ns')))
-        .filter(pl.col('elapsed').is_not_null())
         .with_columns(
+            duration_precise=pl.col('time').diff().cast(pl.Duration('ns')),
+        )
+        .with_columns(
+            duration=(
+                pl.col('duration_precise')
+                .cast(float) * 1e-6  # milliseconds
+            ),
             hour=(
                 pl.col('time')
                 - pl.col('time').dt.truncate('1d')
             ).dt.total_hours(fractional=True),
-            duration=pl.col('elapsed').cast(float) * 1e-6,  # milliseconds
         )
+        .filter(pl.col('duration').is_not_null())
         .collect()
     )
     assert (df['count'] > 0).all()
@@ -117,6 +122,7 @@ class RbfRateParams(NamedTuple):
     rbf_weights: Array
 
 
+@jax.jit
 def calc_log_rate_rbf(params: RbfRateParams, time_of_day: Array) -> Array:
     n_hours = 24
     centers = jnp.linspace(0, n_hours, N_CENTERS, endpoint=False)
@@ -143,7 +149,9 @@ def plot_rbf_rate(params: RbfRateParams) -> None:
 
     plt.plot(time_of_day, rates)
     plt.axhline(baseline_rate, label=f'{baseline_rate=:.6f}',
-                c='k', alpha=0.6, linestyle='--')
+                c='g', alpha=0.4, linestyle='-')
+    plt.axvline(0, c='k', alpha=0.2, linestyle='--')
+    plt.axvline(24, c='k', alpha=0.2, linestyle='--')
     plt.legend(loc='upper left')
     plt.show()
 
@@ -194,6 +202,120 @@ rbf_rate = jnp.exp(rbf_log_rate)
 # %%
 
 
+def logit(y) -> Array:
+    return jnp.log(y) - jnp.log1p(-y)
+
+
+# exponential decay kernel for now
+class HawkesParams(NamedTuple):
+    base_log_rate: float
+    logit_norm: float = logit(jnp.array(0.85)).item()
+    log_omega: float = -jnp.log(30 * 1_000).item()
+
+
+class HawkesOutputs(NamedTuple):
+    decay_factors: Array
+    decayed_counts: Array
+    rates: Array
+
+
+@jax.jit
+def calc_hawkes(params: HawkesParams, dataset: Dataset) -> HawkesOutputs:
+    base_rate = jnp.exp(params.base_log_rate)
+    norm = jax.nn.sigmoid(params.logit_norm)
+    omega = jnp.exp(params.log_omega)
+    decay_factors = jnp.exp(-omega * dataset.durations)
+
+    def step(carry, x):
+        decayed_counts = carry
+        count, decay_factor = x
+        decayed_counts *= decay_factor
+        decayed_counts += count
+        return decayed_counts, decayed_counts
+
+    _, decayed_counts = jax.lax.scan(step, 0, (dataset.counts, decay_factors))
+    rates = base_rate + norm * omega * decayed_counts
+
+    return HawkesOutputs(
+        decay_factors=decay_factors,
+        decayed_counts=decayed_counts,
+        rates=rates,
+    )
+
+
+def plot_hawkes_rate(params: HawkesParams,
+                     dataset: Dataset,
+                     input_df: pl.DataFrame) -> None:
+    outputs = calc_hawkes(params, dataset)
+    display(params)
+
+    base_rate = jnp.exp(params.base_log_rate).item()
+    norm = jax.nn.sigmoid(params.logit_norm).item()
+    omega = jnp.exp(params.log_omega).item()
+
+    print(f'{base_rate=}, {norm=}, {omega=}')
+    df = (
+        input_df
+        .with_columns(
+            decay_factors=np.asarray(outputs.decay_factors),
+            decayed_counts=np.asarray(outputs.decayed_counts),
+            rates=np.asarray(outputs.rates),
+
+        )
+    )
+    display(df)
+    subset = (
+        df
+        .filter(
+            pl.col('time') >= datetime.datetime(2025, 12, 12, hour=12),
+            pl.col('time') <= datetime.datetime(2025, 12, 13),
+        )
+    )
+    _, (ax1, ax2) = plt.subplots(2, 1, sharex=True)
+    ax1.scatter(subset['time'], subset[['count']], alpha=0.05, marker='.')
+    ax2.plot(subset['time'], subset[['rates']])
+    plt.tight_layout()
+    plt.show()
+
+
+init_hawkes_params = HawkesParams(
+    base_log_rate=float(jnp.log(constant_rate)),
+)
+
+
+plot_hawkes_rate(init_hawkes_params, DATASET, INPUT_DF)
+
+
+# %%
+
+
+flat_hawkes_params, unflatten_hawkes_params = ravel_pytree(init_hawkes_params)
+
+
+def hawkes_loss(flat_params: Array,
+                unflatten_fn: Callable,
+                dataset: Dataset):
+    hawkes_params = unflatten_fn(flat_params)
+    output = calc_hawkes(hawkes_params, dataset)
+    return -calc_loglik(output.rates, dataset).mean()
+
+
+hawkes_optim_result = minimize(
+    hawkes_loss,
+    flat_hawkes_params,
+    args=(unflatten_hawkes_params, DATASET),
+    method='BFGS',
+)
+
+
+hawkes_optim_params = unflatten_hawkes_params(hawkes_optim_result.x)
+hawkes_outputs = calc_hawkes(hawkes_optim_params, DATASET)
+plot_hawkes_rate(hawkes_optim_params, DATASET, INPUT_DF)
+
+
+# %%
+
+
 result_df = (
     INPUT_DF
     .with_columns(
@@ -204,6 +326,9 @@ result_df = (
         rbf_loglik=np.asarray(
             calc_loglik(rbf_rate, DATASET),
         ),
+        hawkes_loglik=np.asarray(
+            calc_loglik(hawkes_outputs.rates, DATASET),
+        ),
     )
     .group_by('time', maintain_order=True)
     .sum()
@@ -211,6 +336,10 @@ result_df = (
         rbf_improvement=(
             pl.col('rbf_loglik')
             - pl.col('constant_loglik')
+        ),
+        hawkes_improvement=(
+            pl.col('hawkes_loglik')
+            - pl.col('rbf_loglik')
         ),
     )
 )
@@ -231,7 +360,7 @@ result_df.select(pl.selectors.ends_with('_loglik').sum())
 (
     result_df
     .group_by(pl.col('time').dt.time().alias('time')).sum()
-    .sort('rbf_improvement')
+    .sort('hawkes_improvement')
 )
 
 
@@ -242,7 +371,7 @@ result_df.select(pl.selectors.ends_with('_loglik').sum())
     result_df
     .to_pandas()
     .set_index('time')
-    [['constant_loglik', 'rbf_loglik']]
+    [['constant_loglik', 'rbf_loglik', 'hawkes_loglik']]
     .plot(alpha=0.6)
 )
 plt.show()
