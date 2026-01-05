@@ -1,0 +1,8 @@
+*
+
+!.gitignore
+!LICENSE
+!environment.yml
+
+!scripts
+!scripts/**
