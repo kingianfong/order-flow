@@ -117,55 +117,65 @@ print(f'{closed_form_rate=:.8f}, {constant_rate=:.8f}')
 # %%
 
 
-N_CENTERS = 24  # arbitrary
+class RbfConstants:
+    n_centers: int = 24
+    n_hours: int = 24
+    centers: Array = jnp.linspace(0, n_centers, n_hours, endpoint=False)
+
+    width_factor: float = 0.5
+    sigma = width_factor * n_hours / n_centers
+    inv_sigma_sq = 1.0 / (sigma**2)
+
+    l2_reg: float = 2.0
 
 
 class RbfRateParams(NamedTuple):
     log_base_rate: float
-    rbf_weights: Array
+    # weights: Array = 0.05 * jnp.sin(jnp.arange(RbfConstants.n_centers))
+    weights: Array = 0.1 * jnp.ones(RbfConstants.n_centers)
 
 
 @jax.jit
-def calc_log_rate_rbf(params: RbfRateParams, time_of_day: Array) -> Array:
-    n_hours = 24
-    centers = jnp.linspace(0, n_hours, N_CENTERS, endpoint=False)
-
-    sigma = n_hours / N_CENTERS
-    inv_sigma_sq = 1.0 / (sigma**2)
-
-    dist = jnp.abs(time_of_day[:, None] - centers[None, :])
-    dist = jnp.where(dist > n_hours / 2, 24 - dist, dist)
-
-    exponent = -0.5 * (dist**2) * inv_sigma_sq
+def calc_rbf_rate_log_factor(weights: Array, time_of_day: Array) -> Array:
+    dist = jnp.abs(time_of_day[:, None] - RbfConstants.centers[None, :])
+    dist = jnp.where(dist > RbfConstants.n_hours / 2, 24 - dist, dist)
+    exponent = -0.5 * (dist**2) * RbfConstants.inv_sigma_sq
     basis = jnp.exp(exponent)
+    log_factor = basis @ weights
+    return log_factor
 
-    log_rate = basis @ params.rbf_weights + params.log_base_rate
-    return log_rate
 
-
-def plot_rbf_rate(params: RbfRateParams) -> None:
+def plot_rbf_rate(log_base_rate: float, weights: Array) -> None:
     time_of_day = jnp.linspace(-2, 26, 500, endpoint=False)
-    log_rates = calc_log_rate_rbf(params, time_of_day=time_of_day)
+    log_factor = calc_rbf_rate_log_factor(weights, time_of_day)
+    base_rate = jnp.exp(log_base_rate).item()
+    rate = jnp.exp(log_base_rate + log_factor)
 
-    baseline_rate = jnp.exp(params.log_base_rate).item()
-    rates = jnp.exp(log_rates)
+    f, (ax1, ax2) = plt.subplots(2, 1, sharex=True)
 
-    plt.plot(time_of_day, rates)
-    plt.axhline(baseline_rate, label=f'{baseline_rate=:.6f}',
+    ax1.plot(time_of_day, rate)
+    ax1.axhline(base_rate, label=f'{base_rate=:.6f}',
                 c='g', alpha=0.4, linestyle='-')
-    plt.axvline(0, c='k', alpha=0.2, linestyle='--')
-    plt.axvline(24, c='k', alpha=0.2, linestyle='--')
-    plt.legend(loc='upper left')
+    ax1.axvline(0, c='k', alpha=0.2, linestyle='--')
+    ax1.axvline(24, c='k', alpha=0.2, linestyle='--')
+    ax1.legend(loc='upper left')
+
+    for ctr, weight in zip(RbfConstants.centers, weights, strict=True):
+        dist = jnp.abs(time_of_day[:, None] - ctr)
+        dist = jnp.where(dist > RbfConstants.n_hours / 2, 24 - dist, dist)
+        exponent = -0.5 * (dist**2) * RbfConstants.inv_sigma_sq
+        basis = jnp.exp(exponent)
+        ax2.plot(time_of_day, weight * basis)
+
     plt.show()
 
 
 init_rbf_params = RbfRateParams(
     log_base_rate=float(jnp.log(constant_rate)),
-    rbf_weights=0.05 * jnp.sin(jnp.arange(N_CENTERS)),
 )
 
 
-plot_rbf_rate(init_rbf_params)
+plot_rbf_rate(init_rbf_params.log_base_rate, init_rbf_params.weights)
 
 
 # %%
@@ -174,32 +184,36 @@ plot_rbf_rate(init_rbf_params)
 flat_rbf_params, unflatten_rbf_params = ravel_pytree(init_rbf_params)
 
 
+@jax.jit
 def rbf_rate_loss(flat_params: Array,
-                  unflatten_fn: Callable,
                   dataset: Dataset):
-    rbf_params = unflatten_fn(flat_params)
-    log_rate = calc_log_rate_rbf(rbf_params, dataset.time_of_day)
-    rate = jnp.exp(log_rate)
-    return -calc_loglik(rate, dataset).mean()
+    rbf_params: RbfRateParams = unflatten_rbf_params(flat_params)
+    log_rate_factor = calc_rbf_rate_log_factor(
+        rbf_params.weights,
+        dataset.time_of_day
+    )
+    rate = jnp.exp(rbf_params.log_base_rate + log_rate_factor)
+    nll = -calc_loglik(rate, dataset).mean()
+    norm = jax.numpy.linalg.norm(rbf_params.weights)
+    reg_penalty = norm / (RbfConstants.n_centers * RbfConstants.l2_reg)
+    return nll + reg_penalty
 
 
 rbf_optim_result = minimize(
     rbf_rate_loss,
     flat_rbf_params,
-    args=(unflatten_rbf_params, DATASET),
+    args=(DATASET,),
     method='BFGS',
 )
 
 
 rbf_optim_params = unflatten_rbf_params(rbf_optim_result.x)
-plot_rbf_rate(rbf_optim_params)
+plot_rbf_rate(rbf_optim_params.log_base_rate, rbf_optim_params.weights)
 
 
-# %%
-
-
-rbf_log_rate = calc_log_rate_rbf(rbf_optim_params, DATASET.time_of_day)
-rbf_rate = jnp.exp(rbf_log_rate)
+rbf_log_rate_factor = calc_rbf_rate_log_factor(
+    rbf_optim_params.weights, DATASET.time_of_day)
+rbf_rate = jnp.exp(rbf_optim_params.log_base_rate + rbf_log_rate_factor)
 
 
 # %%
@@ -223,6 +237,7 @@ class HawkesOutputs(NamedTuple):
     rate: Array  # includes events[t]
 
 
+@jax.jit
 def calc_hawkes(params: HawkesParams, dataset: Dataset) -> HawkesOutputs:
     base_rate = jnp.exp(params.log_base_rates)
     norm = jax.nn.sigmoid(params.logit_norm)
@@ -307,10 +322,9 @@ plot_hawkes_rate(init_hawkes_params, DATASET, INPUT_DF)
 flat_hawkes_params, unflatten_hawkes_params = ravel_pytree(init_hawkes_params)
 
 
-def hawkes_loss(flat_params: Array,
-                unflatten_fn: Callable,
-                dataset: Dataset):
-    hawkes_params = unflatten_fn(flat_params)
+@jax.jit
+def hawkes_loss(flat_params: Array, dataset: Dataset):
+    hawkes_params = unflatten_hawkes_params(flat_params)
     output = calc_hawkes(hawkes_params, dataset)
     return -output.loglik.mean()
 
@@ -318,7 +332,7 @@ def hawkes_loss(flat_params: Array,
 hawkes_optim_result = minimize(
     hawkes_loss,
     flat_hawkes_params,
-    args=(unflatten_hawkes_params, DATASET),
+    args=(DATASET,),
     method='BFGS',
 )
 
@@ -335,12 +349,8 @@ result_df = (
     INPUT_DF
     .with_columns(
         pl.col('time').dt.truncate('30m'),
-        constant_loglik=np.asarray(
-            calc_loglik(constant_rate, DATASET),
-        ),
-        rbf_loglik=np.asarray(
-            calc_loglik(rbf_rate, DATASET),
-        ),
+        constant_loglik=np.asarray(calc_loglik(constant_rate, DATASET)),
+        rbf_loglik=np.asarray(calc_loglik(rbf_rate, DATASET)),
         hawkes_loglik=np.asarray(hawkes_outputs.loglik),
     )
     .group_by('time', maintain_order=True)
