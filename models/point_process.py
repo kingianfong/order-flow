@@ -121,7 +121,7 @@ N_CENTERS = 24  # arbitrary
 
 
 class RbfRateParams(NamedTuple):
-    base_log_rate: float
+    log_base_rate: float
     rbf_weights: Array
 
 
@@ -139,7 +139,7 @@ def calc_log_rate_rbf(params: RbfRateParams, time_of_day: Array) -> Array:
     exponent = -0.5 * (dist**2) * inv_sigma_sq
     basis = jnp.exp(exponent)
 
-    log_rate = basis @ params.rbf_weights + params.base_log_rate
+    log_rate = basis @ params.rbf_weights + params.log_base_rate
     return log_rate
 
 
@@ -147,7 +147,7 @@ def plot_rbf_rate(params: RbfRateParams) -> None:
     time_of_day = jnp.linspace(-2, 26, 500, endpoint=False)
     log_rates = calc_log_rate_rbf(params, time_of_day=time_of_day)
 
-    baseline_rate = jnp.exp(params.base_log_rate).item()
+    baseline_rate = jnp.exp(params.log_base_rate).item()
     rates = jnp.exp(log_rates)
 
     plt.plot(time_of_day, rates)
@@ -160,7 +160,7 @@ def plot_rbf_rate(params: RbfRateParams) -> None:
 
 
 init_rbf_params = RbfRateParams(
-    base_log_rate=float(jnp.log(constant_rate)),
+    log_base_rate=float(jnp.log(constant_rate)),
     rbf_weights=0.05 * jnp.sin(jnp.arange(N_CENTERS)),
 )
 
@@ -211,7 +211,7 @@ def logit(y) -> Array:
 
 # exponential decay kernel for now
 class HawkesParams(NamedTuple):
-    base_log_rate: float
+    log_base_rates: float
     logit_norm: float = logit(jnp.array(0.85)).item()
     log_omega: float = -jnp.log(30 * 1_000).item()
 
@@ -224,7 +224,7 @@ class HawkesOutputs(NamedTuple):
 
 
 def calc_hawkes(params: HawkesParams, dataset: Dataset) -> HawkesOutputs:
-    base_rate = jnp.exp(params.base_log_rate)
+    base_rate = jnp.exp(params.log_base_rates)
     norm = jax.nn.sigmoid(params.logit_norm)
     omega = jnp.exp(params.log_omega)
 
@@ -232,11 +232,11 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> HawkesOutputs:
 
     def step(carry, x):
         decayed_count = carry
-        count, duration, decay_factor = x
+        count, elapsed, decay_factor = x
 
         decayed_count *= decay_factor
         loglik_rate = base_rate + norm * omega * decayed_count
-        loglik = poisson.logpmf(k=count, mu=loglik_rate * duration)
+        loglik = poisson.logpmf(k=count, mu=loglik_rate * elapsed)
 
         # assume all trades happen at the same time because they happen at
         # the same millisecond (timestamp resolution)
@@ -263,7 +263,7 @@ def plot_hawkes_rate(params: HawkesParams,
     outputs = calc_hawkes(params, dataset)
     display(params)
 
-    base_rate = jnp.exp(params.base_log_rate).item()
+    base_rate = jnp.exp(params.log_base_rates).item()
     norm = jax.nn.sigmoid(params.logit_norm).item()
     omega = jnp.exp(params.log_omega).item()
 
@@ -294,7 +294,7 @@ def plot_hawkes_rate(params: HawkesParams,
 
 
 init_hawkes_params = HawkesParams(
-    base_log_rate=float(jnp.log(constant_rate)),
+    log_base_rates=float(jnp.log(constant_rate)),
 )
 
 
