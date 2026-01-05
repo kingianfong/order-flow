@@ -2,7 +2,7 @@
 
 
 from pathlib import Path
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 import datetime
 
 from jax import Array
@@ -22,87 +22,98 @@ DATA_DIR = Path(__file__).parent.parent / 'data/preprocessed'
 # %%
 
 
-SYM = 'BTCUSDT'
-
-df = (
-    pl.scan_parquet(DATA_DIR)
-    .filter(
-        pl.col('sym') == pl.lit(SYM),
-        pl.col('date') >= datetime.date(2025, 12, 1),
+def load_data(sym: str) -> pl.DataFrame:
+    df = (
+        pl.scan_parquet(DATA_DIR)
+        .filter(
+            pl.col('sym') == pl.lit(sym),
+            pl.col('date') >= datetime.date(2025, 12, 1),
+        )
+        .select('time', count=pl.col('total_count'))
+        .with_columns(elapsed=pl.col('time').diff().cast(pl.Duration('ns')))
+        .filter(pl.col('elapsed').is_not_null())
+        .with_columns(
+            hour=(
+                pl.col('time')
+                - pl.col('time').dt.truncate('1d')
+            ).dt.total_hours(fractional=True),
+            duration=pl.col('elapsed').cast(float) * 1e-6,  # milliseconds
+        )
+        .collect()
     )
-    .select('time', count=pl.col('total_count'))
-    .with_columns(elapsed=pl.col('time').diff().cast(pl.Duration('ns')))
-    .filter(pl.col('elapsed').is_not_null())
-    .with_columns(
-        hour=(pl.col('time')
-              - pl.col('time').dt.truncate('1d')
-              ).dt.total_hours(fractional=True),
-        duration=pl.col('elapsed').cast(float) * 1e-6,
-    )
-    .collect()
-)
+    assert (df['count'] > 0).all()
+    assert (df['duration'] > 0).all()
+    assert (df['hour'] >= 0).all()
+    assert df['time'].is_sorted()
+    return df
 
-assert (df['count'] > 0).all()
-assert (df['duration'] > 0).all()
-assert (df['hour'] >= 0).all()
-assert df['time'].is_sorted()
 
-df
+INPUT_DF = load_data('BTCUSDT')
+INPUT_DF
 
 
 # %%
 
 
-count = df['count'].to_jax()
-duration = df['duration'].to_jax()
-hour = df['hour'].to_jax()
-closed_form_rate = count.sum() / duration.sum()
+class Dataset(NamedTuple):
+    counts: Array
+    durations: Array
+    times_of_day: Array
+
+
+DATASET = Dataset(
+    counts=INPUT_DF['count'].to_jax(),
+    durations=INPUT_DF['duration'].to_jax(),
+    times_of_day=INPUT_DF['hour'].to_jax(),
+)
+
+
+# %%
+
+
+closed_form_rate = DATASET.counts.sum() / DATASET.durations.sum()
 closed_form_rate
 
 
 # %%
 
 
-def calc_loglik(rate: ArrayLike, duration: Array, count: Array) -> Array:
-    return jax.scipy.stats.poisson.logpmf(k=count, mu=rate*duration)
+def calc_loglik(rate: ArrayLike, dataset: Dataset) -> Array:
+    return jax.scipy.stats.poisson.logpmf(
+        k=dataset.counts,
+        mu=rate*dataset.durations,
+    )
 
 
-def obj_fn(params, duration: Array, count: Array):
+def constant_rate_loss(params: Array, dataset: Dataset):
     log_rate, = params
     rate = jnp.exp(log_rate)
-    return -calc_loglik(rate, duration, count).mean()
+    return -calc_loglik(rate, dataset).mean()
 
 
-initial_guess = jnp.array([jnp.log(closed_form_rate + 1e-1)])
+init_constant_rate_guess = jnp.array([jnp.log(closed_form_rate + 1e-1)])
 
 
-rbf_optim_result = minimize(
-    obj_fn,
-    initial_guess,
-    args=(duration, count),
+constant_optim_result = minimize(
+    constant_rate_loss,
+    init_constant_rate_guess,
+    args=(DATASET,),
     method='BFGS',
-    tol=1e-7,
 )
 
-rbf_optim_result
+
+constant_rate = jnp.exp(constant_optim_result.x[0])
+print(f'{closed_form_rate=:.8f}, {constant_rate=:.8f}')
 
 
 # %%
 
 
-optimised_rate = float(jnp.exp(rbf_optim_result.x[0]))
-optim_diff = float(optimised_rate - closed_form_rate)
-
-print(f'{closed_form_rate=:.8f}, {optimised_rate=:.8f}, {optim_diff=}')
-
-
-# %%
-
-
-N_CENTERS = 12  # arbitrary
+N_CENTERS = 24  # arbitrary
 
 
 class RbfRateParams(NamedTuple):
+    base_log_rate: float
     rbf_weights: Array
 
 
@@ -119,78 +130,88 @@ def calc_log_rate_rbf(params: RbfRateParams, time_of_day: Array) -> Array:
     exponent = -0.5 * (dist**2) * inv_sigma_sq
     basis = jnp.exp(exponent)
 
-    log_rate = basis @ params.rbf_weights
+    log_rate = basis @ params.rbf_weights + params.base_log_rate
     return log_rate
 
 
 def plot_rbf_rate(params: RbfRateParams) -> None:
-    time_of_day = jnp.linspace(0, 24, 200, endpoint=False)
+    time_of_day = jnp.linspace(-2, 26, 500, endpoint=False)
     log_rates = calc_log_rate_rbf(params, time_of_day=time_of_day)
+
+    baseline_rate = jnp.exp(params.base_log_rate).item()
     rates = jnp.exp(log_rates)
+
     plt.plot(time_of_day, rates)
+    plt.axhline(baseline_rate, label=f'{baseline_rate=:.6f}',
+                c='k', alpha=0.6, linestyle='--')
+    plt.legend(loc='upper left')
     plt.show()
 
 
-initial_rbf_params = RbfRateParams(
+init_rbf_params = RbfRateParams(
+    base_log_rate=float(jnp.log(constant_rate)),
     rbf_weights=jnp.sin(jnp.arange(N_CENTERS)),
 )
 
 
-plot_rbf_rate(initial_rbf_params)
+plot_rbf_rate(init_rbf_params)
 
 
 # %%
 
 
-flat_params, unflatten_fn = ravel_pytree(initial_rbf_params)
+flat_rbf_params, unflatten_rbf_params = ravel_pytree(init_rbf_params)
 
 
-def rbf_obj_fn(flat_params: Array, unflatten_fn, duration: Array, count: Array, time_of_day: Array):
+def rbf_rate_loss(flat_params: Array,
+                  unflatten_fn: Callable,
+                  dataset: Dataset):
     rbf_params = unflatten_fn(flat_params)
-    log_rate = calc_log_rate_rbf(rbf_params, time_of_day)
+    log_rate = calc_log_rate_rbf(rbf_params, dataset.times_of_day)
     rate = jnp.exp(log_rate)
-    return -calc_loglik(rate, duration, count).mean()
+    return -calc_loglik(rate, dataset).mean()
 
 
 rbf_optim_result = minimize(
-    rbf_obj_fn,
-    flat_params,
-    args=(unflatten_fn, duration, count, hour),
+    rbf_rate_loss,
+    flat_rbf_params,
+    args=(unflatten_rbf_params, DATASET),
     method='BFGS',
-    tol=1e-7,
 )
 
 
-rbf_optim_params = unflatten_fn(rbf_optim_result.x)
+rbf_optim_params = unflatten_rbf_params(rbf_optim_result.x)
 plot_rbf_rate(rbf_optim_params)
 
 
 # %%
 
 
-log_rate_rbf = calc_log_rate_rbf(rbf_optim_params, hour)
-rate_rbf = jnp.exp(log_rate_rbf)
+rbf_log_rate = calc_log_rate_rbf(rbf_optim_params, DATASET.times_of_day)
+rbf_rate = jnp.exp(rbf_log_rate)
 
 
 # %%
 
 
 result_df = (
-    df
+    INPUT_DF
     .with_columns(
         pl.col('time').dt.truncate('30m'),
-        constant_rate_loglik=np.asarray(
-            calc_loglik(optimised_rate, duration, count),
+        constant_loglik=np.asarray(
+            calc_loglik(constant_rate, DATASET),
         ),
-        rbf_rate_loglik=np.asarray(
-            calc_loglik(rate_rbf, duration, count),
-        )
+        rbf_loglik=np.asarray(
+            calc_loglik(rbf_rate, DATASET),
+        ),
     )
     .group_by('time', maintain_order=True)
     .sum()
     .with_columns(
-        rbf_improvement=pl.col('rbf_rate_loglik') -
-        pl.col('constant_rate_loglik'),
+        rbf_improvement=(
+            pl.col('rbf_loglik')
+            - pl.col('constant_loglik')
+        ),
     )
 )
 
@@ -201,10 +222,16 @@ result_df
 # %%
 
 
+result_df.select(pl.selectors.ends_with('_loglik').sum())
+
+
+# %%
+
+
 (
     result_df
     .group_by(pl.col('time').dt.time().alias('time')).sum()
-    .sort('constant_rate_loglik')
+    .sort('rbf_improvement')
 )
 
 
@@ -215,9 +242,10 @@ result_df
     result_df
     .to_pandas()
     .set_index('time')
-    [['constant_rate_loglik', 'rbf_rate_loglik']]
+    [['constant_loglik', 'rbf_loglik']]
     .plot(alpha=0.6)
 )
 plt.show()
+
 
 # %%
