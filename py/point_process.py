@@ -225,8 +225,6 @@ class HawkesParams(NamedTuple):
 
 
 class HawkesOutputs(NamedTuple):
-    decay_factor: Array
-    decayed_count: Array
     loglik: Array  # excludes events[t]
     rate: Array  # includes events[t]
 
@@ -249,15 +247,12 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> HawkesOutputs:
 
         decayed_count += count
         forecast_rate = base_rate + norm * omega * decayed_count
-        return decayed_count, (decayed_count, loglik, forecast_rate)
+        return decayed_count, (loglik, forecast_rate)
 
     xs = dataset.curr_count, dataset.elapsed, decay_factors
-    _, y = jax.lax.scan(step, 0, xs)
-    decayed_count, loglik, rate = y
+    _, (loglik, rate) = jax.lax.scan(step, 0, xs)
 
     return HawkesOutputs(
-        decay_factor=decay_factors,
-        decayed_count=decayed_count,
         loglik=loglik,
         rate=rate,
     )
@@ -277,8 +272,6 @@ def plot_hawkes_rate(params: HawkesParams,
     df = (
         input_df
         .with_columns(
-            decay_factor=np.asarray(outputs.decay_factor),
-            decayed_count=np.asarray(outputs.decayed_count),
             loglik=np.asarray(outputs.loglik),
             rate=np.asarray(outputs.rate),
         )
@@ -346,9 +339,6 @@ class RbfHawkesParams(NamedTuple):
 
 
 class RbfHawkesOutputs(NamedTuple):
-    base_rate: Array  # from rbf
-    decay_factor: Array
-    decayed_count: Array
     loglik: Array  # excludes events[t]
     rate: Array  # includes events[t]
 
@@ -373,16 +363,12 @@ def calc_rbf_hawkes(params: RbfHawkesParams,
 
         decayed_count += count
         forecast_rate = base_rate + norm * omega * decayed_count
-        return decayed_count, (decayed_count, loglik, forecast_rate)
+        return decayed_count, (loglik, forecast_rate)
 
     xs = base_rate, dataset.curr_count, dataset.elapsed, decay_factors
-    _, y = jax.lax.scan(step, 0, xs)
-    decayed_count, loglik, rate = y
+    _, (loglik, rate) = jax.lax.scan(step, 0, xs)
 
     return RbfHawkesOutputs(
-        base_rate=base_rate,
-        decay_factor=decay_factors,
-        decayed_count=decayed_count,
         loglik=loglik,
         rate=rate,
     )
@@ -401,8 +387,6 @@ def plot_rbf_hawkes(params: RbfHawkesParams,
     df = (
         input_df
         .with_columns(
-            decay_factor=np.asarray(outputs.decay_factor),
-            decayed_count=np.asarray(outputs.decayed_count),
             loglik=np.asarray(outputs.loglik),
             rate=np.asarray(outputs.rate),
         )
