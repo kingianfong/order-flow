@@ -531,31 +531,36 @@ def plot_kernel_power_law():
     min_t = 1e-3
     max_t = 1e5
     t_geom = jnp.geomspace(min_t, max_t, n)
-
-    omega = 0.1
-    beta = 0.2  # The 'beta' in the kernel definition
     max_history_duration = 1e5
     n_exponentials = 8
 
-    kernel_params = kernel_power_law_params(
-        omega=omega,
-        beta=beta,
-        max_history_duration=max_history_duration,
-        n_exponentials=n_exponentials,
-    )
+    omegas = 100, 1.0, 0.01
+    betas = 0.1, 0.2, 0.3  # The 'beta' in the kernel definition
 
-    exact = kernel_power_law(t_geom, omega=omega, beta=beta)
-    _, approx = approx_iterative(t_geom, kernel_params)
+    f, axes = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
+    f.suptitle('Hawkes Power-Law Kernel (Lomax) Approximation')
 
-    plt.figure(figsize=(8, 5))
-    plt.loglog(t_geom, exact, 'k-', label='Exact Lomax Kernel', lw=2)
-    plt.loglog(t_geom, approx, 'r--', label='SOE Approximation', lw=2)
-    plt.title(
-        f"Hawkes Power-Law Kernel (Lomax) Approximation\n$\\omega={omega}, \\beta={beta}$")
-    plt.xlabel("Time (t)")
-    plt.ylabel("Kernel Value $k(t)$")
-    plt.legend()
-    plt.grid(True, which="both", ls="-", alpha=0.2)
+    for omega, row in zip(omegas, axes):
+        for beta, ax in zip(betas, row):
+
+            kernel_params = kernel_power_law_params(
+                omega=omega,
+                beta=beta,
+                max_history_duration=max_history_duration,
+                n_exponentials=n_exponentials,
+            )
+
+            exact = kernel_power_law(t_geom, omega=omega, beta=beta)
+            _, approx = approx_iterative(t_geom, kernel_params)
+
+            ax.loglog(t_geom, exact, 'k-', label='Exact Lomax Kernel', lw=2)
+            ax.loglog(t_geom, approx, 'r--', label='SOE Approximation', lw=2)
+            ax.set_title(f"$\\omega={omega}, \\beta={beta}$")
+            ax.grid(True, which="both", ls="-", alpha=0.2)
+            # ax.set_xlabel("Time (t)")
+            # ax.set_ylabel("Kernel Value $k(t)$")
+            # ax.legend()
+    plt.tight_layout()
     plt.show()
 
 
