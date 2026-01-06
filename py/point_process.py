@@ -230,7 +230,7 @@ class HawkesOutputs(NamedTuple):
 
 
 @jax.jit
-def calc_hawkes(params: HawkesParams, dataset: Dataset) -> HawkesOutputs:
+def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> HawkesOutputs:
     base_rate = jnp.exp(params.log_base_rate)
     norm = jax.nn.sigmoid(params.logit_norm)
     omega = jnp.exp(params.log_omega)
@@ -260,10 +260,46 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> HawkesOutputs:
     )
 
 
+@jax.jit
+def calc_hawkes(params: HawkesParams, dataset: Dataset) -> HawkesOutputs:
+    base_rate = jnp.exp(params.log_base_rate)
+    norm = jax.nn.sigmoid(params.logit_norm)
+    omega = jnp.exp(params.log_omega)
+
+    decay_factors = jnp.exp(-omega * dataset.elapsed)
+
+    def step(carry, x):
+        decayed_count = carry
+        count, decay_factor = x
+        decayed_count *= decay_factor
+        decayed_count += count
+        return decayed_count, decayed_count
+
+    xs = dataset.curr_count, decay_factors
+    _, (decayed_count) = jax.lax.scan(step, 0, xs)
+
+    decayed_before_count = decayed_count - dataset.curr_count
+    loglik_rate = base_rate + norm * omega * decayed_before_count
+    forecast_rate = base_rate + norm * omega * decayed_count
+
+    loglik = poisson.logpmf(k=dataset.curr_count,
+                            mu=loglik_rate * dataset.elapsed)
+
+    return HawkesOutputs(
+        loglik=loglik,
+        rate=forecast_rate,
+    )
+
+
 def plot_hawkes_rate(params: HawkesParams,
                      dataset: Dataset,
                      input_df: pl.DataFrame) -> None:
+    baseline_outputs = calc_hawkes_baseline(params, dataset)
+
     outputs = calc_hawkes(params, dataset)
+    assert jnp.allclose(outputs.loglik, baseline_outputs.loglik)
+    assert jnp.allclose(outputs.rate, baseline_outputs.rate)
+
     display(params)
 
     base_rate = jnp.exp(params.log_base_rate).item()
