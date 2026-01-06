@@ -537,39 +537,17 @@ def plot_kernel_power_law():
     omegas = 100, 1.0, 0.01
     betas = 1.0, 2.0, 3.0  # The 'beta' in the kernel definition
 
-    f, axes = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
-    f.suptitle('Hawkes Power-Law Kernel (Lomax) Approximation')
+    f1, axes1 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
+    f1.suptitle('Hawkes Power-Law Kernel (Lomax) Approximation')
+    f2, axes2 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
+    f2.suptitle('linear y, divided by $\\omega * \\beta$')
+    f3, axes3 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
+    f3.suptitle('absolute error')
+    f4, axes4 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
+    f4.suptitle('relative error')
 
-    for omega, row in zip(omegas, axes):
-        for beta, ax in zip(betas, row):
-
-            kernel_params = kernel_power_law_params(
-                omega=omega,
-                beta=beta,
-                max_history_duration=max_history_duration,
-                n_exponentials=n_exponentials,
-            )
-
-            exact = kernel_power_law(t_geom, omega=omega, beta=beta)
-            _, approx = approx_iterative(t_geom, kernel_params)
-
-            ax.loglog(t_geom, exact, 'k-', label='Exact Lomax Kernel', lw=2)
-            ax.loglog(t_geom, approx, 'r--', label='SOE Approximation', lw=2)
-            ax.set_title(f"$\\omega={omega}, \\beta={beta}$")
-            ax.grid(True, which="both", ls="-", alpha=0.2)
-            # ax.set_xlabel("Time (t)")
-            # ax.set_ylabel("Kernel Value $k(t)$")
-            # ax.legend()
-    plt.tight_layout()
-    plt.show()
-
-    f, axes = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
-    f.suptitle(
-        r'Hawkes Power-Law Kernel (Lomax) Approximation (divided by $\omega * \beta$)'
-    )
-
-    for omega, row in zip(omegas, axes):
-        for beta, ax in zip(betas, row):
+    for r, omega in enumerate(omegas):
+        for c, beta in enumerate(betas):
 
             kernel_params = kernel_power_law_params(
                 omega=omega,
@@ -580,17 +558,30 @@ def plot_kernel_power_law():
 
             exact = kernel_power_law(t_geom, omega=omega, beta=beta)
             _, approx = approx_iterative(t_geom, kernel_params)
-            exact /= omega * beta
-            approx /= omega * beta
 
-            ax.plot(t_geom, exact, 'k-', label='Exact Lomax Kernel', lw=2)
-            ax.plot(t_geom, approx, 'r--', label='SOE Approximation', lw=2)
-            ax.set_xscale('log')
-            ax.set_title(f"$\\omega={omega}, \\beta={beta}$")
-            ax.grid(True, which="both", ls="-", alpha=0.2)
-            # ax.set_xlabel("Time (t)")
-            # ax.set_ylabel("Kernel Value $k(t)$")
-            # ax.legend()
+            ax1 = axes1[r, c]
+            ax1.loglog(t_geom, exact, 'k-', label='Exact Lomax Kernel', lw=2)
+            ax1.loglog(t_geom, approx, 'r--', label='SOE Approximation', lw=2)
+            ax1.set_title(f"$\\omega={omega}, \\beta={beta}$")
+            ax1.grid(True, which="both", ls="-", alpha=0.2)
+
+            ax2 = axes2[r, c]
+            ax2.plot(t_geom, exact / omega * beta, 'k-', lw=2)
+            ax2.plot(t_geom, approx / omega * beta, 'r--', lw=2)
+            ax2.set_xscale('log')
+            ax2.set_title(f"$\\omega={omega}, \\beta={beta}$")
+            ax2.grid(True, which="both", ls="-", alpha=0.2)
+
+            ax3 = axes3[r, c]
+            ax3.loglog(t_geom, abs(approx - exact), 'k-', lw=2)
+            ax3.set_title(f"$\\omega={omega}, \\beta={beta}$")
+            ax3.grid(True, which="both", ls="-", alpha=0.2)
+
+            ax4 = axes4[r, c]
+            ax4.loglog(t_geom, abs(approx - exact) / exact, 'k-', lw=2)
+            ax4.set_title(f"$\\omega={omega}, \\beta={beta}$")
+            ax4.grid(True, which="both", ls="-", alpha=0.2)
+
     plt.tight_layout()
     plt.show()
 
