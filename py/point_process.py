@@ -239,18 +239,20 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> HawkesOutputs:
 
     def step(carry, x):
         decayed_count = carry
-        count, elapsed, decay_factor = x
+        count, decay_factor = x
 
         decayed_count *= decay_factor
         loglik_rate = base_rate + norm * omega * decayed_count
-        loglik = poisson.logpmf(k=count, mu=loglik_rate * elapsed)
 
         decayed_count += count
         forecast_rate = base_rate + norm * omega * decayed_count
-        return decayed_count, (loglik, forecast_rate)
+        return decayed_count, (loglik_rate, forecast_rate)
 
-    xs = dataset.curr_count, dataset.elapsed, decay_factors
-    _, (loglik, rate) = jax.lax.scan(step, 0, xs)
+    xs = dataset.curr_count, decay_factors
+    _, (loglik_rate, rate) = jax.lax.scan(step, 0, xs)
+
+    loglik = poisson.logpmf(k=dataset.curr_count,
+                            mu=loglik_rate * dataset.elapsed)
 
     return HawkesOutputs(
         loglik=loglik,
