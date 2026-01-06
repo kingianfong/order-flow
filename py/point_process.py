@@ -42,7 +42,7 @@ def load_data(sym: str) -> pl.DataFrame:
         .with_columns(
             elapsed=(
                 pl.col('elapsed_precise')
-                .cast(float) * 1e-6  # milliseconds
+                .cast(pl.Float32) * 1e-6  # milliseconds
             ),
             hour=(
                 pl.col('time')
