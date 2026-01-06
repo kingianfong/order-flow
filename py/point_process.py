@@ -566,8 +566,8 @@ def plot_kernel_power_law():
             ax1.grid(True, which="both", ls="-", alpha=0.2)
 
             ax2 = axes2[r, c]
-            ax2.plot(t_geom, exact / omega * beta, 'k-', lw=2)
-            ax2.plot(t_geom, approx / omega * beta, 'r--', lw=2)
+            ax2.plot(t_geom, exact / (omega * beta), 'k-', lw=2)
+            ax2.plot(t_geom, approx / (omega * beta), 'r--', lw=2)
             ax2.set_xscale('log')
             ax2.set_title(f"$\\omega={omega}, \\beta={beta}$")
             ax2.grid(True, which="both", ls="-", alpha=0.2)
