@@ -67,16 +67,37 @@ INPUT_DF
 # %%
 
 
+# for multipliers based on time-of-day
+class RbfConstants:
+    n_centers: int = 24
+    n_hours: int = 24
+    centers: Array = jnp.linspace(0, n_centers, n_hours, endpoint=False)
+
+    width_factor: float = 0.5
+    sigma = width_factor * n_hours / n_centers
+    inv_sigma_sq = 1.0 / (sigma**2)
+
+    l2_reg: float = 0.01
+
+
+def calc_rbf_basis(time_of_day: Array) -> Array:
+    dist = jnp.abs(time_of_day[:, None] - RbfConstants.centers[None, :])
+    dist = jnp.where(dist > RbfConstants.n_hours / 2, 24 - dist, dist)
+    exponent = -0.5 * (dist**2) * RbfConstants.inv_sigma_sq
+    basis = jnp.exp(exponent)
+    return basis
+
+
 class Dataset(NamedTuple):
     curr_count: Array
     elapsed: Array
-    time_of_day: Array
+    rbf_basis: Array
 
 
 DATASET = Dataset(
     curr_count=INPUT_DF['curr_count'].to_jax(),
     elapsed=INPUT_DF['elapsed'].to_jax(),
-    time_of_day=INPUT_DF['hour'].to_jax(),
+    rbf_basis=calc_rbf_basis(INPUT_DF['hour'].to_jax()),
 )
 
 
@@ -119,18 +140,6 @@ print(f'{closed_form_rate=:.8f}, {constant_rate=:.8f}')
 # %%
 
 
-class RbfConstants:
-    n_centers: int = 24
-    n_hours: int = 24
-    centers: Array = jnp.linspace(0, n_centers, n_hours, endpoint=False)
-
-    width_factor: float = 0.5
-    sigma = width_factor * n_hours / n_centers
-    inv_sigma_sq = 1.0 / (sigma**2)
-
-    l2_reg: float = 0.01
-
-
 class RbfRateParams(NamedTuple):
     log_base_rate: float
     # weights: Array = 0.05 * jnp.sin(jnp.arange(RbfConstants.n_centers))
@@ -138,18 +147,9 @@ class RbfRateParams(NamedTuple):
                                              (RbfConstants.n_centers,),)
 
 
-def calc_rbf_rate_log_factor(weights: Array, time_of_day: Array) -> Array:
-    dist = jnp.abs(time_of_day[:, None] - RbfConstants.centers[None, :])
-    dist = jnp.where(dist > RbfConstants.n_hours / 2, 24 - dist, dist)
-    exponent = -0.5 * (dist**2) * RbfConstants.inv_sigma_sq
-    basis = jnp.exp(exponent)
-    log_factor = basis @ weights
-    return log_factor
-
-
 def plot_rbf_rate(log_base_rate: float, weights: Array) -> None:
     time_of_day = jnp.linspace(-2, 26, 500, endpoint=False)
-    log_factor = calc_rbf_rate_log_factor(weights, time_of_day)
+    log_factor = calc_rbf_basis(time_of_day) @ weights
     base_rate = jnp.exp(log_base_rate).item()
     rate = jnp.exp(log_base_rate + log_factor)
 
@@ -187,13 +187,9 @@ flat_rbf_params, unflatten_rbf_params = ravel_pytree(init_rbf_params)
 
 
 @jax.jit
-def rbf_rate_loss(flat_params: Array,
-                  dataset: Dataset):
+def rbf_rate_loss(flat_params: Array, dataset: Dataset):
     params: RbfRateParams = unflatten_rbf_params(flat_params)
-    log_rate_factor = calc_rbf_rate_log_factor(
-        params.weights,
-        dataset.time_of_day
-    )
+    log_rate_factor = dataset.rbf_basis @ params.weights
     rate = jnp.exp(params.log_base_rate + log_rate_factor)
     nll = -calc_loglik(rate, dataset).mean()
     reg_penalty = jnp.sum(jnp.square(params.weights)) * RbfConstants.l2_reg
@@ -212,8 +208,7 @@ rbf_optim_params = unflatten_rbf_params(rbf_optim_result.x)
 plot_rbf_rate(rbf_optim_params.log_base_rate, rbf_optim_params.weights)
 
 
-rbf_log_rate_factor = calc_rbf_rate_log_factor(
-    rbf_optim_params.weights, DATASET.time_of_day)
+rbf_log_rate_factor = DATASET.rbf_basis @ rbf_optim_params.weights
 rbf_rate = jnp.exp(rbf_optim_params.log_base_rate + rbf_log_rate_factor)
 
 
@@ -363,8 +358,7 @@ class RbfHawkesOutputs(NamedTuple):
 @jax.jit
 def calc_rbf_hawkes(params: RbfHawkesParams,
                     dataset: Dataset) -> RbfHawkesOutputs:
-    log_factor = calc_rbf_rate_log_factor(
-        params.rbf_weights, dataset.time_of_day)
+    log_factor = dataset.rbf_basis @ params.rbf_weights
     base_rate = jnp.exp(params.log_base_rate + log_factor)
 
     norm = jax.nn.sigmoid(params.logit_norm)
