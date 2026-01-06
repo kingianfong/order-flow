@@ -207,3 +207,70 @@ plot_power_law_kernel(apply_jitter=True)
 
 
 # %%
+
+
+def kernel_power_law(t: Array, omega: float, beta: float):
+    numerator = omega * beta
+    denominator = (1 + omega * t) ** (1 + beta)
+    return numerator / denominator
+
+
+def kernel_power_law_params(omega: float, beta: float,
+                            max_history_duration: float,
+                            n_exponentials: int):
+
+    # 1. Generate params for f(x) = x^-alpha
+    # Range of x is [1, 1 + omega * max_t]
+    unif = uniform_approx_params(
+        alpha=1.0 + beta,
+        max_history_duration=1 + omega * max_history_duration,
+        n_exponentials=n_exponentials,
+    )
+
+    # 2. Transform to k(t) = omega * beta * f(1 + omega * t)
+    # R_i = r_i * omega
+    # W_i = (omega * beta) * w_i * exp(-r_i)
+    kernel_rates = unif.rates * omega
+    kernel_weights = omega * beta * unif.weights * jnp.exp(-unif.rates)
+
+    return PowerLawApproxParams(
+        weights=kernel_weights,
+        rates=kernel_rates,
+    )
+
+
+def plot_kernel_power_law():
+    n = 10_000
+    min_t = 1e-3
+    max_t = 1e5
+    t_geom = jnp.geomspace(min_t, max_t, n)
+
+    omega = 0.1
+    beta = 0.15  # The 'beta' in the kernel definition
+
+    n_exponentials = 6
+    kernel_params = kernel_power_law_params(
+        omega=omega, beta=beta,
+        max_history_duration=1e6,
+        n_exponentials=n_exponentials,
+    )
+
+    exact = kernel_power_law(t_geom, omega=omega, beta=beta)
+    _, approx = approx_iterative(t_geom, kernel_params)
+
+    plt.figure(figsize=(8, 5))
+    plt.loglog(t_geom, exact, 'k-', label='Exact Lomax Kernel', lw=2)
+    plt.loglog(t_geom, approx, 'r--', label='SOE Approximation', lw=2)
+    plt.title(
+        f"Hawkes Power-Law Kernel (Lomax) Approximation\n$\\omega={omega}, \\beta={beta}$")
+    plt.xlabel("Time (t)")
+    plt.ylabel("Kernel Value $k(t)$")
+    plt.legend()
+    plt.grid(True, which="both", ls="-", alpha=0.2)
+    plt.show()
+
+
+plot_kernel_power_law()
+
+
+# %%
