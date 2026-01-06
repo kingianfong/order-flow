@@ -8,7 +8,6 @@ from jax.typing import ArrayLike
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
-import numpy as np
 
 
 # %%
@@ -83,7 +82,7 @@ def recursive_approx_params(alpha: float,
     # We solve for c_i starting from c_N down to c_0
     # Equation 9: c_{N-k} = 1 - sum_{i=0}^{k-1} c_{N-i} * beta^(-alpha*(k-i)) * exp(alpha*(1 - beta^(i-k)))
 
-    c_list = [1.0]  # c_N = 1.0 (base case)
+    c_list: list[ArrayLike] = [1.0]  # c_N = 1.0 (base case)
 
     for k in range(1, n_exponentials + 1):
         # We are calculating c_{N-k}
@@ -216,9 +215,9 @@ def kernel_power_law(t: Array, omega: float, beta: float):
     return numerator / denominator
 
 
-def kernel_power_law_params(omega: float,
-                            beta: float,
-                            max_history_duration: float,
+def kernel_power_law_params(omega: ArrayLike,
+                            beta: ArrayLike,
+                            max_history_duration: ArrayLike,
                             n_exponentials: int):
 
     alpha = 1.0 + beta
@@ -239,8 +238,8 @@ def kernel_power_law_params(omega: float,
     kernel_weights = omega * beta * a * er
 
     return PowerLawApproxParams(
-        weights=kernel_weights,
-        rates=kernel_rates,
+        weights=jnp.asarray(kernel_weights),
+        rates=jnp.asarray(kernel_rates),
     )
 
 
