@@ -202,8 +202,9 @@ def plot_power_law_kernel(*, apply_jitter: bool):
     plt.show()
 
 
-plot_power_law_kernel(apply_jitter=False)
-plot_power_law_kernel(apply_jitter=True)
+if __name__ == '__main__':
+    plot_power_law_kernel(apply_jitter=False)
+    plot_power_law_kernel(apply_jitter=True)
 
 
 # %%
@@ -276,7 +277,8 @@ def plot_kernel_power_law():
     plt.show()
 
 
-plot_kernel_power_law()
+if __name__ == '__main__':
+    plot_kernel_power_law()
 
 
 # %%

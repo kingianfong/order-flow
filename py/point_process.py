@@ -16,6 +16,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import polars as pl
 
+import plot_power_law_approx
+
 
 DATA_DIR = Path(__file__).parent.parent / 'data/preprocessed'
 
