@@ -215,23 +215,27 @@ def kernel_power_law(t: Array, omega: float, beta: float):
     return numerator / denominator
 
 
-def kernel_power_law_params(omega: float, beta: float,
+def kernel_power_law_params(omega: float,
+                            beta: float,
                             max_history_duration: float,
                             n_exponentials: int):
 
-    # 1. Generate params for f(x) = x^-alpha
-    # Range of x is [1, 1 + omega * max_t]
-    unif = uniform_approx_params(
-        alpha=1.0 + beta,
-        max_history_duration=1 + omega * max_history_duration,
-        n_exponentials=n_exponentials,
-    )
+    alpha = 1.0 + beta
+    indices = jnp.arange(n_exponentials)
+    logb = jnp.log1p(omega * max_history_duration) / n_exponentials
+    inv_bi = jnp.exp(-indices * logb)          # b^{-i}
+    r = alpha * inv_bi                   # r_i = α / b^i
 
-    # 2. Transform to k(t) = omega * beta * f(1 + omega * t)
-    # R_i = r_i * omega
-    # W_i = (omega * beta) * w_i * exp(-r_i)
-    kernel_rates = unif.rates * omega
-    kernel_weights = omega * beta * unif.weights * jnp.exp(-unif.rates)
+    # a_i = b^{-iα}
+    a = jnp.exp(-alpha * indices * logb)
+
+    # Normalize so that Σ a_i e^{-r_i} = 1  (=> Σ kernel_weights = ωβ)
+    er = jnp.exp(-r)
+    Z = jnp.sum(a * er)
+    a = a / Z
+
+    kernel_rates = omega * r
+    kernel_weights = omega * beta * a * er
 
     return PowerLawApproxParams(
         weights=kernel_weights,
@@ -246,12 +250,14 @@ def plot_kernel_power_law():
     t_geom = jnp.geomspace(min_t, max_t, n)
 
     omega = 0.1
-    beta = 0.15  # The 'beta' in the kernel definition
+    beta = 0.2  # The 'beta' in the kernel definition
+    max_history_duration = 1e5
+    n_exponentials = 8
 
-    n_exponentials = 6
     kernel_params = kernel_power_law_params(
-        omega=omega, beta=beta,
-        max_history_duration=1e6,
+        omega=omega,
+        beta=beta,
+        max_history_duration=max_history_duration,
         n_exponentials=n_exponentials,
     )
 
