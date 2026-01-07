@@ -283,6 +283,79 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
 
 
 @jax.jit
+def calculate_decayed_counts(decay_factors: Array, counts: Array) -> Array:
+
+    def combine(prefix, step):
+        # f_left(x)  = a_left * x + b_left
+        # f_right(x) = a_right * x + b_right
+        # f_right(f_left(x)) = a_right * (a_left * x + b_left) + b_right
+        #                    = (a_right * a_left) * x + (a_right * b_left + b_right)
+        decay_left, count_left = prefix
+        decay_right, count_right = step
+        combined_decay = decay_right * decay_left
+        combined_count = decay_right * count_left + count_right
+        return combined_decay, combined_count
+
+    if counts.ndim == 1 and decay_factors.ndim > 1:
+        counts = counts[:, jnp.newaxis]
+        counts = jnp.broadcast_to(counts, decay_factors.shape)
+
+    elems = decay_factors, counts
+    _, decayed_counts = jax.lax.associative_scan(combine, elems)
+    return decayed_counts
+
+
+def test_calculate_decayed_counts():
+    key = jax.random.PRNGKey(0)
+    n = 100
+
+    # 1d
+    normal = 10 * jax.random.normal(key, (n, ))
+    decay_factors = jax.nn.sigmoid(normal)
+    counts = 1.0 + jax.random.randint(key, (n, ), 0, 5)
+
+    def step_1d(carry, xs):
+        decayed_count = carry
+        decay_factor, count = xs
+        decayed_count *= decay_factor
+        decayed_count += count
+        return decayed_count, decayed_count
+
+    init = 0
+    xs = decay_factors, counts
+    _, expected = jax.lax.scan(step_1d, init, xs)
+
+    actual = calculate_decayed_counts(decay_factors, counts)
+    assert jnp.allclose(actual, expected)
+
+    # multidim
+    m = 5
+    normal = 10 * jax.random.normal(key, (n, m))
+    decay_factors = jax.nn.sigmoid(normal)
+    counts = 1.0 + jax.random.randint(key, (n, ), 0, 5)
+
+    def step(carry, xs):
+        decayed_count = carry
+        decay_factor, count = xs
+        decayed_count *= decay_factor
+        decayed_count += count
+        return decayed_count, decayed_count
+
+    init = jnp.zeros((m,))
+    xs = decay_factors, counts
+    _, expected = jax.lax.scan(step, init, xs)
+
+    actual = calculate_decayed_counts(decay_factors, counts)
+    assert jnp.allclose(actual, expected)
+
+
+test_calculate_decayed_counts()
+
+
+# %%
+
+
+@jax.jit
 def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     base_rate = jnp.exp(params.log_base_rate)
     norm = jax.nn.sigmoid(params.logit_norm)
@@ -290,13 +363,7 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
 
     decay_factors = jnp.exp(-omega * dataset.elapsed)
 
-    def binary_op(prefix, step):
-        a1, b1 = prefix   # earlier-composed transform
-        a2, b2 = step     # next transform
-        return (a2 * a1, a2 * b1 + b2)
-
-    elems = decay_factors, dataset.curr_count
-    _, decayed_count = jax.lax.associative_scan(binary_op, elems)
+    decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
 
     # loglik of interval that just passed with no events
     prev_decayed_count = jnp.roll(decayed_count, 1).at[0].set(0.0)
@@ -335,8 +402,11 @@ def plot_hawkes_rate(params: HawkesParams,
     base_rate = jnp.exp(params.log_base_rate).item()
     norm = jax.nn.sigmoid(params.logit_norm).item()
     omega = jnp.exp(params.log_omega).item()
+    avg_life_seconds = 1000 / omega
 
     print(f'{base_rate=}, {norm=}, {omega=}')
+    print(f'{avg_life_seconds=}')
+
     df = (
         input_df
         .with_columns(
@@ -435,24 +505,28 @@ def calc_rbf_hawkes(params: RbfHawkesParams,
     omega = jnp.exp(params.log_omega)
     decay_factors = jnp.exp(-omega * dataset.elapsed)
 
-    def step(carry, x):
-        decayed_count = carry
-        base_rate, count, elapsed, decay_factor = x
+    decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
 
-        decayed_count *= decay_factor
-        loglik_rate = base_rate + norm * omega * decayed_count
-        loglik = poisson.logpmf(k=count, mu=loglik_rate * elapsed)
+    # loglik of interval that just passed with no events
+    prev_decayed_count = jnp.roll(decayed_count, 1).at[0].set(0.0)
+    integral_over_interval = -jnp.expm1(-omega * dataset.elapsed)
+    interval_term = \
+        dataset.elapsed * base_rate \
+        + norm * prev_decayed_count * integral_over_interval
 
-        decayed_count += count
-        forecast_rate = base_rate + norm * omega * decayed_count
-        return decayed_count, (loglik, forecast_rate)
+    # loglik of event(s) at current timestamp
+    curr_minus_count = prev_decayed_count * decay_factors
+    a = base_rate + norm * omega * curr_minus_count
+    d = norm * omega
+    event_term = \
+        dataset.curr_count * jnp.log(d) \
+        + gammaln(a / d + dataset.curr_count) \
+        - gammaln(a / d)
 
-    xs = base_rate, dataset.curr_count, dataset.elapsed, decay_factors
-    _, (loglik, rate) = jax.lax.scan(step, 0, xs)
-
+    forecast_rate = base_rate + norm * omega * decayed_count
     return ModelOutput(
-        loglik=loglik,
-        rate=rate,
+        loglik=event_term - interval_term,
+        rate=forecast_rate,
     )
 
 
@@ -464,8 +538,11 @@ def plot_rbf_hawkes(params: RbfHawkesParams,
 
     norm = jax.nn.sigmoid(params.logit_norm).item()
     omega = jnp.exp(params.log_omega).item()
+    avg_life_seconds = 1000 / omega
 
     print(f'{norm=}, {omega=}')
+    print(f'{avg_life_seconds=}')
+
     df = (
         input_df
         .with_columns(
@@ -512,11 +589,11 @@ flat_rbf_hawkes_params, unflatten_rbf_hawkes_params = ravel_pytree(
 
 @jax.jit
 def rbf_hawkes_loss(flat_params: Array, dataset: Dataset):
-    prams: RbfHawkesParams = unflatten_rbf_hawkes_params(flat_params)
-    output = calc_rbf_hawkes(prams, dataset)
+    params: RbfHawkesParams = unflatten_rbf_hawkes_params(flat_params)
+    output = calc_rbf_hawkes(params, dataset)
 
     nll = -output.loglik.mean()
-    reg_penalty = jnp.sum(jnp.square(prams.rbf_weights)) * RbfConstants.l2_reg
+    reg_penalty = jnp.sum(jnp.square(params.rbf_weights)) * RbfConstants.l2_reg
     return nll + reg_penalty
 
 
