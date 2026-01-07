@@ -8,6 +8,7 @@ import datetime
 from jax import Array
 from jax.flatten_util import ravel_pytree
 from jax.scipy.optimize import minimize
+from jax.scipy.special import logit
 from jax.scipy.stats import poisson
 from jax.typing import ArrayLike
 import jax
@@ -213,11 +214,8 @@ rbf_rate = jnp.exp(rbf_optim_params.log_base_rate + rbf_log_rate_factor)
 # %%
 
 
-def logit(y) -> Array:
-    return jnp.log(y) - jnp.log1p(-y)
-
-
 # exponential decay kernel for now
+
 class HawkesParams(NamedTuple):
     log_base_rate: float
     logit_norm: float = logit(jnp.array(0.85)).item()
