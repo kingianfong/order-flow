@@ -284,7 +284,6 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
 
 @jax.jit
 def calculate_decayed_counts(decay_factors: Array, counts: Array) -> Array:
-
     def combine(prefix, step):
         # f_left(x)  = a_left * x + b_left
         # f_right(x) = a_right * x + b_right
@@ -306,47 +305,41 @@ def calculate_decayed_counts(decay_factors: Array, counts: Array) -> Array:
 
 
 def test_calculate_decayed_counts():
-    key = jax.random.PRNGKey(0)
-    n = 100
-
-    # 1d
-    normal = 10 * jax.random.normal(key, (n, ))
-    decay_factors = jax.nn.sigmoid(normal)
-    counts = 1.0 + jax.random.randint(key, (n, ), 0, 5)
-
-    def step_1d(carry, xs):
+    def linear_scan_step(carry, xs):
         decayed_count = carry
         decay_factor, count = xs
         decayed_count *= decay_factor
         decayed_count += count
         return decayed_count, decayed_count
 
-    init = 0
-    xs = decay_factors, counts
-    _, expected = jax.lax.scan(step_1d, init, xs)
+    n = 1_000
+    for i in range(10):
+        k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(i), 4)
 
-    actual = calculate_decayed_counts(decay_factors, counts)
-    assert jnp.allclose(actual, expected)
+        # 1d
+        normal = 10 * jax.random.normal(k1, (n, ))
+        decay_factors = jax.nn.sigmoid(normal)
+        counts = 1.0 + jax.random.randint(k2, (n, ), 0, 5)
 
-    # multidim
-    m = 5
-    normal = 10 * jax.random.normal(key, (n, m))
-    decay_factors = jax.nn.sigmoid(normal)
-    counts = 1.0 + jax.random.randint(key, (n, ), 0, 5)
+        init = 0
+        xs = decay_factors, counts
+        _, expected = jax.lax.scan(linear_scan_step, init, xs)
 
-    def step(carry, xs):
-        decayed_count = carry
-        decay_factor, count = xs
-        decayed_count *= decay_factor
-        decayed_count += count
-        return decayed_count, decayed_count
+        actual = calculate_decayed_counts(decay_factors, counts)
+        assert jnp.allclose(actual, expected)
 
-    init = jnp.zeros((m,))
-    xs = decay_factors, counts
-    _, expected = jax.lax.scan(step, init, xs)
+        # multidim
+        m = 5
+        normal = 10 * jax.random.normal(k3, (n, m))
+        decay_factors = jax.nn.sigmoid(normal)
+        counts = 1.0 + jax.random.randint(k4, (n, ), 0, 5)
 
-    actual = calculate_decayed_counts(decay_factors, counts)
-    assert jnp.allclose(actual, expected)
+        init = jnp.zeros((m,))
+        xs = decay_factors, counts
+        _, expected = jax.lax.scan(linear_scan_step, init, xs)
+
+        actual = calculate_decayed_counts(decay_factors, counts)
+        assert jnp.allclose(actual, expected)
 
 
 test_calculate_decayed_counts()
