@@ -93,7 +93,7 @@ class Dataset(NamedTuple):
 
 
 DATASET = Dataset(
-    curr_count=INPUT_DF['curr_count'].to_jax(),
+    curr_count=INPUT_DF['curr_count'].cast(pl.Float32).to_jax(),
     elapsed=INPUT_DF['elapsed'].to_jax(),
     rbf_basis=calc_rbf_basis(INPUT_DF['hour'].to_jax()),
 )
@@ -268,23 +268,21 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> HawkesOutputs:
 
     decay_factors = jnp.exp(-omega * dataset.elapsed)
 
-    def step(carry, x):
-        decayed_count = carry
-        count, decay_factor = x
-        decayed_count *= decay_factor
-        decayed_count += count
-        return decayed_count, decayed_count
+    def binary_op(prefix, step):
+        a1, b1 = prefix   # earlier-composed transform
+        a2, b2 = step     # next transform
+        return (a2 * a1, a2 * b1 + b2)
 
-    xs = dataset.curr_count, decay_factors
-    _, (decayed_count) = jax.lax.scan(step, 0, xs)
+    elems = decay_factors, dataset.curr_count
+    _, decayed_count = jax.lax.associative_scan(binary_op, elems)
 
     decayed_before_count = decayed_count - dataset.curr_count
+    # TODO: split loglik calculation to integral and event
     loglik_rate = base_rate + norm * omega * decayed_before_count
-    forecast_rate = base_rate + norm * omega * decayed_count
-
     loglik = poisson.logpmf(k=dataset.curr_count,
                             mu=loglik_rate * dataset.elapsed)
 
+    forecast_rate = base_rate + norm * omega * decayed_count
     return HawkesOutputs(
         loglik=loglik,
         rate=forecast_rate,
@@ -297,8 +295,8 @@ def plot_hawkes_rate(params: HawkesParams,
     baseline_outputs = calc_hawkes_baseline(params, dataset)
 
     outputs = calc_hawkes(params, dataset)
-    assert jnp.allclose(outputs.loglik, baseline_outputs.loglik)
-    assert jnp.allclose(outputs.rate, baseline_outputs.rate)
+    assert jnp.allclose(outputs.loglik, baseline_outputs.loglik, rtol=1e-4)
+    assert jnp.allclose(outputs.rate, baseline_outputs.rate, rtol=1e-4)
 
     display(params)
 
@@ -312,6 +310,8 @@ def plot_hawkes_rate(params: HawkesParams,
         .with_columns(
             loglik=np.asarray(outputs.loglik),
             rate=np.asarray(outputs.rate),
+            baseline_loglik=np.asarray(baseline_outputs.loglik),
+            baseline_rate=np.asarray(baseline_outputs.rate),
         )
     )
     display(df)
