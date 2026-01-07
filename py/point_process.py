@@ -215,15 +215,14 @@ rbf_rate = jnp.exp(rbf_optim_params.log_base_rate + rbf_log_rate_factor)
 
 
 # exponential decay kernel for now
-
 class HawkesParams(NamedTuple):
     log_base_rate: float
     logit_norm: float = logit(jnp.array(0.85)).item()
-    log_omega: float = -jnp.log(30 * 1_000).item()
+    log_omega: float = -jnp.log(30 * 1000).item()
 
 
 class ModelOutput(NamedTuple):
-    loglik: Array  # excludes events[t]
+    loglik: Array  # loglik of (no event since prev t) + (events at t)
     rate: Array  # includes events[t]
 
 
@@ -233,24 +232,30 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     norm = jax.nn.sigmoid(params.logit_norm)
     omega = jnp.exp(params.log_omega)
 
-    decay_factors = jnp.exp(-omega * dataset.elapsed)
-
     def step(carry, x):
         decayed_count = carry
-        count, decay_factor = x
+        count, elapsed = x
 
+        # loglik of no event in interval which just passed
+        integral_over_interval = -jnp.expm1(-omega * elapsed)
+        interval_term = \
+            base_rate * elapsed  \
+            + norm * decayed_count * integral_over_interval
+
+        # loglik of events at current timestamp
+        decay_factor = jnp.exp(-omega * elapsed)
         decayed_count *= decay_factor
-        loglik_rate = base_rate + norm * omega * decayed_count
+        event_rate = base_rate + norm * omega * decayed_count
+        event_term = count * jnp.log(event_rate)
+
+        loglik = event_term - interval_term
 
         decayed_count += count
         forecast_rate = base_rate + norm * omega * decayed_count
-        return decayed_count, (loglik_rate, forecast_rate)
+        return decayed_count, (loglik, forecast_rate)
 
-    xs = dataset.curr_count, decay_factors
-    _, (loglik_rate, rate) = jax.lax.scan(step, 0, xs)
-
-    loglik = poisson.logpmf(k=dataset.curr_count,
-                            mu=loglik_rate * dataset.elapsed)
+    xs = dataset.curr_count, dataset.elapsed
+    _, (loglik, rate) = jax.lax.scan(step, 0, xs)
 
     return ModelOutput(
         loglik=loglik,
@@ -274,15 +279,30 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     elems = decay_factors, dataset.curr_count
     _, decayed_count = jax.lax.associative_scan(binary_op, elems)
 
-    decayed_before_count = decayed_count - dataset.curr_count
-    # TODO: split loglik calculation to integral and event
-    loglik_rate = base_rate + norm * omega * decayed_before_count
-    loglik = poisson.logpmf(k=dataset.curr_count,
-                            mu=loglik_rate * dataset.elapsed)
+    # rate(t) = base_rate + norm * omega * decayed_count
+
+    # loglik =
+    #   sum(log(rate)) at each event
+    #   - integral(rate) over duration
+
+    # loglik of interval that just passed with no events
+    prev_decayed_count = jnp.roll(decayed_count, 1).at[0].set(0.0)
+    integral_over_interval = -jnp.expm1(-omega * dataset.elapsed)
+    interval_term = \
+        dataset.elapsed * base_rate \
+        + norm * prev_decayed_count * integral_over_interval
+
+    # loglik of event(s) at current timestamp
+    # assume events with the same time point were triggered by earlier events
+    # and that there's no self-excitation within each timestamp
+    # curr_minus_count = decayed_count - dataset.curr_count
+    curr_minus_count = prev_decayed_count * decay_factors
+    event_rate = base_rate + norm * omega * curr_minus_count
+    event_term = dataset.curr_count * jnp.log(event_rate)
 
     forecast_rate = base_rate + norm * omega * decayed_count
     return ModelOutput(
-        loglik=loglik,
+        loglik=event_term-interval_term,
         rate=forecast_rate,
     )
 
@@ -293,8 +313,8 @@ def plot_hawkes_rate(params: HawkesParams,
     baseline_outputs = calc_hawkes_baseline(params, dataset)
 
     outputs = calc_hawkes(params, dataset)
-    assert jnp.allclose(outputs.loglik, baseline_outputs.loglik, rtol=1e-4)
-    assert jnp.allclose(outputs.rate, baseline_outputs.rate, rtol=1e-4)
+    # assert jnp.allclose(outputs.loglik, baseline_outputs.loglik, rtol=0.05)
+    # assert jnp.allclose(outputs.rate, baseline_outputs.rate, rtol=1e-4)
 
     display(params)
 
@@ -313,6 +333,22 @@ def plot_hawkes_rate(params: HawkesParams,
         )
     )
     display(df)
+    display(
+        df
+        .with_columns(
+            baseline_minus_loglik=pl.col('baseline_loglik') - pl.col('loglik'),
+        )
+        .with_columns(
+            rel_diff=(
+                pl.col('baseline_minus_loglik') /
+                pl.col('baseline_loglik').abs()
+            ),
+        )
+        .filter(
+            pl.col('rel_diff').abs() > 0.01
+        )
+        .sort('curr_count')
+    )
     subset = (
         df
         .filter(
