@@ -222,13 +222,13 @@ class HawkesParams(NamedTuple):
     log_omega: float = -jnp.log(30 * 1_000).item()
 
 
-class HawkesOutputs(NamedTuple):
+class ModelOutput(NamedTuple):
     loglik: Array  # excludes events[t]
     rate: Array  # includes events[t]
 
 
 @jax.jit
-def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> HawkesOutputs:
+def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     base_rate = jnp.exp(params.log_base_rate)
     norm = jax.nn.sigmoid(params.logit_norm)
     omega = jnp.exp(params.log_omega)
@@ -252,14 +252,14 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> HawkesOutput
     loglik = poisson.logpmf(k=dataset.curr_count,
                             mu=loglik_rate * dataset.elapsed)
 
-    return HawkesOutputs(
+    return ModelOutput(
         loglik=loglik,
         rate=rate,
     )
 
 
 @jax.jit
-def calc_hawkes(params: HawkesParams, dataset: Dataset) -> HawkesOutputs:
+def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     base_rate = jnp.exp(params.log_base_rate)
     norm = jax.nn.sigmoid(params.logit_norm)
     omega = jnp.exp(params.log_omega)
@@ -281,7 +281,7 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> HawkesOutputs:
                             mu=loglik_rate * dataset.elapsed)
 
     forecast_rate = base_rate + norm * omega * decayed_count
-    return HawkesOutputs(
+    return ModelOutput(
         loglik=loglik,
         rate=forecast_rate,
     )
@@ -374,14 +374,9 @@ class RbfHawkesParams(NamedTuple):
                                                  (RbfConstants.n_centers,),)
 
 
-class RbfHawkesOutputs(NamedTuple):
-    loglik: Array  # excludes events[t]
-    rate: Array  # includes events[t]
-
-
 @jax.jit
 def calc_rbf_hawkes(params: RbfHawkesParams,
-                    dataset: Dataset) -> RbfHawkesOutputs:
+                    dataset: Dataset) -> ModelOutput:
     log_factor = dataset.rbf_basis @ params.rbf_weights
     base_rate = jnp.exp(params.log_base_rate + log_factor)
 
@@ -404,7 +399,7 @@ def calc_rbf_hawkes(params: RbfHawkesParams,
     xs = base_rate, dataset.curr_count, dataset.elapsed, decay_factors
     _, (loglik, rate) = jax.lax.scan(step, 0, xs)
 
-    return RbfHawkesOutputs(
+    return ModelOutput(
         loglik=loglik,
         rate=rate,
     )
@@ -621,13 +616,8 @@ class PowerLawHawkesParams(NamedTuple):
     log_max_history_duration: float = jnp.log(2 * 86_400 * 1_000).item()
 
 
-class PowerLawHawkesOutputs(NamedTuple):
-    loglik: Array  # excludes events[t]
-    rate: Array  # includes events[t]
-
-
 @jax.jit
-def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> PowerLawHawkesOutputs:
+def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> ModelOutput:
     n_exponentials = 10  # not differentiable
     base_rate = jnp.exp(params.log_base_rate)
     norm = jax.nn.sigmoid(params.logit_norm)
@@ -667,7 +657,7 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Pow
     _, y = jax.lax.scan(step, init_carry, xs)
     loglik, rate = y
 
-    return PowerLawHawkesOutputs(
+    return ModelOutput(
         loglik=loglik,
         rate=rate,
     )
