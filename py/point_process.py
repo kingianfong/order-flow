@@ -8,8 +8,7 @@ import datetime
 from jax import Array
 from jax.flatten_util import ravel_pytree
 from jax.scipy.optimize import minimize
-from jax.scipy.special import logit, gammaln
-from jax.scipy.stats import poisson
+from jax.scipy.special import logit
 from jax.typing import ArrayLike
 import jax
 import jax.numpy as jnp
@@ -111,14 +110,15 @@ closed_form_rate
 
 
 # assumes rate is effectively constant
-def calc_loglik(rate: ArrayLike, dataset: Dataset) -> Array:
-    return poisson.logpmf(k=dataset.curr_count, mu=rate*dataset.elapsed)
+def constant_loglik(rate: ArrayLike, dataset: Dataset) -> Array:
+    # assume constant rate throughout interval
+    return dataset.curr_count * jnp.log(rate) - rate * dataset.elapsed
 
 
 def constant_rate_loss(params: Array, dataset: Dataset):
     log_rate, = params
     rate = jnp.exp(log_rate)
-    return -calc_loglik(rate, dataset).mean()
+    return -constant_loglik(rate, dataset).mean()
 
 
 init_constant_rate_guess = jnp.array([jnp.log(closed_form_rate + 1e-1)])
@@ -139,6 +139,11 @@ print(f'{closed_form_rate=:.8f}, {constant_rate=:.8f}')
 # %%
 
 
+class ModelOutput(NamedTuple):
+    loglik: Array  # loglik of (no event since prev t) + (events at t)
+    rate: Array  # used for predictions after observing events at t
+
+
 class RbfRateParams(NamedTuple):
     log_base_rate: float
     # weights: Array = 0.05 * jnp.sin(jnp.arange(RbfConstants.n_centers))
@@ -146,7 +151,16 @@ class RbfRateParams(NamedTuple):
                                              (RbfConstants.n_centers,),)
 
 
-def plot_rbf_rate(log_base_rate: float, weights: Array) -> None:
+def calc_rbf(params: RbfRateParams, dataset: Dataset) -> ModelOutput:
+    log_rate_factor = dataset.rbf_basis @ params.weights
+    rate = jnp.exp(params.log_base_rate + log_rate_factor)
+    loglik = \
+        dataset.curr_count * jnp.log(rate) \
+        - rate * dataset.elapsed  # assume constant rate throughout interval
+    return ModelOutput(loglik=loglik, rate=rate)
+
+
+def plot_rbf(log_base_rate: float, weights: Array) -> None:
     time_of_day = jnp.linspace(-2, 26, 500, endpoint=False)
     log_factor = calc_rbf_basis(time_of_day) @ weights
     base_rate = jnp.exp(log_base_rate).item()
@@ -176,7 +190,7 @@ init_rbf_params = RbfRateParams(
 )
 
 
-plot_rbf_rate(init_rbf_params.log_base_rate, init_rbf_params.weights)
+plot_rbf(init_rbf_params.log_base_rate, init_rbf_params.weights)
 
 
 # %%
@@ -186,17 +200,15 @@ flat_rbf_params, unflatten_rbf_params = ravel_pytree(init_rbf_params)
 
 
 @jax.jit
-def rbf_rate_loss(flat_params: Array, dataset: Dataset):
+def rbf_loss(flat_params: Array, dataset: Dataset):
     params: RbfRateParams = unflatten_rbf_params(flat_params)
-    log_rate_factor = dataset.rbf_basis @ params.weights
-    rate = jnp.exp(params.log_base_rate + log_rate_factor)
-    nll = -calc_loglik(rate, dataset).mean()
+    output = calc_rbf(params, dataset)
     reg_penalty = jnp.sum(jnp.square(params.weights)) * RbfConstants.l2_reg
-    return nll + reg_penalty
+    return -output.loglik.mean() + reg_penalty
 
 
 rbf_optim_result = minimize(
-    rbf_rate_loss,
+    rbf_loss,
     flat_rbf_params,
     args=(DATASET,),
     method='BFGS',
@@ -204,11 +216,8 @@ rbf_optim_result = minimize(
 
 
 rbf_optim_params = unflatten_rbf_params(rbf_optim_result.x)
-plot_rbf_rate(rbf_optim_params.log_base_rate, rbf_optim_params.weights)
-
-
-rbf_log_rate_factor = DATASET.rbf_basis @ rbf_optim_params.weights
-rbf_rate = jnp.exp(rbf_optim_params.log_base_rate + rbf_log_rate_factor)
+rbf_outputs = calc_rbf(rbf_optim_params, DATASET)
+plot_rbf(rbf_optim_params.log_base_rate, rbf_optim_params.weights)
 
 
 # %%
@@ -219,11 +228,6 @@ class HawkesParams(NamedTuple):
     log_base_rate: float
     logit_norm: float = logit(0.9).item()
     log_omega: float = jnp.log(1).item()  # log(1 / avg_life_ms)
-
-
-class ModelOutput(NamedTuple):
-    loglik: Array  # loglik of (no event since prev t) + (events at t)
-    rate: Array  # used for predictions after observing events at t
 
 
 def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
@@ -254,19 +258,13 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
         decay_factor = jnp.exp(-omega * elapsed)
         decayed_count *= decay_factor
 
-        # every subsequent event at the same timestamp will have a likelihood
-        # calculated based on a rate that includes the earlier events at the
-        # same timestamp
+        # assume events happen instantaneously without self-excitation
+        # 1. jittering is unacceptable as it increases data size too much
+        # 2. an attempt using logarithm of rising factorial aka Pochhammer
+        # symbol has resulted in omega blowing up due to
 
-        # to calculate sum( log( a + md ) ), m in [0, count - 1]
-        # use logarithm of rising factorial aka Pochhammer symbol
-        a = base_rate + norm * omega * decayed_count
-        d = norm * omega
-        event_term = \
-            count * jnp.log(d) \
-            + gammaln(a / d + count) \
-            - gammaln(a / d)
-
+        event_rate = base_rate + norm * omega * decayed_count
+        event_term = count * jnp.log(event_rate)
         loglik = event_term - interval_term
 
         decayed_count += count
@@ -353,9 +351,7 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     base_rate = jnp.exp(params.log_base_rate)
     norm = jax.nn.sigmoid(params.logit_norm)
     omega = jnp.exp(params.log_omega)
-
     decay_factors = jnp.exp(-omega * dataset.elapsed)
-
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
 
     # loglik of interval that just passed with no events
@@ -367,12 +363,8 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
 
     # loglik of event(s) at current timestamp
     curr_minus_count = prev_decayed_count * decay_factors
-    a = base_rate + norm * omega * curr_minus_count
-    d = norm * omega
-    event_term = \
-        dataset.curr_count * jnp.log(d) \
-        + gammaln(a / d + dataset.curr_count) \
-        - gammaln(a / d)
+    event_rate = base_rate + norm * omega * curr_minus_count
+    event_term = dataset.curr_count * jnp.log(event_rate)
 
     forecast_rate = base_rate + norm * omega * decayed_count
     return ModelOutput(
@@ -381,13 +373,13 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     )
 
 
-def plot_hawkes_rate(params: HawkesParams,
-                     dataset: Dataset,
-                     input_df: pl.DataFrame) -> None:
+def plot_hawkes(params: HawkesParams,
+                dataset: Dataset,
+                input_df: pl.DataFrame) -> None:
     baseline_outputs = calc_hawkes_baseline(params, dataset)
 
     outputs = calc_hawkes(params, dataset)
-    # assert jnp.allclose(outputs.loglik, baseline_outputs.loglik, atol=1e-3)
+    assert jnp.allclose(outputs.loglik, baseline_outputs.loglik, atol=1e-4)
     assert jnp.allclose(outputs.rate, baseline_outputs.rate, rtol=1e-4)
 
     display(params)
@@ -447,7 +439,7 @@ init_hawkes_params = HawkesParams(
 )
 
 
-plot_hawkes_rate(init_hawkes_params, DATASET, INPUT_DF)
+plot_hawkes(init_hawkes_params, DATASET, INPUT_DF)
 
 
 # %%
@@ -458,8 +450,8 @@ flat_hawkes_params, unflatten_hawkes_params = ravel_pytree(init_hawkes_params)
 
 @jax.jit
 def hawkes_loss(flat_params: Array, dataset: Dataset):
-    hawkes_params = unflatten_hawkes_params(flat_params)
-    output = calc_hawkes(hawkes_params, dataset)
+    params = unflatten_hawkes_params(flat_params)
+    output = calc_hawkes(params, dataset)
     return -output.loglik.mean()
 
 
@@ -473,7 +465,7 @@ hawkes_optim_result = minimize(
 
 hawkes_optim_params = unflatten_hawkes_params(hawkes_optim_result.x)
 hawkes_outputs = calc_hawkes(hawkes_optim_params, DATASET)
-plot_hawkes_rate(hawkes_optim_params, DATASET, INPUT_DF)
+plot_hawkes(hawkes_optim_params, DATASET, INPUT_DF)
 
 
 # %%
@@ -482,22 +474,18 @@ plot_hawkes_rate(hawkes_optim_params, DATASET, INPUT_DF)
 # exponential decay kernel for now
 class RbfHawkesParams(NamedTuple):
     log_base_rate: float
-    logit_norm: float = logit(jnp.array(0.85)).item()
-    log_omega: float = -jnp.log(30 * 1_000).item()
-    rbf_weights: Array = 0.1 * jax.random.normal(jax.random.PRNGKey(0),
-                                                 (RbfConstants.n_centers,),)
+    logit_norm: float
+    log_omega: float
+    weights: Array
 
 
 @jax.jit
-def calc_rbf_hawkes(params: RbfHawkesParams,
-                    dataset: Dataset) -> ModelOutput:
-    log_factor = dataset.rbf_basis @ params.rbf_weights
+def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
+    log_factor = dataset.rbf_basis @ params.weights
     base_rate = jnp.exp(params.log_base_rate + log_factor)
-
     norm = jax.nn.sigmoid(params.logit_norm)
     omega = jnp.exp(params.log_omega)
     decay_factors = jnp.exp(-omega * dataset.elapsed)
-
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
 
     # loglik of interval that just passed with no events
@@ -509,12 +497,8 @@ def calc_rbf_hawkes(params: RbfHawkesParams,
 
     # loglik of event(s) at current timestamp
     curr_minus_count = prev_decayed_count * decay_factors
-    a = base_rate + norm * omega * curr_minus_count
-    d = norm * omega
-    event_term = \
-        dataset.curr_count * jnp.log(d) \
-        + gammaln(a / d + dataset.curr_count) \
-        - gammaln(a / d)
+    event_rate = base_rate + norm * omega * curr_minus_count
+    event_term = dataset.curr_count * jnp.log(event_rate)
 
     forecast_rate = base_rate + norm * omega * decayed_count
     return ModelOutput(
@@ -526,47 +510,18 @@ def calc_rbf_hawkes(params: RbfHawkesParams,
 def plot_rbf_hawkes(params: RbfHawkesParams,
                     dataset: Dataset,
                     input_df: pl.DataFrame) -> None:
-    outputs = calc_rbf_hawkes(params, dataset)
-    display(params)
-
-    norm = jax.nn.sigmoid(params.logit_norm).item()
-    omega = jnp.exp(params.log_omega).item()
-    avg_life_seconds = 1000 / omega
-
-    print(f'{norm=}, {omega=}')
-    print(f'{avg_life_seconds=}')
-
-    df = (
-        input_df
-        .with_columns(
-            loglik=np.asarray(outputs.loglik),
-            rate=np.asarray(outputs.rate),
-        )
-    )
-    display(df)
-
-    plot_rbf_rate(log_base_rate=params.log_base_rate,
-                  weights=params.rbf_weights)
-    subset = (
-        df
-        .filter(
-            pl.col('time') >= datetime.datetime(2025, 12, 12, hour=12),
-            pl.col('time') <= datetime.datetime(2025, 12, 13),
-        )
-    )
-    _, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True)
-    ax1.scatter(subset['time'], subset[['curr_count']], alpha=0.05, marker='.')
-    ax2.plot(subset['time'], subset[['rate']])
-    ax3.plot(subset['time'], subset[['loglik']])
-    plt.tight_layout()
-    plt.show()
+    plot_hawkes(params=params,   # type: ignore
+                dataset=dataset,
+                input_df=input_df)
+    plot_rbf(log_base_rate=params.log_base_rate,
+             weights=params.weights)
 
 
 init_rbf_hawkes = RbfHawkesParams(
     log_base_rate=hawkes_optim_params.log_base_rate,
     logit_norm=hawkes_optim_params.logit_norm,
     log_omega=hawkes_optim_params.log_omega,
-    rbf_weights=jnp.zeros(RbfConstants.n_centers)
+    weights=rbf_optim_params.weights,
 )
 
 
@@ -584,13 +539,13 @@ flat_rbf_hawkes_params, unflatten_rbf_hawkes_params = ravel_pytree(
 def rbf_hawkes_loss(flat_params: Array, dataset: Dataset):
     params: RbfHawkesParams = unflatten_rbf_hawkes_params(flat_params)
     output = calc_rbf_hawkes(params, dataset)
+    reg_penalty = (
+        jnp.sum(jnp.square(params.weights)) * RbfConstants.l2_reg
+    )
+    return -output.loglik.mean() + reg_penalty
 
-    nll = -output.loglik.mean()
-    reg_penalty = jnp.sum(jnp.square(params.rbf_weights)) * RbfConstants.l2_reg
-    return nll + reg_penalty
 
-
-hawkes_optim_result = minimize(
+rbf_hawkes_optim_result = minimize(
     rbf_hawkes_loss,
     flat_rbf_hawkes_params,
     args=(DATASET,),
@@ -598,7 +553,8 @@ hawkes_optim_result = minimize(
 )
 
 
-rbf_hawkes_optim_params = unflatten_rbf_hawkes_params(hawkes_optim_result.x)
+rbf_hawkes_optim_params = unflatten_rbf_hawkes_params(
+    rbf_hawkes_optim_result.x)
 rbf_hawkes_outputs = calc_rbf_hawkes(rbf_hawkes_optim_params, DATASET)
 plot_rbf_hawkes(rbf_hawkes_optim_params, DATASET, INPUT_DF)
 
@@ -722,154 +678,151 @@ def plot_kernel_power_law():
     plt.show()
 
 
-if __name__ == '__main__':
-    plot_kernel_power_law()
+# if __name__ == '__main__':
+#     plot_kernel_power_law()
+
+
+# class PowerLawHawkesParams(NamedTuple):
+#     log_base_rate: float
+#     logit_norm: float = logit(jnp.array(0.85)).item()
+#     log_omega: float = -jnp.log(30 * 1_000).item()
+#     log_beta: float = jnp.log(0.5).item()
+#     log_max_history_duration: float = jnp.log(2 * 86_400 * 1_000).item()
+
+
+# @jax.jit
+# def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> ModelOutput:
+#     n_exponentials = 10  # not differentiable
+#     base_rate = jnp.exp(params.log_base_rate)
+#     norm = jax.nn.sigmoid(params.logit_norm)
+#     omega = jnp.exp(params.log_omega)
+#     beta = jnp.exp(params.log_beta)
+#     max_history_duration = jnp.exp(params.log_max_history_duration)
+
+#     approx_params = kernel_power_law_params(
+#         omega=omega,
+#         beta=beta,
+#         max_history_duration=max_history_duration,
+#         n_exponentials=n_exponentials,
+#     )
+#     weights, rates = approx_params.weights, approx_params.rates
+
+#     def step(carry, x):
+#         decayed_counts = carry
+#         count, elapsed = x
+#         decay_factors = jnp.exp(-rates * elapsed)
+
+#         decayed_counts *= decay_factors
+#         loglik_rate = (
+#             base_rate
+#             + norm * jnp.sum(weights * decayed_counts)
+#         )
+#         loglik = poisson.logpmf(k=count, mu=loglik_rate * elapsed)
+
+#         decayed_counts += count
+#         forecast_rate = (
+#             base_rate
+#             + norm * jnp.sum(weights * decayed_counts)
+#         )
+#         return decayed_counts, (loglik, forecast_rate)
+
+#     init_carry = jnp.zeros(n_exponentials)
+#     xs = dataset.curr_count, dataset.elapsed
+#     _, y = jax.lax.scan(step, init_carry, xs)
+#     loglik, rate = y
+
+#     return ModelOutput(
+#         loglik=loglik,
+#         rate=rate,
+#     )
+
+
+# def plot_power_law_hawkes_rate(params: PowerLawHawkesParams,
+#                                dataset: Dataset,
+#                                input_df: pl.DataFrame) -> None:
+#     outputs = calc_power_law_hawkes(params, dataset)
+#     display(params)
+
+#     base_rate = jnp.exp(params.log_base_rate).item()
+#     norm = jax.nn.sigmoid(params.logit_norm).item()
+#     omega = jnp.exp(params.log_omega).item()
+
+#     print(f'{base_rate=}, {norm=}, {omega=}')
+#     df = (
+#         input_df
+#         .with_columns(
+#             loglik=np.asarray(outputs.loglik),
+#             rate=np.asarray(outputs.rate),
+#         )
+#     )
+#     display(df)
+#     subset = (
+#         df
+#         .filter(
+#             pl.col('time') >= datetime.datetime(2025, 12, 12, hour=12),
+#             pl.col('time') <= datetime.datetime(2025, 12, 13),
+#         )
+#     )
+#     _, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True)
+#     ax1.scatter(subset['time'], subset[['curr_count']], alpha=0.05, marker='.')
+#     ax2.plot(subset['time'], subset[['rate']])
+#     ax3.plot(subset['time'], subset[['loglik']])
+#     plt.tight_layout()
+#     plt.show()
+
+
+# init_pl_hawkes_params = PowerLawHawkesParams(
+#     log_base_rate=hawkes_optim_params.log_base_rate,
+#     logit_norm=hawkes_optim_params.logit_norm,
+#     log_omega=hawkes_optim_params.log_omega,
+# )
+
+
+# plot_power_law_hawkes_rate(init_pl_hawkes_params, DATASET, INPUT_DF)
+
+
+# flat_pl_hawkes_params, unflatten_pl_hawkes_params = ravel_pytree(
+#     init_pl_hawkes_params)
+
+
+# @jax.jit
+# def power_law_hawkes_loss(flat_params: Array, dataset: Dataset):
+#     params: PowerLawHawkesParams = unflatten_pl_hawkes_params(flat_params)
+#     output = calc_power_law_hawkes(params, dataset)
+#     return -output.loglik.mean()
+
+
+# optim_result = minimize(
+#     power_law_hawkes_loss,
+#     flat_pl_hawkes_params,
+#     args=(DATASET,),
+#     method='BFGS',
+# )
+
+
+# power_law_hawkes_optim_params = unflatten_pl_hawkes_params(optim_result.x)
+# power_law_hawkes_outputs = calc_power_law_hawkes(
+#     power_law_hawkes_optim_params, DATASET)
+# plot_power_law_hawkes_rate(power_law_hawkes_optim_params, DATASET, INPUT_DF)
 
 
 # %%
 
-
-class PowerLawHawkesParams(NamedTuple):
-    log_base_rate: float
-    logit_norm: float = logit(jnp.array(0.85)).item()
-    log_omega: float = -jnp.log(30 * 1_000).item()
-    log_beta: float = jnp.log(0.5).item()
-    log_max_history_duration: float = jnp.log(2 * 86_400 * 1_000).item()
-
-
-@jax.jit
-def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> ModelOutput:
-    n_exponentials = 10  # not differentiable
-    base_rate = jnp.exp(params.log_base_rate)
-    norm = jax.nn.sigmoid(params.logit_norm)
-    omega = jnp.exp(params.log_omega)
-    beta = jnp.exp(params.log_beta)
-    max_history_duration = jnp.exp(params.log_max_history_duration)
-
-    approx_params = kernel_power_law_params(
-        omega=omega,
-        beta=beta,
-        max_history_duration=max_history_duration,
-        n_exponentials=n_exponentials,
+with_logliks = (
+    INPUT_DF
+    .with_columns(
+        constant_loglik=np.asarray(constant_loglik(constant_rate, DATASET)),
+        rbf_loglik=np.asarray(rbf_outputs.loglik),
+        hawkes_loglik=np.asarray(hawkes_outputs.loglik),
+        rbf_hawkes_loglik=np.asarray(rbf_hawkes_outputs.loglik),
+        # pl_hawkes_loglik=np.asarray(power_law_hawkes_outputs.loglik),
     )
-    weights, rates = approx_params.weights, approx_params.rates
-
-    def step(carry, x):
-        decayed_counts = carry
-        count, elapsed = x
-        decay_factors = jnp.exp(-rates * elapsed)
-
-        decayed_counts *= decay_factors
-        loglik_rate = (
-            base_rate
-            + norm * jnp.sum(weights * decayed_counts)
-        )
-        loglik = poisson.logpmf(k=count, mu=loglik_rate * elapsed)
-
-        decayed_counts += count
-        forecast_rate = (
-            base_rate
-            + norm * jnp.sum(weights * decayed_counts)
-        )
-        return decayed_counts, (loglik, forecast_rate)
-
-    init_carry = jnp.zeros(n_exponentials)
-    xs = dataset.curr_count, dataset.elapsed
-    _, y = jax.lax.scan(step, init_carry, xs)
-    loglik, rate = y
-
-    return ModelOutput(
-        loglik=loglik,
-        rate=rate,
-    )
-
-
-def plot_power_law_hawkes_rate(params: PowerLawHawkesParams,
-                               dataset: Dataset,
-                               input_df: pl.DataFrame) -> None:
-    outputs = calc_power_law_hawkes(params, dataset)
-    display(params)
-
-    base_rate = jnp.exp(params.log_base_rate).item()
-    norm = jax.nn.sigmoid(params.logit_norm).item()
-    omega = jnp.exp(params.log_omega).item()
-
-    print(f'{base_rate=}, {norm=}, {omega=}')
-    df = (
-        input_df
-        .with_columns(
-            loglik=np.asarray(outputs.loglik),
-            rate=np.asarray(outputs.rate),
-        )
-    )
-    display(df)
-    subset = (
-        df
-        .filter(
-            pl.col('time') >= datetime.datetime(2025, 12, 12, hour=12),
-            pl.col('time') <= datetime.datetime(2025, 12, 13),
-        )
-    )
-    _, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True)
-    ax1.scatter(subset['time'], subset[['curr_count']], alpha=0.05, marker='.')
-    ax2.plot(subset['time'], subset[['rate']])
-    ax3.plot(subset['time'], subset[['loglik']])
-    plt.tight_layout()
-    plt.show()
-
-
-init_pl_hawkes_params = PowerLawHawkesParams(
-    log_base_rate=hawkes_optim_params.log_base_rate,
-    logit_norm=hawkes_optim_params.logit_norm,
-    log_omega=hawkes_optim_params.log_omega,
 )
-
-
-plot_power_law_hawkes_rate(init_pl_hawkes_params, DATASET, INPUT_DF)
-
-
-# %%
-
-
-flat_pl_hawkes_params, unflatten_pl_hawkes_params = ravel_pytree(
-    init_pl_hawkes_params)
-
-
-@jax.jit
-def power_law_hawkes_loss(flat_params: Array, dataset: Dataset):
-    params: PowerLawHawkesParams = unflatten_pl_hawkes_params(flat_params)
-    output = calc_power_law_hawkes(params, dataset)
-    return -output.loglik.mean()
-
-
-optim_result = minimize(
-    power_law_hawkes_loss,
-    flat_pl_hawkes_params,
-    args=(DATASET,),
-    method='BFGS',
-)
-
-
-power_law_hawkes_optim_params = unflatten_pl_hawkes_params(optim_result.x)
-power_law_hawkes_outputs = calc_power_law_hawkes(
-    power_law_hawkes_optim_params, DATASET)
-plot_power_law_hawkes_rate(power_law_hawkes_optim_params, DATASET, INPUT_DF)
-
-
-# %%
 
 
 result_df = (
-    INPUT_DF
-    .with_columns(
-        pl.col('time').dt.truncate('1h'),
-        constant_loglik=np.asarray(calc_loglik(constant_rate, DATASET)),
-        rbf_loglik=np.asarray(calc_loglik(rbf_rate, DATASET)),
-        hawkes_loglik=np.asarray(hawkes_outputs.loglik),
-        rbf_hawkes_loglik=np.asarray(rbf_hawkes_outputs.loglik),
-        pl_hawkes_loglik=np.asarray(power_law_hawkes_outputs.loglik),
-    )
-    .group_by('time', maintain_order=True)
+    with_logliks
+    .group_by(pl.col('time').dt.truncate('1h'), maintain_order=True)
     .sum()
     .with_columns(
         rbf_improvement=(
@@ -890,7 +843,10 @@ result_df
 # %%
 
 
-result_df.select(pl.selectors.ends_with('_loglik').sum())
+display(
+    with_logliks.select(pl.selectors.ends_with('_loglik')).sum(),
+    with_logliks.select(pl.selectors.ends_with('_loglik')).mean(),
+)
 
 
 # %%
@@ -912,10 +868,10 @@ result_df.select(pl.selectors.ends_with('_loglik').sum())
     .set_index('time')
     [[
         # 'constant_loglik',
-        # 'rbf_loglik',
-        # 'hawkes_loglik',
+        'rbf_loglik',
+        'hawkes_loglik',
         'rbf_hawkes_loglik',
-        'pl_hawkes_loglik',
+        # 'pl_hawkes_loglik',
     ]]
     .plot(alpha=0.6)
 )
