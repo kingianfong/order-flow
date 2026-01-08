@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import NamedTuple
 import datetime
 
+from IPython.display import display
 from jax import Array
 from jax.flatten_util import ravel_pytree
 from jax.scipy.optimize import minimize
@@ -59,7 +60,7 @@ def load_data(sym: str) -> pl.DataFrame:
 
 
 INPUT_DF = load_data('BTCUSDT')
-INPUT_DF
+display(INPUT_DF)
 
 
 # %%
@@ -103,7 +104,7 @@ DATASET = Dataset(
 
 
 closed_form_rate = DATASET.curr_count.sum() / DATASET.elapsed.sum()
-closed_form_rate
+display(closed_form_rate)
 
 
 # %%
@@ -567,72 +568,68 @@ class PowerLawApproxParams(NamedTuple):
     rates: Array
 
 
-def kernel_power_law_params(omega: ArrayLike,
-                            beta: ArrayLike,
-                            max_history_duration: ArrayLike,
-                            n_exponentials: int) -> PowerLawApproxParams:
+def power_law_decay_approx_params(omega: ArrayLike, beta: ArrayLike,
+                                  max_history_duration_ms: ArrayLike,
+                                  n_exponentials: int) -> PowerLawApproxParams:
+    # to approximate lomax decay
+    #   g(t) = (1 + omega * t) ^ -(1 + beta)
+    #        = E[ h(X; t) ]
+    # where
+    #   X ~ Gamma(1+beta, scale=omega)
+    #       -> f(x) = k * x^{beta} * exp{-x / omega}
+    #   h(x; t) = exp{-x * t}
 
-    alpha = 1.0 + beta
-    indices = jnp.arange(n_exponentials)
-    logb = jnp.log1p(omega * max_history_duration) / n_exponentials
-    inv_bi = jnp.exp(-indices * logb)          # b^{-i}
-    r = alpha * inv_bi                   # r_i = α / b^i
+    min_history_duration_ms = 1e-3  # one microsecond
 
-    # a_i = b^{-iα}
-    a = jnp.exp(-alpha * indices * logb)
-
-    # Normalize so that Σ a_i e^{-r_i} = 1  (=> Σ kernel_weights = ωβ)
-    er = jnp.exp(-r)
-    Z = jnp.sum(a * er)
-    a = a / Z
-
-    kernel_rates = omega * r
-    kernel_weights = omega * beta * a * er
+    # decay rate for each exponential
+    rates = jnp.geomspace(
+        1 / max_history_duration_ms,
+        1 / min_history_duration_ms,
+        n_exponentials,
+    )
+    # quadrature weights:
+    # approximate integral[ f(x)   * exp(-x   * t)   dx        ]
+    # as               sum[ f(x_i) * exp(-x_i * t) * delta_x_i ]
+    # Since x_i is geomspaced, delta_x_i is proportional to x_i.
+    log_pdf = jax.scipy.stats.gamma.logpdf(rates, a=1 + beta, scale=omega)
+    unnorm_log_weights = log_pdf + jnp.log(rates)
+    weights = jax.nn.softmax(unnorm_log_weights)
 
     return PowerLawApproxParams(
-        weights=jnp.asarray(kernel_weights),
-        rates=jnp.asarray(kernel_rates),
+        weights=jnp.asarray(weights),
+        rates=jnp.asarray(rates),
     )
 
 
-def plot_kernel_power_law():
+def plot_power_law_decay():
+    def calc_exact(t: Array, omega: float, beta: float):
+        return (1.0 + omega * t) ** -(1.0 + beta)
 
-    def approx_iterative(t: Array, params: PowerLawApproxParams) -> tuple[Array, Array]:
-        def step(carry, xs):
-            prev_t, decayed = carry
-            curr_t = xs
-            elapsed = curr_t - prev_t
-
-            decay_rates = jnp.exp(-params.rates * elapsed)
-            decayed *= decay_rates
-            curr_val = params.weights @ decayed
-
-            return (curr_t, decayed), (decayed, curr_val)
-
-        init_carry = 0.0, jnp.ones_like(params.rates)
-        _, (components, final) = jax.lax.scan(step, init_carry, xs=t)
-
-        return components, final
-
-    def kernel_power_law(t: Array, omega: float, beta: float):
-        numerator = omega * beta
-        denominator = (1 + omega * t) ** (1 + beta)
-        return numerator / denominator
+    # done sequentially to ensure markovian nature holds
+    def calc_approx(t: Array, params: PowerLawApproxParams) -> Array:
+        elapsed = jnp.concat([jnp.zeros(1), jnp.diff(t)])
+        counts = jnp.zeros_like(elapsed).at[0].set(1)
+        outer = jnp.outer(elapsed, params.rates)
+        decay_rates = jnp.exp(-outer)
+        decayed_counts = calculate_decayed_counts(decay_rates, counts)
+        return decayed_counts @ params.weights
 
     n = 10_000
-    min_t = 1e-3
-    max_t = 1e5
-    t_geom = jnp.geomspace(min_t, max_t, n)
-    max_history_duration = 1e5
-    n_exponentials = 8
+    one_micro = 1e-3
+    one_hour = 60 * 60 * 1e3  # 8 orders of magnitude
+    min_t_ms = one_micro
+    max_t_ms = one_hour * 10
+    t_geom = jnp.geomspace(min_t_ms, max_t_ms, n)
+    max_history_duration = one_hour
+    n_exponentials = 16  # 2x orders of magnitude
 
     omegas = 100, 1.0, 0.01
     betas = 1.0, 2.0, 3.0  # The 'beta' in the kernel definition
 
     f1, axes1 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
-    f1.suptitle('Hawkes Power-Law Kernel (Lomax) Approximation')
+    f1.suptitle('Lomax Kernel')
     f2, axes2 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
-    f2.suptitle('linear y, divided by $\\omega * \\beta$')
+    f2.suptitle('linear y')
     f3, axes3 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
     f3.suptitle('absolute error')
     f4, axes4 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
@@ -641,28 +638,30 @@ def plot_kernel_power_law():
     for r, omega in enumerate(omegas):
         for c, beta in enumerate(betas):
 
-            kernel_params = kernel_power_law_params(
+            kernel_params = power_law_decay_approx_params(
                 omega=omega,
                 beta=beta,
-                max_history_duration=max_history_duration,
+                max_history_duration_ms=max_history_duration,
                 n_exponentials=n_exponentials,
             )
 
-            exact = kernel_power_law(t_geom, omega=omega, beta=beta)
-            _, approx = approx_iterative(t_geom, kernel_params)
+            exact = calc_exact(t_geom, omega=omega, beta=beta)
+            approx = calc_approx(t_geom, kernel_params)
 
             ax1 = axes1[r, c]
-            ax1.loglog(t_geom, exact, 'k-', label='Exact Lomax Kernel', lw=2)
-            ax1.loglog(t_geom, approx, 'r--', label='SOE Approximation', lw=2)
+            ax1.loglog(t_geom, exact, 'k-', label='exact', lw=2)
+            ax1.loglog(t_geom, approx, 'r--', label='approx', lw=2)
             ax1.set_title(f"$\\omega={omega}, \\beta={beta}$")
             ax1.grid(True, which="both", ls="-", alpha=0.2)
+            ax1.legend(loc='lower left')
 
             ax2 = axes2[r, c]
-            ax2.plot(t_geom, exact / (omega * beta), 'k-', lw=2)
-            ax2.plot(t_geom, approx / (omega * beta), 'r--', lw=2)
+            ax2.plot(t_geom, exact, 'k-', label='exact', lw=2)
+            ax2.plot(t_geom, approx, 'r--', label='approx', lw=2)
             ax2.set_xscale('log')
             ax2.set_title(f"$\\omega={omega}, \\beta={beta}$")
             ax2.grid(True, which="both", ls="-", alpha=0.2)
+            ax2.legend(loc='upper right')
 
             ax3 = axes3[r, c]
             ax3.loglog(t_geom, abs(approx - exact), 'k-', lw=2)
@@ -678,136 +677,139 @@ def plot_kernel_power_law():
     plt.show()
 
 
-# if __name__ == '__main__':
-#     plot_kernel_power_law()
-
-
-# class PowerLawHawkesParams(NamedTuple):
-#     log_base_rate: float
-#     logit_norm: float = logit(jnp.array(0.85)).item()
-#     log_omega: float = -jnp.log(30 * 1_000).item()
-#     log_beta: float = jnp.log(0.5).item()
-#     log_max_history_duration: float = jnp.log(2 * 86_400 * 1_000).item()
-
-
-# @jax.jit
-# def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> ModelOutput:
-#     n_exponentials = 10  # not differentiable
-#     base_rate = jnp.exp(params.log_base_rate)
-#     norm = jax.nn.sigmoid(params.logit_norm)
-#     omega = jnp.exp(params.log_omega)
-#     beta = jnp.exp(params.log_beta)
-#     max_history_duration = jnp.exp(params.log_max_history_duration)
-
-#     approx_params = kernel_power_law_params(
-#         omega=omega,
-#         beta=beta,
-#         max_history_duration=max_history_duration,
-#         n_exponentials=n_exponentials,
-#     )
-#     weights, rates = approx_params.weights, approx_params.rates
-
-#     def step(carry, x):
-#         decayed_counts = carry
-#         count, elapsed = x
-#         decay_factors = jnp.exp(-rates * elapsed)
-
-#         decayed_counts *= decay_factors
-#         loglik_rate = (
-#             base_rate
-#             + norm * jnp.sum(weights * decayed_counts)
-#         )
-#         loglik = poisson.logpmf(k=count, mu=loglik_rate * elapsed)
-
-#         decayed_counts += count
-#         forecast_rate = (
-#             base_rate
-#             + norm * jnp.sum(weights * decayed_counts)
-#         )
-#         return decayed_counts, (loglik, forecast_rate)
-
-#     init_carry = jnp.zeros(n_exponentials)
-#     xs = dataset.curr_count, dataset.elapsed
-#     _, y = jax.lax.scan(step, init_carry, xs)
-#     loglik, rate = y
-
-#     return ModelOutput(
-#         loglik=loglik,
-#         rate=rate,
-#     )
-
-
-# def plot_power_law_hawkes_rate(params: PowerLawHawkesParams,
-#                                dataset: Dataset,
-#                                input_df: pl.DataFrame) -> None:
-#     outputs = calc_power_law_hawkes(params, dataset)
-#     display(params)
-
-#     base_rate = jnp.exp(params.log_base_rate).item()
-#     norm = jax.nn.sigmoid(params.logit_norm).item()
-#     omega = jnp.exp(params.log_omega).item()
-
-#     print(f'{base_rate=}, {norm=}, {omega=}')
-#     df = (
-#         input_df
-#         .with_columns(
-#             loglik=np.asarray(outputs.loglik),
-#             rate=np.asarray(outputs.rate),
-#         )
-#     )
-#     display(df)
-#     subset = (
-#         df
-#         .filter(
-#             pl.col('time') >= datetime.datetime(2025, 12, 12, hour=12),
-#             pl.col('time') <= datetime.datetime(2025, 12, 13),
-#         )
-#     )
-#     _, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True)
-#     ax1.scatter(subset['time'], subset[['curr_count']], alpha=0.05, marker='.')
-#     ax2.plot(subset['time'], subset[['rate']])
-#     ax3.plot(subset['time'], subset[['loglik']])
-#     plt.tight_layout()
-#     plt.show()
-
-
-# init_pl_hawkes_params = PowerLawHawkesParams(
-#     log_base_rate=hawkes_optim_params.log_base_rate,
-#     logit_norm=hawkes_optim_params.logit_norm,
-#     log_omega=hawkes_optim_params.log_omega,
-# )
-
-
-# plot_power_law_hawkes_rate(init_pl_hawkes_params, DATASET, INPUT_DF)
-
-
-# flat_pl_hawkes_params, unflatten_pl_hawkes_params = ravel_pytree(
-#     init_pl_hawkes_params)
-
-
-# @jax.jit
-# def power_law_hawkes_loss(flat_params: Array, dataset: Dataset):
-#     params: PowerLawHawkesParams = unflatten_pl_hawkes_params(flat_params)
-#     output = calc_power_law_hawkes(params, dataset)
-#     return -output.loglik.mean()
-
-
-# optim_result = minimize(
-#     power_law_hawkes_loss,
-#     flat_pl_hawkes_params,
-#     args=(DATASET,),
-#     method='BFGS',
-# )
-
-
-# power_law_hawkes_optim_params = unflatten_pl_hawkes_params(optim_result.x)
-# power_law_hawkes_outputs = calc_power_law_hawkes(
-#     power_law_hawkes_optim_params, DATASET)
-# plot_power_law_hawkes_rate(power_law_hawkes_optim_params, DATASET, INPUT_DF)
+if __name__ == '__main__':
+    plot_power_law_decay()
 
 
 # %%
 
+
+class PowerLawHawkesParams(NamedTuple):
+    log_base_rate: float
+    logit_norm: float
+    log_omega: float
+    log_beta: float = jnp.log(0.5).item()
+    log_max_history_duration: float = jnp.log(60 * 60 * 1_000).item()
+
+
+@jax.jit
+def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> ModelOutput:
+    n_exponentials = 10  # not differentiable
+
+    base_rate = jnp.exp(params.log_base_rate)
+    norm = jax.nn.sigmoid(params.logit_norm)
+    omega = jnp.exp(params.log_omega)
+    beta = jnp.exp(params.log_beta)
+    max_history_duration = jnp.exp(params.log_max_history_duration)
+
+    kernel_factor = norm * omega * beta
+
+    approx_params = power_law_decay_approx_params(
+        omega=omega,
+        beta=beta,
+        max_history_duration_ms=max_history_duration,
+        n_exponentials=n_exponentials,
+    )
+    weights, rates = approx_params.weights, approx_params.rates
+
+    decay_factor_exponents = -jnp.outer(dataset.elapsed, rates)
+    decay_factors = jnp.exp(decay_factor_exponents)
+    decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
+
+    # loglik of interval that just passed with no events
+    prev_decayed_count = jnp.roll(decayed_count, 1, axis=0).at[0, :].set(0.0)
+    term_per_exp = -jnp.expm1(decay_factor_exponents) / rates
+    integral_history = (prev_decayed_count * term_per_exp) @ weights
+
+    interval_term = \
+        (dataset.elapsed * base_rate) \
+        + (kernel_factor * integral_history)
+
+    # loglik of event(s) at current timestamp
+    curr_minus_count = prev_decayed_count * decay_factors
+    event_rate = base_rate + kernel_factor * (curr_minus_count @ weights)
+    event_term = dataset.curr_count * jnp.log(event_rate)
+
+    forecast_rate = base_rate + kernel_factor * (decayed_count @ weights)
+
+    return ModelOutput(
+        loglik=event_term - interval_term,
+        rate=forecast_rate,
+    )
+
+
+def plot_power_law_hawkes_rate(params: PowerLawHawkesParams,
+                               dataset: Dataset,
+                               input_df: pl.DataFrame) -> None:
+    outputs = calc_power_law_hawkes(params, dataset)
+    display(params)
+
+    base_rate = jnp.exp(params.log_base_rate).item()
+    norm = jax.nn.sigmoid(params.logit_norm).item()
+    omega = jnp.exp(params.log_omega).item()
+
+    print(f'{base_rate=}, {norm=}, {omega=}')
+    df = (
+        input_df
+        .with_columns(
+            loglik=np.asarray(outputs.loglik),
+            rate=np.asarray(outputs.rate),
+        )
+    )
+    display(df)
+    subset = (
+        df
+        .filter(
+            pl.col('time') >= datetime.datetime(2025, 12, 12, hour=12),
+            pl.col('time') <= datetime.datetime(2025, 12, 13),
+        )
+    )
+    _, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True)
+    ax1.scatter(subset['time'], subset[['curr_count']], alpha=0.05, marker='.')
+    ax2.plot(subset['time'], subset[['rate']])
+    ax3.plot(subset['time'], subset[['loglik']])
+    plt.tight_layout()
+    plt.show()
+
+
+init_pl_hawkes_params = PowerLawHawkesParams(
+    log_base_rate=hawkes_optim_params.log_base_rate,
+    logit_norm=hawkes_optim_params.logit_norm,
+    log_omega=hawkes_optim_params.log_omega,
+)
+
+
+plot_power_law_hawkes_rate(init_pl_hawkes_params, DATASET, INPUT_DF)
+
+# %%
+
+
+flat_pl_hawkes_params, unflatten_pl_hawkes_params = ravel_pytree(
+    init_pl_hawkes_params)
+
+
+@jax.jit
+def power_law_hawkes_loss(flat_params: Array, dataset: Dataset):
+    params: PowerLawHawkesParams = unflatten_pl_hawkes_params(flat_params)
+    output = calc_power_law_hawkes(params, dataset)
+    return -output.loglik.mean()
+
+
+optim_result = minimize(
+    power_law_hawkes_loss,
+    flat_pl_hawkes_params,
+    args=(DATASET,),
+    method='BFGS',
+)
+
+
+power_law_hawkes_optim_params = unflatten_pl_hawkes_params(optim_result.x)
+power_law_hawkes_outputs = calc_power_law_hawkes(
+    power_law_hawkes_optim_params, DATASET)
+plot_power_law_hawkes_rate(power_law_hawkes_optim_params, DATASET, INPUT_DF)
+
+
+# %%
 with_logliks = (
     INPUT_DF
     .with_columns(
@@ -815,7 +817,7 @@ with_logliks = (
         rbf_loglik=np.asarray(rbf_outputs.loglik),
         hawkes_loglik=np.asarray(hawkes_outputs.loglik),
         rbf_hawkes_loglik=np.asarray(rbf_hawkes_outputs.loglik),
-        # pl_hawkes_loglik=np.asarray(power_law_hawkes_outputs.loglik),
+        pl_hawkes_loglik=np.asarray(power_law_hawkes_outputs.loglik),
     )
 )
 
@@ -837,7 +839,7 @@ result_df = (
 )
 
 
-result_df
+display(result_df)
 
 
 # %%
@@ -867,11 +869,11 @@ display(
     .to_pandas()
     .set_index('time')
     [[
-        # 'constant_loglik',
+        'constant_loglik',
         'rbf_loglik',
         'hawkes_loglik',
         'rbf_hawkes_loglik',
-        # 'pl_hawkes_loglik',
+        'pl_hawkes_loglik',
     ]]
     .plot(alpha=0.6)
 )
