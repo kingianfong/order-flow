@@ -4,5 +4,7 @@
 !LICENSE
 !environment.yml
 
-!scripts
-!scripts/**
+!py
+!py/**
+
+__pycache__
