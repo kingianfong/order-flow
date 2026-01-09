@@ -33,8 +33,9 @@ def load_data(sym: str) -> pl.DataFrame:
         pl.scan_parquet(DATA_DIR)
         .filter(
             pl.col('sym') == pl.lit(sym),
-            pl.col('date') >= datetime.date(2025, 12, 1),
-            pl.col('date') <= datetime.date(2025, 12, 5),
+            pl.col('date') < datetime.date(2025, 11, 1),
+            # pl.col('date') >= datetime.date(2025, 12, 1),
+            # pl.col('date') <= datetime.date(2025, 12, 5),
         )
         .select(
             pl.col('time'),
@@ -79,7 +80,11 @@ class RbfConstants:
     sigma = width_factor * n_hours / n_centers
     inv_sigma_sq = 1.0 / (sigma**2)
 
-    l2_reg: float = 0.1
+    @staticmethod
+    def reg_penalty(weights: Array) -> Array:
+        # TODO: consider penalising differences between adjacent elements
+        l2_reg: float = 0.1
+        return jnp.sum(jnp.square(weights)) * l2_reg
 
 
 def calc_rbf_basis(time_of_day: Array) -> Array:
@@ -139,12 +144,13 @@ def get_pytree_labels(params):
     return labels
 
 
-def run_optim(init, loss_fn, loss_kwargs, verbose=False) -> Any:
+def run_optim(init, loss_fn, loss_kwargs,
+              show_hessian=False,
+              verbose=False) -> Any:
     opt = optax.lbfgs(
         memory_size=20,
         linesearch=optax.scale_by_zoom_linesearch(
             max_linesearch_steps=20,
-            max_learning_rate=2,
             verbose=verbose,
             initial_guess_strategy='one'
         ),
@@ -190,32 +196,32 @@ def run_optim(init, loss_fn, loss_kwargs, verbose=False) -> Any:
     else:
         print(f'converged: {n_iter=}')
 
-    flat_params, unravel = ravel_pytree(final_params)
+    if show_hessian:
+        flat_params, unravel = ravel_pytree(final_params)
 
-    def flat_loss_fn(flat_p, dataset):
-        return loss_fn(unravel(flat_p), dataset)
+        def flat_loss_fn(flat_p, dataset):
+            return loss_fn(unravel(flat_p), dataset)
 
-    labels = get_pytree_labels(final_params)
+        labels = get_pytree_labels(final_params)
+        calc_hessian = jax.jit(jax.hessian(flat_loss_fn))
+        hessian_matrix = calc_hessian(flat_params, dataset=DATASET)
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(
+            pd.DataFrame(
+                jnp.linalg.pinv(hessian_matrix),
+                index=labels,
+                columns=labels,
+            ),
+            # annot=True,
+            center=0.0,
+            robust=True,
+        )
+        plt.title("Inverse Hessian Matrix")
+        plt.show()
 
-    # 4. Convert to DataFrame for Seaborn
+        cond = jnp.linalg.cond(hessian_matrix)
+        print(f"Condition Number: {cond} (closer to 1 is better)")
 
-    hessian_matrix = jax.hessian(flat_loss_fn)(flat_params, dataset=DATASET)
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(
-        pd.DataFrame(
-            jnp.linalg.pinv(hessian_matrix),
-            index=labels,
-            columns=labels,
-        ),
-        # annot=True,
-        center=0.0,
-        robust=True,
-    )
-    plt.title("Inverse Hessian Matrix")
-    plt.show()
-
-    cond = jnp.linalg.cond(hessian_matrix)
-    print(f"Condition Number: {cond} (closer to 1 is better)")
     return final_params
 
 
@@ -306,8 +312,7 @@ plot_rbf(init_rbf_params.log_base_rate, init_rbf_params.weights)
 @jax.jit
 def rbf_loss(params: RbfRateParams, dataset: Dataset):
     output = calc_rbf(params, dataset)
-    reg_penalty = jnp.sum(jnp.square(params.weights)) * RbfConstants.l2_reg
-    return -output.loglik.mean() + reg_penalty
+    return -output.loglik.mean() + RbfConstants.reg_penalty(params.weights)
 
 
 rbf_optim_params = run_optim(
@@ -542,6 +547,7 @@ hawkes_optim_params = run_optim(
     init_hawkes_params,
     hawkes_loss,
     loss_kwargs=dict(dataset=DATASET),
+    show_hessian=True,
 )
 
 hawkes_outputs = calc_hawkes(hawkes_optim_params, DATASET)
@@ -610,16 +616,14 @@ show_rbf_hawkes(init_rbf_hawkes, DATASET, INPUT_DF)
 @jax.jit
 def rbf_hawkes_loss(params: RbfHawkesParams, dataset: Dataset):
     output = calc_rbf_hawkes(params, dataset)
-    reg_penalty = (
-        jnp.sum(jnp.square(params.weights)) * RbfConstants.l2_reg
-    )
-    return -output.loglik.mean() + reg_penalty
+    return -output.loglik.mean() + RbfConstants.reg_penalty(params.weights)
 
 
 rbf_hawkes_optim_params = run_optim(
     init_rbf_hawkes,
     rbf_hawkes_loss,
     loss_kwargs=dict(dataset=DATASET),
+    show_hessian=False,
 )
 rbf_hawkes_outputs = calc_rbf_hawkes(rbf_hawkes_optim_params, DATASET)
 show_rbf_hawkes(rbf_hawkes_optim_params, DATASET, INPUT_DF)
@@ -633,7 +637,13 @@ class PowerLawApproxParams(NamedTuple):
     rates: Array
 
 
+_one_millisecond = 1.0  # timestamp resolution
+_one_minute = _one_millisecond * 60e3
+_one_hour = _one_minute * 60
+
+
 def power_law_decay_approx_params(omega: ArrayLike, beta: ArrayLike,
+                                  min_history_duration_ms: ArrayLike,
                                   max_history_duration_ms: ArrayLike,
                                   n_exponentials: int) -> PowerLawApproxParams:
     # to approximate lomax decay
@@ -643,8 +653,6 @@ def power_law_decay_approx_params(omega: ArrayLike, beta: ArrayLike,
     #   X ~ Gamma(1+beta, scale=omega)
     #       -> f(x) = k * x^{beta} * exp{-x / omega}
     #   h(x; t) = exp{-x * t}
-
-    min_history_duration_ms = 1e-3  # one microsecond
 
     # decay rate for each exponential
     rates = jnp.geomspace(
@@ -680,33 +688,36 @@ def plot_power_law_decay():
         return decayed_counts @ params.weights
 
     n = 10_000
-    one_micro = 1e-3
-    one_hour = 60 * 60 * 1e3  # 8 orders of magnitude
-    min_t_ms = one_micro
-    max_t_ms = one_hour * 10
-    t_geom = jnp.geomspace(min_t_ms, max_t_ms, n)
-    max_history_duration = one_hour
-    n_exponentials = 16  # 2x orders of magnitude
+    min_t_ms = _one_millisecond
+    max_t_ms = _one_hour
+    t_geom = jnp.geomspace(min_t_ms, max_t_ms * 10, n)
+    orders_of_magnitude = jnp.log10(max_t_ms / min_t_ms).item()
+    print(f'{orders_of_magnitude=:.2f}')
+    n_exponentials = 14  # 2x orders of magnitude
 
-    omegas = 100, 1.0, 0.01
-    betas = 1.0, 2.0, 3.0  # The 'beta' in the kernel definition
+    omegas = 1 / _one_millisecond, 1 / _one_minute, 1 / _one_hour
+    betas = 0.15, 0.3, 0.5
 
     f1, axes1 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
     f1.suptitle('Lomax Kernel')
     f2, axes2 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
     f2.suptitle('linear y')
     f3, axes3 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
-    f3.suptitle('absolute error')
+    f3.suptitle('linear x, linear y')
     f4, axes4 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
-    f4.suptitle('relative error')
+    f4.suptitle('absolute error')
+    f5, axes5 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
+    f5.suptitle('relative error')
 
     for r, omega in enumerate(omegas):
+        inv_omega = 1.0 / omega
         for c, beta in enumerate(betas):
 
             kernel_params = power_law_decay_approx_params(
                 omega=omega,
                 beta=beta,
-                max_history_duration_ms=max_history_duration,
+                min_history_duration_ms=min_t_ms,
+                max_history_duration_ms=max_t_ms,
                 n_exponentials=n_exponentials,
             )
             exact_integral = 1 / (omega * beta)
@@ -722,27 +733,44 @@ def plot_power_law_decay():
             ax1 = axes1[r, c]
             ax1.loglog(t_geom, exact, 'k-', label='exact', lw=2)
             ax1.loglog(t_geom, approx, 'r--', label='approx', lw=2)
-            ax1.set_title(f"$\\omega={omega}, \\beta={beta}$")
-            ax1.grid(True, which="both", ls="-", alpha=0.2)
+            ax1.set_title(f"$\\omega$={omega:1.1e},$\\beta$={beta}")
+            ax1.grid(True, which="both", ls="--", alpha=0.2)
             ax1.legend(loc='lower left')
 
             ax2 = axes2[r, c]
             ax2.plot(t_geom, exact, 'k-', label='exact', lw=2)
             ax2.plot(t_geom, approx, 'r--', label='approx', lw=2)
+            ax2.axvline(inv_omega, c='g', linestyle='--', alpha=0.6,
+                        label=r'$\omega^{-1}$')
+            ax2.axvline(max_t_ms, c='k', linestyle='--', alpha=0.2)
             ax2.set_xscale('log')
-            ax2.set_title(f"$\\omega={omega}, \\beta={beta}$")
-            ax2.grid(True, which="both", ls="-", alpha=0.2)
+            ax2.set_title(f"$\\omega$={omega:1.1e},$\\beta$={beta}")
+            ax2.grid(True, which="both", ls="--", alpha=0.2)
             ax2.legend(loc='upper right')
 
             ax3 = axes3[r, c]
-            ax3.loglog(t_geom, abs(approx - exact), 'k-', lw=2)
-            ax3.set_title(f"$\\omega={omega}, \\beta={beta}$")
-            ax3.grid(True, which="both", ls="-", alpha=0.2)
+            keep = t_geom < (2 * _one_hour)
+            ax3.plot(t_geom[keep], exact[keep], 'k-', label='exact', lw=2)
+            ax3.plot(t_geom[keep], approx[keep], 'r--', label='approx', lw=2)
+            ax3.axvline(inv_omega, c='g', linestyle='--', alpha=0.6,
+                        label=r'$\omega^{-1}$')
+            ax3.set_title(f"$\\omega$={omega:1.1e},$\\beta$={beta}")
+            ax3.grid(True, which="both", ls="--", alpha=0.2)
+            ax3.legend(loc='upper right')
 
             ax4 = axes4[r, c]
-            ax4.loglog(t_geom, abs(approx - exact) / exact, 'k-', lw=2)
-            ax4.set_title(f"$\\omega={omega}, \\beta={beta}$")
-            ax4.grid(True, which="both", ls="-", alpha=0.2)
+            ax4.loglog(t_geom, abs(approx - exact), 'k-', lw=2)
+            ax4.axvline(inv_omega, c='g', linestyle='--', alpha=0.6,
+                        label=r'$\omega^{-1}$')
+            ax4.set_title(f"$\\omega$={omega:1.1e},$\\beta$={beta}")
+            ax4.grid(True, which="both", ls="--", alpha=0.2)
+
+            ax5 = axes5[r, c]
+            ax5.loglog(t_geom, abs(approx - exact) / exact, 'k-', lw=2)
+            ax5.axvline(inv_omega, c='g', linestyle='--', alpha=0.6,
+                        label=r'$\omega^{-1}$')
+            ax5.set_title(f"$\\omega$={omega:1.1e},$\\beta$={beta}")
+            ax5.grid(True, which="both", ls="--", alpha=0.2)
 
     plt.tight_layout()
     plt.show()
@@ -755,35 +783,41 @@ if __name__ == '__main__':
 # %%
 
 
-_max_history_duration_ms: Array = jnp.array(10 * 60 * 1_000)  # 10 minutes
-
-
 class PowerLawHawkesParams(NamedTuple):
     log_base_rate: Array
     logit_norm: Array
-    log_omega: Array = jnp.log(1 / 1000)  # decay starts after 1000ms
     log_beta: Array = jnp.log(0.15)
 
 
 @jax.jit
-def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> ModelOutput:
+def calc_power_law_hawkes(params: PowerLawHawkesParams,
+                          dataset: Dataset,
+                          # fix omega to min resolution (1ms) to avoid
+                          # identifiability with beta. roughly corresponds to
+                          # where the plateau crosses over to power-law tail
+                          omega: float = 1.0 / _one_millisecond,
+                          ) -> ModelOutput:
     n_exponentials = 10  # not differentiable
+    min_history_duration_ms: Array = jnp.array(_one_millisecond)
+    max_history_duration_ms: Array = jnp.array(_one_hour * 2)
 
     base_rate = jnp.exp(params.log_base_rate)
     norm = jax.nn.sigmoid(params.logit_norm)
-    omega = jnp.exp(params.log_omega)
+    omega = 1.0 / _one_millisecond
     beta = jnp.exp(params.log_beta)
 
     approx_params = power_law_decay_approx_params(
         omega=omega,
         beta=beta,
-        max_history_duration_ms=_max_history_duration_ms,
+        min_history_duration_ms=min_history_duration_ms,
+        max_history_duration_ms=max_history_duration_ms,
         n_exponentials=n_exponentials,
     )
     weights, rates = approx_params.weights, approx_params.rates
     approx_integral = jnp.sum(weights / rates)
     kernel_factor = norm / approx_integral
 
+    # TODO: switch to scan if run out of memory
     decay_factor_exponents = -jnp.outer(dataset.elapsed, rates)
     decay_factors = jnp.exp(decay_factor_exponents)
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
@@ -832,21 +866,7 @@ show_power_law_hawkes(init_pl_hawkes_params, DATASET, INPUT_DF)
 @jax.jit
 def power_law_hawkes_loss(params: PowerLawHawkesParams, dataset: Dataset):
     output = calc_power_law_hawkes(params, dataset)
-    base_rate_seconds = jnp.exp(params.log_base_rate) * 1e3
-    base_rate_penalty = jnp.square(base_rate_seconds - 30)
-
-    # penalise their "negative correlation" by making it such that
-    # one high one low is bad
-    interaction_penalty = jnp.square(params.log_beta - params.log_omega)
-    flat, _ = ravel_pytree(params)
-    l2_penalty = jnp.sum(jnp.square(flat))
-
-    reg_penalty = (
-        base_rate_penalty * 0.01
-        + interaction_penalty * 0.01
-        + l2_penalty * 0.01
-    )
-    return -output.loglik.mean() + reg_penalty
+    return -output.loglik.mean()
 
 
 power_law_hawkes_optim_params = run_optim(
@@ -860,6 +880,8 @@ show_power_law_hawkes(power_law_hawkes_optim_params, DATASET, INPUT_DF)
 
 
 # %%
+
+
 with_logliks = (
     INPUT_DF
     .with_columns(
@@ -872,50 +894,19 @@ with_logliks = (
 )
 
 
-result_df = (
-    with_logliks
-    .group_by(pl.col('time').dt.truncate('1h'), maintain_order=True)
-    .sum()
-    .with_columns(
-        rbf_improvement=(
-            pl.col('rbf_loglik')
-            - pl.col('constant_loglik')
-        ),
-        hawkes_improvement=(
-            pl.col('hawkes_loglik')
-            - pl.col('rbf_loglik')
-        ),
-    )
-)
-
-
-display(result_df)
-
-
-# %%
-
-
+print('note: not a fair comparison because number of parameters differ')
 display(
     with_logliks.select(pl.selectors.ends_with('_loglik')).sum(),
     with_logliks.select(pl.selectors.ends_with('_loglik')).mean(),
 )
 
 
-# %%
-
-
 (
-    result_df
-    .group_by(pl.col('time').dt.time().alias('time')).sum()
-    .sort('hawkes_improvement')
-)
-
-
-# %%
-
-
-(
-    result_df
+    with_logliks
+    .group_by(pl.col('time').dt.truncate('1h'), maintain_order=True)
+    .agg(
+        pl.selectors.ends_with('_loglik').sum()
+    )
     .to_pandas()
     .set_index('time')
     [[
