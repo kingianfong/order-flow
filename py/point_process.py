@@ -31,7 +31,8 @@ def load_data(sym: str) -> pl.DataFrame:
         pl.scan_parquet(DATA_DIR)
         .filter(
             pl.col('sym') == pl.lit(sym),
-            pl.col('date') >= datetime.date(2025, 12, 1),
+            pl.col('date') >= datetime.date(2025, 12, 11),
+            pl.col('date') <= datetime.date(2025, 12, 15),
         )
         .select(
             pl.col('time'),
@@ -104,36 +105,66 @@ DATASET = Dataset(
 
 
 closed_form_rate = DATASET.curr_count.sum() / DATASET.elapsed.sum()
-display(closed_form_rate)
+display(closed_form_rate, jnp.log(closed_form_rate).item())
 
 
 # %%
 
 
-# assumes rate is effectively constant
+# wrapper over jax.scipy.minimize
+# to facilitate replacement with other optimisers
+def run_optim(init, loss_fn, args):
+    flat_init, unflatten = ravel_pytree(init)
+
+    def flat_wrapper(flat_params, args):
+        params = unflatten(flat_params)
+        return loss_fn(params, args)
+
+    optim_result = minimize(
+        flat_wrapper,
+        flat_init,
+        args=args,
+        method='bfgs',  # jax 0.7.2 uses zoom line search
+        options=dict(
+            maxiter=20,
+        )
+    )
+    if not optim_result.success:
+        print('warning: optimisation failed')
+        result_dict = optim_result._asdict()
+        scalars = {k: v for k, v in result_dict.items() if jnp.isscalar(v)}
+        df = pl.DataFrame(
+            data=dict(
+                key=scalars.keys(),
+                value=scalars.values(),
+            )
+        )
+        display(df)
+
+    return unflatten(optim_result.x)
+
+
 def constant_loglik(rate: ArrayLike, dataset: Dataset) -> Array:
     # assume constant rate throughout interval
     return dataset.curr_count * jnp.log(rate) - rate * dataset.elapsed
 
 
+@jax.jit
 def constant_rate_loss(params: Array, dataset: Dataset):
     log_rate, = params
     rate = jnp.exp(log_rate)
     return -constant_loglik(rate, dataset).mean()
 
 
-init_constant_rate_guess = jnp.array([jnp.log(closed_form_rate + 1e-1)])
-
-
-constant_optim_result = minimize(
-    constant_rate_loss,
-    init_constant_rate_guess,
+log_constant_rate_result = run_optim(
+    init=(jnp.log(closed_form_rate + 1e-1), ),
+    loss_fn=constant_rate_loss,
     args=(DATASET,),
-    method='BFGS',
 )
 
 
-constant_rate = jnp.exp(constant_optim_result.x[0])
+constant_rate = jnp.exp(log_constant_rate_result[0]).item()
+
 print(f'{closed_form_rate=:.8f}, {constant_rate=:.8f}')
 
 
@@ -197,26 +228,18 @@ plot_rbf(init_rbf_params.log_base_rate, init_rbf_params.weights)
 # %%
 
 
-flat_rbf_params, unflatten_rbf_params = ravel_pytree(init_rbf_params)
-
-
 @jax.jit
-def rbf_loss(flat_params: Array, dataset: Dataset):
-    params: RbfRateParams = unflatten_rbf_params(flat_params)
+def rbf_loss(params: RbfRateParams, dataset: Dataset):
     output = calc_rbf(params, dataset)
     reg_penalty = jnp.sum(jnp.square(params.weights)) * RbfConstants.l2_reg
     return -output.loglik.mean() + reg_penalty
 
 
-rbf_optim_result = minimize(
+rbf_optim_params = run_optim(
+    init_rbf_params,
     rbf_loss,
-    flat_rbf_params,
     args=(DATASET,),
-    method='BFGS',
 )
-
-
-rbf_optim_params = unflatten_rbf_params(rbf_optim_result.x)
 rbf_outputs = calc_rbf(rbf_optim_params, DATASET)
 plot_rbf(rbf_optim_params.log_base_rate, rbf_optim_params.weights)
 
@@ -446,25 +469,18 @@ plot_hawkes(init_hawkes_params, DATASET, INPUT_DF)
 # %%
 
 
-flat_hawkes_params, unflatten_hawkes_params = ravel_pytree(init_hawkes_params)
-
-
 @jax.jit
-def hawkes_loss(flat_params: Array, dataset: Dataset):
-    params = unflatten_hawkes_params(flat_params)
+def hawkes_loss(params: HawkesParams, dataset: Dataset):
     output = calc_hawkes(params, dataset)
     return -output.loglik.mean()
 
 
-hawkes_optim_result = minimize(
+hawkes_optim_params = run_optim(
+    init_hawkes_params,
     hawkes_loss,
-    flat_hawkes_params,
     args=(DATASET,),
-    method='BFGS',
 )
 
-
-hawkes_optim_params = unflatten_hawkes_params(hawkes_optim_result.x)
 hawkes_outputs = calc_hawkes(hawkes_optim_params, DATASET)
 plot_hawkes(hawkes_optim_params, DATASET, INPUT_DF)
 
@@ -532,13 +548,8 @@ plot_rbf_hawkes(init_rbf_hawkes, DATASET, INPUT_DF)
 # %%
 
 
-flat_rbf_hawkes_params, unflatten_rbf_hawkes_params = ravel_pytree(
-    init_rbf_hawkes)
-
-
 @jax.jit
-def rbf_hawkes_loss(flat_params: Array, dataset: Dataset):
-    params: RbfHawkesParams = unflatten_rbf_hawkes_params(flat_params)
+def rbf_hawkes_loss(params: RbfHawkesParams, dataset: Dataset):
     output = calc_rbf_hawkes(params, dataset)
     reg_penalty = (
         jnp.sum(jnp.square(params.weights)) * RbfConstants.l2_reg
@@ -546,16 +557,11 @@ def rbf_hawkes_loss(flat_params: Array, dataset: Dataset):
     return -output.loglik.mean() + reg_penalty
 
 
-rbf_hawkes_optim_result = minimize(
+rbf_hawkes_optim_params = run_optim(
+    init_rbf_hawkes,
     rbf_hawkes_loss,
-    flat_rbf_hawkes_params,
     args=(DATASET,),
-    method='BFGS',
 )
-
-
-rbf_hawkes_optim_params = unflatten_rbf_hawkes_params(
-    rbf_hawkes_optim_result.x)
 rbf_hawkes_outputs = calc_rbf_hawkes(rbf_hawkes_optim_params, DATASET)
 plot_rbf_hawkes(rbf_hawkes_optim_params, DATASET, INPUT_DF)
 
@@ -784,26 +790,17 @@ plot_power_law_hawkes_rate(init_pl_hawkes_params, DATASET, INPUT_DF)
 # %%
 
 
-flat_pl_hawkes_params, unflatten_pl_hawkes_params = ravel_pytree(
-    init_pl_hawkes_params)
-
-
 @jax.jit
-def power_law_hawkes_loss(flat_params: Array, dataset: Dataset):
-    params: PowerLawHawkesParams = unflatten_pl_hawkes_params(flat_params)
+def power_law_hawkes_loss(params: PowerLawHawkesParams, dataset: Dataset):
     output = calc_power_law_hawkes(params, dataset)
     return -output.loglik.mean()
 
 
-optim_result = minimize(
+power_law_hawkes_optim_params = run_optim(
+    init_pl_hawkes_params,
     power_law_hawkes_loss,
-    flat_pl_hawkes_params,
     args=(DATASET,),
-    method='BFGS',
 )
-
-
-power_law_hawkes_optim_params = unflatten_pl_hawkes_params(optim_result.x)
 power_law_hawkes_outputs = calc_power_law_hawkes(
     power_law_hawkes_optim_params, DATASET)
 plot_power_law_hawkes_rate(power_law_hawkes_optim_params, DATASET, INPUT_DF)
