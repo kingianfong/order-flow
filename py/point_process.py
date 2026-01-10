@@ -186,7 +186,7 @@ def get_pytree_labels(params):
     return labels
 
 
-def run_optim(init, loss_fn, loss_kwargs,
+def run_optim(init_params, loss_fn, loss_kwargs,
               nll_samples: int | None = None,
               verbose=False) -> Any:
     opt = optax.lbfgs(
@@ -203,8 +203,8 @@ def run_optim(init, loss_fn, loss_kwargs,
     value_and_grad_fun = optax.value_and_grad_from_state(loss_fn)
 
     @jax.jit
-    def step(carry):
-        params, state, loss_kwargs = carry
+    def update(carry, loss_kwargs):
+        params, state = carry
         value, grad = value_and_grad_fun(params, state=state, **loss_kwargs)
         updates, state = opt.update(
             grad, state, params,
@@ -214,50 +214,45 @@ def run_optim(init, loss_fn, loss_kwargs,
             **loss_kwargs,
         )
         params = optax.apply_updates(params, updates)
-        return params, state, loss_kwargs
+        return params, state
 
-    @jax.jit
-    def continuing_criterion(carry):
-        _, state, _ = carry
-        iter_num = optax.tree.get(state, 'count')
+    params = init_params
+    state = opt.init(init_params)
+    n_eval = 0
+
+    # this loop may force syncs between GPU and CPU
+    for n_iter in range(max_iter):
+        params, state = update((params, state), loss_kwargs)
+        *_, linesearch_state = state
+        assert isinstance(linesearch_state, optax.ScaleByZoomLinesearchState), \
+            f'{type(linesearch_state)=}'
+        n_eval += int(linesearch_state.info.num_linesearch_steps)
+
         grad = optax.tree.get(state, 'grad')
         err = optax.tree.norm(grad)
-        return (iter_num == 0) | ((iter_num < max_iter) & (err >= tol))
-
-    init_carry = init, opt.init(init), loss_kwargs
-    final_params, final_state, _ = jax.lax.while_loop(
-        continuing_criterion, step, init_carry
-    )
-
-    assert isinstance(final_state, tuple), \
-        f'{type(final_state)=}'
-    lbfgs_final_state = final_state[0]
-    assert isinstance(lbfgs_final_state, optax.ScaleByLBFGSState), \
-        f'{type(lbfgs_final_state)=}'
-
-    n_iter = optax.tree.get(final_state, 'count').item()
-    if n_iter == max_iter:
-        grad = optax.tree.get(final_state, 'grad')
-        err = optax.tree.norm(grad).item()
-        print(f'warning: did not converge after {n_iter=}, {err=}')
+        if err <= tol:
+            print(f'converged: {n_iter=}, {n_eval=}')
+            break
     else:
-        print(f'converged: {n_iter=}')
+        grad = optax.tree.get(state, 'grad')
+        err = optax.tree.norm(grad)
+        print(f'did not converge: {n_eval=}, {err=}')
 
     # assume -mean(loglik) insetad of -sum(loglik)
     if nll_samples is not None:
         print('calculating hessian')
         start_time = datetime.datetime.now()
 
-        flat_params, unravel = ravel_pytree(final_params)
+        flat_params, unravel = ravel_pytree(params)
 
         def flat_loss_fn(flat_p, dataset):
             return loss_fn(unravel(flat_p), dataset)
         calc_hess = jax.jit(jax.hessian(flat_loss_fn))
-        inv_hess_mat = jnp.linalg.pinv(calc_hess(flat_params, dataset=DATASET))
+        inv_hess_mat = jnp.linalg.pinv(calc_hess(flat_params, **loss_kwargs))
         cond = jnp.linalg.cond(inv_hess_mat).item()
 
-        labels = get_pytree_labels(final_params)
-        plt.figure(figsize=(10, 8))
+        labels = get_pytree_labels(params)
+        plt.figure(figsize=(8, 6))
         sns.heatmap(
             pd.DataFrame(inv_hess_mat, index=labels, columns=labels),
             center=0.0, robust=True,
@@ -282,10 +277,7 @@ def run_optim(init, loss_fn, loss_kwargs,
         elapsed = stop_time - start_time
         print(f'hessian took {elapsed}')
 
-    return final_params
-
-
-# %%
+    return params
 
 
 class ModelOutput(NamedTuple):
@@ -309,7 +301,7 @@ def constant_rate_loss(params: Array, dataset: Dataset):
 
 
 log_constant_rate_result = run_optim(
-    init=(jnp.log(closed_form_rate + 1e-4), ),
+    init_params=(jnp.log(closed_form_rate + 1e-4), ),
     loss_fn=constant_rate_loss,
     loss_kwargs=dict(dataset=DATASET),
     # nll_samples=DATASET.n_samples,
