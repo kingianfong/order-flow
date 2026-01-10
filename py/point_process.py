@@ -10,6 +10,7 @@ from jax import Array
 from jax.flatten_util import ravel_pytree
 from jax.scipy.special import logit
 from jax.typing import ArrayLike
+import chex
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -23,6 +24,9 @@ import seaborn as sns
 DATA_DIR = Path(__file__).parent.parent / 'data/preprocessed'
 
 
+# TODO: train test split
+
+
 # %%
 
 
@@ -33,9 +37,9 @@ def load_data(sym: str) -> pl.DataFrame:
         pl.scan_parquet(DATA_DIR)
         .filter(
             pl.col('sym') == pl.lit(sym),
-            pl.col('date') < datetime.date(2025, 11, 1),
-            # pl.col('date') >= datetime.date(2025, 12, 1),
-            # pl.col('date') <= datetime.date(2025, 12, 5),
+            # pl.col('date') < datetime.date(2025, 11, 1),
+            pl.col('date') >= datetime.date(2025, 12, 1),
+            pl.col('date') <= datetime.date(2025, 12, 5),
         )
         .select(
             pl.col('time'),
@@ -100,12 +104,22 @@ class Dataset(NamedTuple):
     elapsed: Array
     rbf_basis: Array
 
+    @property
+    def n_samples(self):
+        chex.assert_equal_shape_prefix(
+            (self.curr_count, self.elapsed, self.rbf_basis),
+            prefix_len=1,
+        )
+        return len(self.curr_count)
+
 
 DATASET = Dataset(
     curr_count=INPUT_DF['curr_count'].cast(pl.Float32).to_jax(),
     elapsed=INPUT_DF['elapsed'].to_jax(),
     rbf_basis=calc_rbf_basis(INPUT_DF['hour'].to_jax()),
 )
+
+assert DATASET.n_samples == INPUT_DF.height
 
 
 # %%
@@ -145,7 +159,7 @@ def get_pytree_labels(params):
 
 
 def run_optim(init, loss_fn, loss_kwargs,
-              show_hessian=False,
+              nll_samples: int | None = None,
               verbose=False) -> Any:
     opt = optax.lbfgs(
         memory_size=20,
@@ -154,7 +168,6 @@ def run_optim(init, loss_fn, loss_kwargs,
             verbose=verbose,
             initial_guess_strategy='one'
         ),
-
     )
     max_iter = 20
     tol = 1e-5
@@ -188,6 +201,12 @@ def run_optim(init, loss_fn, loss_kwargs,
         continuing_criterion, step, init_carry
     )
 
+    assert isinstance(final_state, tuple), \
+        f'{type(final_state)=}'
+    lbfgs_final_state = final_state[0]
+    assert isinstance(lbfgs_final_state, optax.ScaleByLBFGSState), \
+        f'{type(lbfgs_final_state)=}'
+
     n_iter = optax.tree.get(final_state, 'count').item()
     if n_iter == max_iter:
         grad = optax.tree.get(final_state, 'grad')
@@ -196,31 +215,44 @@ def run_optim(init, loss_fn, loss_kwargs,
     else:
         print(f'converged: {n_iter=}')
 
-    if show_hessian:
+    # assume -mean(loglik) insetad of -sum(loglik)
+    if nll_samples is not None:
+        print('calculating hessian')
+        start_time = datetime.datetime.now()
+
         flat_params, unravel = ravel_pytree(final_params)
 
         def flat_loss_fn(flat_p, dataset):
             return loss_fn(unravel(flat_p), dataset)
+        calc_hess = jax.jit(jax.hessian(flat_loss_fn))
+        inv_hess_mat = jnp.linalg.pinv(calc_hess(flat_params, dataset=DATASET))
+        cond = jnp.linalg.cond(inv_hess_mat).item()
 
         labels = get_pytree_labels(final_params)
-        calc_hessian = jax.jit(jax.hessian(flat_loss_fn))
-        hessian_matrix = calc_hessian(flat_params, dataset=DATASET)
         plt.figure(figsize=(10, 8))
         sns.heatmap(
-            pd.DataFrame(
-                jnp.linalg.pinv(hessian_matrix),
-                index=labels,
-                columns=labels,
-            ),
-            # annot=True,
-            center=0.0,
-            robust=True,
+            pd.DataFrame(inv_hess_mat, index=labels, columns=labels),
+            center=0.0, robust=True,
         )
-        plt.title("Inverse Hessian Matrix")
+        plt.title(f"Inverse Hessian Matrix {cond=:.2f}")
         plt.show()
 
-        cond = jnp.linalg.cond(hessian_matrix)
-        print(f"Condition Number: {cond} (closer to 1 is better)")
+        mean = flat_params
+        var = jnp.diag(inv_hess_mat) / nll_samples
+        std_err = jnp.sqrt(var)
+        display(
+            pd.DataFrame(
+                dict(
+                    mean=mean,
+                    std_err=std_err,
+                    z=mean / std_err,
+                ),
+                index=labels,
+            )
+        )
+        stop_time = datetime.datetime.now()
+        elapsed = stop_time - start_time
+        print(f'hessian took {elapsed}')
 
     return final_params
 
@@ -241,6 +273,7 @@ log_constant_rate_result = run_optim(
     init=(jnp.log(closed_form_rate + 1e-4), ),
     loss_fn=constant_rate_loss,
     loss_kwargs=dict(dataset=DATASET),
+    # nll_samples=DATASET.n_samples,
 )
 
 
@@ -319,6 +352,7 @@ rbf_optim_params = run_optim(
     init_rbf_params,
     rbf_loss,
     loss_kwargs=dict(dataset=DATASET,),
+    nll_samples=DATASET.n_samples,
 )
 rbf_outputs = calc_rbf(rbf_optim_params, DATASET)
 plot_rbf(rbf_optim_params.log_base_rate, rbf_optim_params.weights)
@@ -547,7 +581,7 @@ hawkes_optim_params = run_optim(
     init_hawkes_params,
     hawkes_loss,
     loss_kwargs=dict(dataset=DATASET),
-    show_hessian=True,
+    nll_samples=DATASET.n_samples,
 )
 
 hawkes_outputs = calc_hawkes(hawkes_optim_params, DATASET)
@@ -623,7 +657,7 @@ rbf_hawkes_optim_params = run_optim(
     init_rbf_hawkes,
     rbf_hawkes_loss,
     loss_kwargs=dict(dataset=DATASET),
-    show_hessian=False,
+    nll_samples=DATASET.n_samples,
 )
 rbf_hawkes_outputs = calc_rbf_hawkes(rbf_hawkes_optim_params, DATASET)
 show_rbf_hawkes(rbf_hawkes_optim_params, DATASET, INPUT_DF)
@@ -873,6 +907,7 @@ power_law_hawkes_optim_params = run_optim(
     init_pl_hawkes_params,
     power_law_hawkes_loss,
     loss_kwargs=dict(dataset=DATASET),
+    nll_samples=DATASET.n_samples,
 )
 power_law_hawkes_outputs = calc_power_law_hawkes(
     power_law_hawkes_optim_params, DATASET)
