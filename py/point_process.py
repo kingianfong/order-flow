@@ -21,53 +21,75 @@ import polars as pl
 import seaborn as sns
 
 
-DATA_DIR = Path(__file__).parent.parent / 'data/preprocessed'
+# %%
 
 
-# TODO: train test split
+RAW_DATA_DIR = Path(__file__).parent.parent / 'data/raw'
+SYM = 'BTCUSDT'
+DATA_START = datetime.date(2025, 8, 1)
+TRAIN_END = datetime.date(2025, 9, 30)
+VAL_END = datetime.date(2025, 10, 15)
 
 
 # %%
 
 
-# raw data only has sometimes has multiple trades per timestamp
-# this input dataset is grouped by millisecond
-def load_data(sym: str) -> pl.DataFrame:
+# timestamps only hav millisecond resolution
+# there can be multiple trades per timestamp
+def load_data(raw_data_dir: Path,
+              sym: str,
+              start: datetime.date,
+              train_end: datetime.date,
+              val_end: datetime.date) -> pl.DataFrame:
+    assert start <= train_end <= val_end, \
+        f'{start=}, {train_end=}, {val_end=}'
     df = (
-        pl.scan_parquet(DATA_DIR)
+        pl.scan_parquet(raw_data_dir)
         .filter(
             pl.col('sym') == pl.lit(sym),
-            # pl.col('date') < datetime.date(2025, 11, 1),
-            pl.col('date') >= datetime.date(2025, 12, 1),
-            pl.col('date') <= datetime.date(2025, 12, 5),
-        )
-        .select(
-            pl.col('time'),
-            curr_count=pl.col('total_count'),
-            elapsed_precise=pl.col('time').diff().cast(pl.Duration('ns')),
+            pl.col('date') >= start,
+            pl.col('date') <= val_end,
         )
         .with_columns(
-            elapsed=(
-                pl.col('elapsed_precise')
-                .cast(pl.Float32) * 1e-6  # milliseconds
-            ),
+            is_train=pl.col('date') <= train_end,
+        )
+        .drop('sym', 'date')
+        .sort('time')
+        .group_by('time', maintain_order=True)
+        .agg(
+            pl.col('is_train').first(),
+            curr_count=pl.len(),
+        )
+        .with_columns(
+            pl.col('time').cast(pl.Datetime('ms')),
+        )
+        .with_columns(
+            elapsed_ms=pl.col('time').diff().cast(pl.Float32),
             hour=(
-                pl.col('time')
-                - pl.col('time').dt.truncate('1d')
+                pl.col('time') - pl.col('time').dt.truncate('1d')
             ).dt.total_hours(fractional=True),
         )
-        .filter(pl.col('elapsed').is_not_null())
+        .filter(pl.col('elapsed_ms').is_not_null())
         .collect()
     )
+
     assert (df['curr_count'] > 0).all()
-    assert (df['elapsed'] > 0).all()
+    assert (df['elapsed_ms'] > 0).all()
     assert (df['hour'] >= 0).all()
     assert df['time'].is_unique().all()
     assert df['time'].is_sorted()
     return df
 
 
-INPUT_DF = load_data('BTCUSDT')
+INPUT_DF = load_data(
+    raw_data_dir=RAW_DATA_DIR,
+    sym=SYM,
+    start=DATA_START,
+    train_end=TRAIN_END,
+    val_end=VAL_END,
+)
+
+
 display(INPUT_DF)
 
 
@@ -103,23 +125,29 @@ class Dataset(NamedTuple):
     curr_count: Array
     elapsed: Array
     rbf_basis: Array
-
-    @property
-    def n_samples(self):
-        chex.assert_equal_shape_prefix(
-            (self.curr_count, self.elapsed, self.rbf_basis),
-            prefix_len=1,
-        )
-        return len(self.curr_count)
+    n_samples: int
 
 
-DATASET = Dataset(
-    curr_count=INPUT_DF['curr_count'].cast(pl.Float32).to_jax(),
-    elapsed=INPUT_DF['elapsed'].to_jax(),
-    rbf_basis=calc_rbf_basis(INPUT_DF['hour'].to_jax()),
-)
+def create_datsets(input_df: pl.DataFrame):
+    train_df = input_df.filter(pl.col('is_train'))
+    val_df = input_df.filter(~pl.col('is_train'))
 
-assert DATASET.n_samples == INPUT_DF.height
+    train_ds = Dataset(
+        curr_count=train_df['curr_count'].cast(pl.Float32).to_jax(),
+        elapsed=train_df['elapsed_ms'].to_jax(),
+        rbf_basis=calc_rbf_basis(train_df['hour'].to_jax()),
+        n_samples=train_df.height,
+    )
+    val_ds = Dataset(
+        curr_count=val_df['curr_count'].cast(pl.Float32).to_jax(),
+        elapsed=val_df['elapsed_ms'].to_jax(),
+        rbf_basis=calc_rbf_basis(val_df['hour'].to_jax()),
+        n_samples=val_df.height,
+    )
+    return train_ds, val_ds
+
+
+DATASET, VAL_DATASET = create_datsets(INPUT_DF)
 
 
 # %%
@@ -257,16 +285,27 @@ def run_optim(init, loss_fn, loss_kwargs,
     return final_params
 
 
-def constant_loglik(rate: ArrayLike, dataset: Dataset) -> Array:
+# %%
+
+
+class ModelOutput(NamedTuple):
+    loglik: Array  # loglik of (no event since prev t) + (events at t)
+    rate: Array  # used for predictions after observing events at t
+
+
+def calc_const(rate: Array, dataset: Dataset) -> ModelOutput:
     # assume constant rate throughout interval
-    return dataset.curr_count * jnp.log(rate) - rate * dataset.elapsed
+    return ModelOutput(
+        loglik=dataset.curr_count * jnp.log(rate) - rate * dataset.elapsed,
+        rate=rate,
+    )
 
 
 @jax.jit
 def constant_rate_loss(params: Array, dataset: Dataset):
     log_rate, = params
     rate = jnp.exp(log_rate)
-    return -constant_loglik(rate, dataset).mean()
+    return -calc_const(rate, dataset).loglik.mean()
 
 
 log_constant_rate_result = run_optim(
@@ -283,11 +322,6 @@ print(f'{closed_form_rate=:.8f}, {constant_rate=:.8f}')
 
 
 # %%
-
-
-class ModelOutput(NamedTuple):
-    loglik: Array  # loglik of (no event since prev t) + (events at t)
-    rate: Array  # used for predictions after observing events at t
 
 
 class RbfRateParams(NamedTuple):
@@ -565,7 +599,7 @@ init_hawkes_params = HawkesParams(
 )
 
 
-show_hawkes(init_hawkes_params, DATASET, INPUT_DF)
+show_hawkes(init_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 
 
 # %%
@@ -585,7 +619,7 @@ hawkes_optim_params = run_optim(
 )
 
 hawkes_outputs = calc_hawkes(hawkes_optim_params, DATASET)
-show_hawkes(hawkes_optim_params, DATASET, INPUT_DF)
+show_hawkes(hawkes_optim_params, DATASET, INPUT_DF.filter('is_train'))
 
 
 # %%
@@ -641,7 +675,7 @@ init_rbf_hawkes = RbfHawkesParams(
 )
 
 
-show_rbf_hawkes(init_rbf_hawkes, DATASET, INPUT_DF)
+show_rbf_hawkes(init_rbf_hawkes, DATASET, INPUT_DF.filter('is_train'))
 
 
 # %%
@@ -657,10 +691,10 @@ rbf_hawkes_optim_params = run_optim(
     init_rbf_hawkes,
     rbf_hawkes_loss,
     loss_kwargs=dict(dataset=DATASET),
-    nll_samples=DATASET.n_samples,
+    # nll_samples=DATASET.n_samples,
 )
 rbf_hawkes_outputs = calc_rbf_hawkes(rbf_hawkes_optim_params, DATASET)
-show_rbf_hawkes(rbf_hawkes_optim_params, DATASET, INPUT_DF)
+show_rbf_hawkes(rbf_hawkes_optim_params, DATASET, INPUT_DF.filter('is_train'))
 
 
 # %%
@@ -892,7 +926,8 @@ init_pl_hawkes_params = PowerLawHawkesParams(
 )
 
 
-show_power_law_hawkes(init_pl_hawkes_params, DATASET, INPUT_DF)
+show_power_law_hawkes(init_pl_hawkes_params, DATASET,
+                      INPUT_DF.filter('is_train'))
 
 # %%
 
@@ -911,37 +946,56 @@ power_law_hawkes_optim_params = run_optim(
 )
 power_law_hawkes_outputs = calc_power_law_hawkes(
     power_law_hawkes_optim_params, DATASET)
-show_power_law_hawkes(power_law_hawkes_optim_params, DATASET, INPUT_DF)
+show_power_law_hawkes(power_law_hawkes_optim_params,
+                      DATASET, INPUT_DF.filter('is_train'))
 
 
 # %%
 
 
+def _calc_logliks(params, calc_output_fn):
+    train = calc_output_fn(params, DATASET).loglik
+    val = calc_output_fn(params, VAL_DATASET).loglik
+    return np.asarray(jnp.concat([train, val]))
+
+
 with_logliks = (
     INPUT_DF
     .with_columns(
-        constant_loglik=np.asarray(constant_loglik(constant_rate, DATASET)),
-        rbf_loglik=np.asarray(rbf_outputs.loglik),
-        hawkes_loglik=np.asarray(hawkes_outputs.loglik),
-        rbf_hawkes_loglik=np.asarray(rbf_hawkes_outputs.loglik),
-        pl_hawkes_loglik=np.asarray(power_law_hawkes_outputs.loglik),
+        constant_loglik=_calc_logliks(constant_rate,
+                                      calc_const),
+        rbf_loglik=_calc_logliks(rbf_optim_params,
+                                 calc_rbf),
+        hawkes_loglik=_calc_logliks(hawkes_optim_params,
+                                    calc_hawkes),
+        rbf_hawkes_loglik=_calc_logliks(rbf_hawkes_optim_params,
+                                        calc_rbf_hawkes),
+        pl_hawkes_loglik=_calc_logliks(power_law_hawkes_optim_params,
+                                       calc_power_law_hawkes),
     )
 )
 
+with_logliks
 
-print('note: not a fair comparison because number of parameters differ')
+
+# %%
+
+
 display(
-    with_logliks.select(pl.selectors.ends_with('_loglik')).sum(),
-    with_logliks.select(pl.selectors.ends_with('_loglik')).mean(),
+    with_logliks
+    .group_by('is_train')
+    .agg(pl.selectors.ends_with('_loglik').mean())
+    .sort('is_train', descending=True)
+    .to_pandas()
+    .rename(columns=lambda x: x.replace('_loglik', ''))
+    .style.background_gradient(axis=None)
 )
 
 
-(
+ax = (
     with_logliks
     .group_by(pl.col('time').dt.truncate('1h'), maintain_order=True)
-    .agg(
-        pl.selectors.ends_with('_loglik').sum()
-    )
+    .agg(pl.selectors.ends_with('_loglik').sum())
     .to_pandas()
     .set_index('time')
     [[
@@ -951,8 +1005,10 @@ display(
         'rbf_hawkes_loglik',
         'pl_hawkes_loglik',
     ]]
+    .rename(columns=lambda x: x.replace('_loglik', ''))
     .plot(alpha=0.6)
 )
+ax.axvline(TRAIN_END, color='k', linestyle='--', alpha=0.2)  # type: ignore
 plt.show()
 
 
