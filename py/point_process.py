@@ -297,7 +297,7 @@ def calc_const(rate: Array, dataset: Dataset) -> ModelOutput:
     # assume constant rate throughout interval
     return ModelOutput(
         loglik=dataset.curr_count * jnp.log(rate) - rate * dataset.elapsed,
-        rate=rate,
+        rate=rate * jnp.ones_like(dataset.elapsed),
     )
 
 
@@ -966,29 +966,29 @@ show_power_law_hawkes(power_law_hawkes_optim_params,
 # %%
 
 
-def _calc_logliks(params, calc_output_fn):
+def _calc_model_outputs(prefix: str, params, calc_output_fn):
     # Validation loglik is biased downwards as the decayed counts need to
     # "warm up" after starting from 0. The bias is kept as it is is analgous
     # to having to restarting a trading system without replaying data that was
     # published before the restart
-    train = calc_output_fn(params, DATASET).loglik
-    val = calc_output_fn(params, VAL_DATASET).loglik
-    return np.asarray(jnp.concat([train, val]))
+    train = calc_output_fn(params, DATASET)
+    val = calc_output_fn(params, VAL_DATASET)
+    loglik = np.asarray(jnp.concat([train.loglik, val.loglik]))
+    rate = np.asarray(jnp.concat([train.rate, val.rate]))
+    return {
+        f'{prefix}_loglik': loglik,
+        f'{prefix}_rate': rate,
+    }
 
 
 with_logliks = (
     INPUT_DF
     .with_columns(
-        constant_loglik=_calc_logliks(constant_rate,
-                                      calc_const),
-        rbf_loglik=_calc_logliks(rbf_optim_params,
-                                 calc_rbf),
-        hawkes_loglik=_calc_logliks(hawkes_optim_params,
-                                    calc_hawkes),
-        rbf_hawkes_loglik=_calc_logliks(rbf_hawkes_optim_params,
-                                        calc_rbf_hawkes),
-        pl_hawkes_loglik=_calc_logliks(power_law_hawkes_optim_params,
-                                       calc_power_law_hawkes),
+        **_calc_model_outputs('constant', constant_rate, calc_const),
+        **_calc_model_outputs('rbf', rbf_optim_params, calc_rbf),
+        **_calc_model_outputs('hawkes', hawkes_optim_params, calc_hawkes),
+        **_calc_model_outputs('rbf_hawkes', rbf_hawkes_optim_params, calc_rbf_hawkes),
+        **_calc_model_outputs('pl_hawkes', power_law_hawkes_optim_params, calc_power_law_hawkes),
     )
 )
 
@@ -1016,6 +1016,9 @@ def plot_logliks(start: datetime.datetime,
                  end: datetime.datetime,
                  *,
                  duration: str):
+    expected_count_weight = 1000 * pl.col('elapsed_ms') \
+        / pl.col('elapsed_ms').sum()
+
     df = (
         with_logliks
         .filter(
@@ -1026,12 +1029,25 @@ def plot_logliks(start: datetime.datetime,
         .agg(
             pl.col('curr_count').sum().alias('trade_count'),
             pl.selectors.ends_with('_loglik').sum(),
+            (
+                (pl.selectors.ends_with('_rate') * expected_count_weight)
+                .sum()
+                .name.replace('_rate', '_expected_count')
+                .round(2)
+            ),
         )
         .to_pandas()
         .set_index('time')
     )
-    f, axes = plt.subplots(len(df.columns), 1,
-                           sharex=True, figsize=(8, 10))
+    prefixes = [
+        'constant',
+        'rbf',
+        'hawkes',
+        'rbf_hawkes',
+        'pl_hawkes',
+    ]
+    f, axes = plt.subplots(1 + len(prefixes), 1,
+                           sharex=True, figsize=(8, 12))
     title = '\n'.join(
         (
             f'log likelihood summed over {duration} buckets',
@@ -1039,16 +1055,27 @@ def plot_logliks(start: datetime.datetime,
         )
     )
     f.suptitle(title)
-    for ax, col in zip(axes, df.columns):
-        if col == 'trade_count':
-            c = 'blue'
-        else:
-            c = 'green'
-        ax.set_title(col)
-        ax.scatter(df.index, df[col], alpha=0.4, marker='.', c=c)
+    axes[0].set_title('trade_count')
+    axes[0].scatter(df.index, df['trade_count'], label='trade_count',
+                    alpha=0.4, marker='+', c='C0')
+    axes[0].set_ylabel('count', c='C0')
+
+    for i, prefix in enumerate(prefixes):
+        ax1 = axes[1 + i]
+
+        ax1.set_title(prefix)
+        ax1.scatter(df.index, df[f'{prefix}_loglik'],
+                    alpha=0.4, marker='x', c='C1')
+        ax1.set_ylabel('loglik', c='C1')
+
+        ax2 = ax1.twinx()
+        ax2.scatter(df.index, df[f'{prefix}_expected_count'],
+                    alpha=0.4, marker='+', c='C2')
+        ax2.set_ylabel('expected count', c='C2')
+
+    for ax in axes:
         ax.grid(True, which="both", ls="--", alpha=0.4)
-    if start <= TRAIN_END and TRAIN_END <= end:
-        for ax in axes:
+        if start <= TRAIN_END and TRAIN_END <= end:
             ax.axvline(TRAIN_END, linestyle='--', alpha=0.6)  # type: ignore
     plt.tight_layout()
     plt.show()
