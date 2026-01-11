@@ -10,7 +10,6 @@ from jax import Array
 from jax.flatten_util import ravel_pytree
 from jax.scipy.special import logit
 from jax.typing import ArrayLike
-import chex
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -108,15 +107,15 @@ class RbfConstants:
 
     @staticmethod
     def reg_penalty(weights: Array) -> Array:
-        # TODO: consider penalising differences between adjacent elements
         l2_reg: float = 0.1
         return jnp.sum(jnp.square(weights)) * l2_reg
 
 
 def calc_rbf_basis(time_of_day: Array) -> Array:
-    dist = jnp.abs(time_of_day[:, None] - RbfConstants.centers[None, :])
-    dist = jnp.where(dist > RbfConstants.n_hours / 2,  - dist, dist)
-    exponent = -0.5 * (dist**2) * RbfConstants.inv_sigma_sq
+    half = RbfConstants.n_hours / 2
+    dist_from_ctrs = time_of_day[:, None] - RbfConstants.centers[None, :]
+    dist_from_ctrs = (dist_from_ctrs + half) % RbfConstants.n_hours - half
+    exponent = -0.5 * (dist_from_ctrs**2) * RbfConstants.inv_sigma_sq
     basis = jnp.exp(exponent)
     return basis
 
@@ -197,7 +196,7 @@ def run_optim(init_params, loss_fn, loss_kwargs,
             initial_guess_strategy='one'
         ),
     )
-    max_iter = 20
+    max_iter = 50
     tol = 1e-5
 
     value_and_grad_fun = optax.value_and_grad_from_state(loss_fn)
@@ -318,7 +317,7 @@ print(f'{closed_form_rate=:.8f}, {constant_rate=:.8f}')
 
 class RbfRateParams(NamedTuple):
     log_base_rate: Array
-    weights: Array = jnp.zeros((RbfConstants.n_centers,),)
+    weights: Array = jnp.zeros((RbfConstants.n_centers,),) + 0.1
 
 
 def calc_rbf(params: RbfRateParams, dataset: Dataset) -> ModelOutput:
@@ -332,28 +331,32 @@ def calc_rbf(params: RbfRateParams, dataset: Dataset) -> ModelOutput:
 
 
 def plot_rbf(log_base_rate: Array, weights: Array) -> None:
-    time_of_day = jnp.linspace(-2, 26, 500, endpoint=False)
-    log_factor = calc_rbf_basis(time_of_day) @ weights
+    # exceed [0, 24] to verify periodic boundary conditions
+    time_of_day = jnp.linspace(-4, 28, 500, endpoint=False)
+    bases = calc_rbf_basis(time_of_day)
+    log_factor = bases @ weights
     base_rate = jnp.exp(log_base_rate).item()
     rate = jnp.exp(log_base_rate + log_factor)
     per_second = base_rate * 1000
+    per_basis = bases * weights
 
-    f, (ax1, ax2) = plt.subplots(2, 1, sharex=True)
+    f, axes = plt.subplots(2, 1, sharex=True)
+    f.suptitle('exogenous rate')
+    for ax in axes:
+        ax.axvline(0, c='k', alpha=0.2, linestyle='--')
+        ax.axvline(24, c='k', alpha=0.2, linestyle='--')
 
+    ax1, ax2 = axes
     ax1.plot(time_of_day, rate)
-    ax1.axhline(base_rate, label=f'base rate$\\approx${per_second:.2f}/s',
+    ax1.axhline(base_rate, label=f'baseline $\\approx${per_second:.2f}/s',
                 c='g', alpha=0.4, linestyle='-')
-    ax1.axvline(0, c='k', alpha=0.2, linestyle='--')
-    ax1.axvline(24, c='k', alpha=0.2, linestyle='--')
+    ax1.set_ylabel('rate')
     ax1.legend(loc='upper left')
 
-    for ctr, weight in zip(RbfConstants.centers, weights, strict=True):
-        dist = jnp.abs(time_of_day[:, None] - ctr)
-        dist = jnp.where(dist > RbfConstants.n_hours / 2, 24 - dist, dist)
-        exponent = -0.5 * (dist**2) * RbfConstants.inv_sigma_sq
-        basis = jnp.exp(exponent)
-        ax2.plot(time_of_day, weight * basis)
-
+    ax2.plot(time_of_day, per_basis, alpha=0.6)
+    ax2.set_ylabel('weighted bases')
+    ax2.set_xlabel('hour')
+    plt.tight_layout()
     plt.show()
 
 
