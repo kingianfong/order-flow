@@ -63,10 +63,10 @@ def load_data(raw_data_dir: Path,
             pl.col('time').cast(pl.Datetime('ms')),
         )
         .with_columns(
-            elapsed_ms=pl.col('time').diff().cast(pl.Float32),
-            hour=(
-                pl.col('time') - pl.col('time').dt.truncate('1d')
-            ).dt.total_hours(fractional=True),
+            elapsed_ms=(pl.col('time').diff()
+                        .dt.total_milliseconds().cast(pl.Float32)),
+            hour=((pl.col('time') - pl.col('time').dt.truncate('1d'))
+                  .dt.total_hours(fractional=True)),
         )
         .filter(pl.col('elapsed_ms').is_not_null())
         .collect()
@@ -127,7 +127,7 @@ class Dataset(NamedTuple):
     n_samples: int
 
 
-def create_datsets(input_df: pl.DataFrame):
+def create_datasets(input_df: pl.DataFrame):
     train_df = input_df.filter(pl.col('is_train'))
     val_df = input_df.filter(~pl.col('is_train'))
 
@@ -146,7 +146,7 @@ def create_datsets(input_df: pl.DataFrame):
     return train_ds, val_ds
 
 
-DATASET, VAL_DATASET = create_datsets(INPUT_DF)
+DATASET, VAL_DATASET = create_datasets(INPUT_DF)
 
 
 # %%
@@ -398,6 +398,11 @@ class HawkesParams(NamedTuple):
 
 
 def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
+    """Calculate hawkes process outputs sequentially using scan.
+
+    This is a reference implementation which prioritises readability over
+    performance, intended for comparison against optimised implementations.
+    """
     assert jnp.all(dataset.curr_count > 0.0)
     assert jnp.all(dataset.elapsed > 0.0)
 
@@ -425,12 +430,12 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
         decay_factor = jnp.exp(-omega * elapsed)
         decayed_count *= decay_factor
 
+        event_rate = base_rate + norm * omega * decayed_count
         # assume events happen instantaneously without self-excitation
         # 1. jittering is unacceptable as it increases data size too much
         # 2. an attempt using logarithm of rising factorial aka Pochhammer
-        # symbol has resulted in omega blowing up due to
-
-        event_rate = base_rate + norm * omega * decayed_count
+        # symbol has resulted in omega blowing up due to some terms going to 0
+        # and the remaining terms being monotonic
         event_term = count * jnp.log(event_rate)
         loglik = event_term - interval_term
 
@@ -866,7 +871,6 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams,
 
     base_rate = jnp.exp(params.log_base_rate)
     norm = jax.nn.sigmoid(params.logit_norm)
-    omega = 1.0 / _one_millisecond
     beta = jnp.exp(params.log_beta)
 
     approx_params = power_law_decay_approx_params(
@@ -880,8 +884,11 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams,
     approx_integral = jnp.sum(weights / rates)
     kernel_factor = norm / approx_integral
 
-    # TODO: switch to scan if run out of memory
-    decay_factor_exponents = -jnp.outer(dataset.elapsed, rates)
+    decay_factor_exponents = (
+        # note: this may run out of memory for large datasets
+        # switch to jax.lax.scan if necessary
+        -jnp.outer(dataset.elapsed, rates)
+    )
     decay_factors = jnp.exp(decay_factor_exponents)
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
 
@@ -897,6 +904,8 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams,
     # loglik of event(s) at current timestamp
     curr_minus_count = prev_decayed_count * decay_factors
     event_rate = base_rate + kernel_factor * (curr_minus_count @ weights)
+    # refer to comments in `calc_hawkes_baseline` for explanation of
+    # modelling assumptions and implementation choices
     event_term = dataset.curr_count * jnp.log(event_rate)
 
     forecast_rate = base_rate + kernel_factor * (decayed_count @ weights)
@@ -949,6 +958,10 @@ show_power_law_hawkes(power_law_hawkes_optim_params,
 
 
 def _calc_logliks(params, calc_output_fn):
+    # Validation loglik is biased downwards as the decayed counts need to
+    # "warm up" after starting from 0. The bias is kept as it is is analgous
+    # to having to restarting a trading system without replaying data that was
+    # published before the restart
     train = calc_output_fn(params, DATASET).loglik
     val = calc_output_fn(params, VAL_DATASET).loglik
     return np.asarray(jnp.concat([train, val]))
