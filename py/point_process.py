@@ -1005,7 +1005,7 @@ display(
     .sort('is_train', descending=True)
     .to_pandas()
     .rename(columns=lambda x: x.replace('_loglik', ''))
-    .style.background_gradient(axis=None)
+    .style.background_gradient(axis=1)
 )
 
 
@@ -1016,8 +1016,9 @@ def plot_logliks(start: datetime.datetime,
                  end: datetime.datetime,
                  *,
                  duration: str):
-    expected_count_weight = 1000 * pl.col('elapsed_ms') \
-        / pl.col('elapsed_ms').sum()
+    time_until_next_sample = pl.col('elapsed_ms').shift(-1)
+    expected_count_weight = 1000 * time_until_next_sample \
+        / time_until_next_sample.sum()
 
     df = (
         with_logliks
@@ -1062,16 +1063,15 @@ def plot_logliks(start: datetime.datetime,
 
     for i, prefix in enumerate(prefixes):
         ax1 = axes[1 + i]
-
         ax1.set_title(prefix)
-        ax1.scatter(df.index, df[f'{prefix}_loglik'],
-                    alpha=0.4, marker='x', c='C1')
-        ax1.set_ylabel('loglik', c='C1')
+        ax1.scatter(df.index, df[f'{prefix}_expected_count'],
+                    alpha=0.4, marker='+', c='C1')
+        ax1.set_ylabel('expected count', c='C1')
 
         ax2 = ax1.twinx()
-        ax2.scatter(df.index, df[f'{prefix}_expected_count'],
-                    alpha=0.4, marker='+', c='C2')
-        ax2.set_ylabel('expected count', c='C2')
+        ax2.scatter(df.index, df[f'{prefix}_loglik'],
+                    alpha=0.4, marker='x', c='C2')
+        ax2.set_ylabel('loglik', c='C2')
 
     for ax in axes:
         ax.grid(True, which="both", ls="--", alpha=0.4)
@@ -1088,11 +1088,11 @@ plot_logliks(DATA_START, VAL_END, duration='2h')
 
 
 # arbitrary training date
-plot_logliks(datetime.datetime(2025, 9, 5, hour=9),
-             datetime.datetime(2025, 9, 6, hour=6),
+plot_logliks(datetime.datetime(2025, 9, 17, hour=9),
+             datetime.datetime(2025, 9, 18, hour=6),
              duration='90s')
-plot_logliks(datetime.datetime(2025, 9, 5, hour=20),
-             datetime.datetime(2025, 9, 6, hour=1),
+plot_logliks(datetime.datetime(2025, 9, 17, hour=17),
+             datetime.datetime(2025, 9, 17, hour=20),
              duration='30s')
 
 
