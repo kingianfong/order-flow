@@ -25,9 +25,9 @@ import seaborn as sns
 
 RAW_DATA_DIR = Path(__file__).parent.parent / 'data/raw'
 SYM = 'BTCUSDT'
-DATA_START = datetime.date(2025, 8, 1)
-TRAIN_END = datetime.date(2025, 9, 30)
-VAL_END = datetime.date(2025, 10, 15)
+DATA_START = datetime.datetime(2025, 8, 1)
+TRAIN_END = datetime.datetime(2025, 9, 30)
+VAL_END = datetime.datetime(2025, 10, 15)
 
 
 # %%
@@ -247,14 +247,23 @@ def run_optim(init_params, loss_fn, loss_kwargs,
         def flat_loss_fn(flat_p, dataset):
             return loss_fn(unravel(flat_p), dataset)
         calc_hess = jax.jit(jax.hessian(flat_loss_fn))
-        inv_hess_mat = jnp.linalg.pinv(calc_hess(flat_params, **loss_kwargs))
-        cond = jnp.linalg.cond(inv_hess_mat).item()
+        hess_mat = calc_hess(flat_params, **loss_kwargs)
+
+        eigvals = jnp.linalg.eigvalsh(hess_mat)
+        if jnp.any(eigvals <= 0):
+            print("Warning: Hessian not positive definite. Standard errors invalid.")
+
+        cond = jnp.linalg.cond(hess_mat).item()
+        inv_hess_mat = jnp.linalg.pinv(hess_mat)
+        diag_sqrt = jnp.sqrt(jnp.diag(inv_hess_mat))
+        corr_mat = inv_hess_mat / jnp.outer(diag_sqrt, diag_sqrt)
+        mask = np.triu(np.ones_like(corr_mat, dtype=bool))
 
         labels = get_pytree_labels(params)
         plt.figure(figsize=(8, 6))
         sns.heatmap(
-            pd.DataFrame(inv_hess_mat, index=labels, columns=labels),
-            center=0.0, robust=True,
+            data=pd.DataFrame(corr_mat, index=labels, columns=labels),
+            mask=mask, center=0.0, robust=False,
         )
         plt.title(f"Inverse Hessian Matrix {cond=:.2f}")
         plt.show()
@@ -1000,24 +1009,76 @@ display(
 )
 
 
-ax = (
-    with_logliks
-    .group_by(pl.col('time').dt.truncate('1h'), maintain_order=True)
-    .agg(pl.selectors.ends_with('_loglik').sum())
-    .to_pandas()
-    .set_index('time')
-    [[
-        'constant_loglik',
-        'rbf_loglik',
-        'hawkes_loglik',
-        'rbf_hawkes_loglik',
-        'pl_hawkes_loglik',
-    ]]
-    .rename(columns=lambda x: x.replace('_loglik', ''))
-    .plot(alpha=0.6)
-)
-ax.axvline(TRAIN_END, color='k', linestyle='--', alpha=0.2)  # type: ignore
-plt.show()
+# %%
+
+
+def plot_logliks(start: datetime.datetime,
+                 end: datetime.datetime,
+                 *,
+                 duration: str):
+    df = (
+        with_logliks
+        .filter(
+            pl.col('time') >= start,
+            pl.col('time') <= end,
+        )
+        .group_by(pl.col('time').dt.truncate(duration), maintain_order=True)
+        .agg(
+            pl.col('curr_count').sum().alias('trade_count'),
+            pl.selectors.ends_with('_loglik').sum(),
+        )
+        .to_pandas()
+        .set_index('time')
+    )
+    f, axes = plt.subplots(len(df.columns), 1,
+                           sharex=True, figsize=(8, 10))
+    title = '\n'.join(
+        (
+            f'log likelihood summed over {duration} buckets',
+            f'[ {start} , {end} ]',
+        )
+    )
+    f.suptitle(title)
+    for ax, col in zip(axes, df.columns):
+        if col == 'trade_count':
+            c = 'blue'
+        else:
+            c = 'green'
+        ax.set_title(col)
+        ax.scatter(df.index, df[col], alpha=0.4, marker='.', c=c)
+        ax.grid(True, which="both", ls="--", alpha=0.4)
+    if start <= TRAIN_END and TRAIN_END <= end:
+        for ax in axes:
+            ax.axvline(TRAIN_END, linestyle='--', alpha=0.6)  # type: ignore
+    plt.tight_layout()
+    plt.show()
+
+
+plot_logliks(DATA_START, VAL_END, duration='2h')
+
+
+# %%
+
+
+# arbitrary training date
+plot_logliks(datetime.datetime(2025, 9, 5, hour=9),
+             datetime.datetime(2025, 9, 6, hour=6),
+             duration='90s')
+plot_logliks(datetime.datetime(2025, 9, 5, hour=20),
+             datetime.datetime(2025, 9, 6, hour=1),
+             duration='30s')
+
+
+# %%
+
+
+# 2025/10/10 volatility event
+plot_logliks(datetime.datetime(2025, 10, 10, hour=9),
+             datetime.datetime(2025, 10, 11, hour=6),
+             duration='90s')
+plot_logliks(datetime.datetime(2025, 10, 10, hour=20),
+             datetime.datetime(2025, 10, 11, hour=1),
+             duration='30s')
 
 
 # %%
