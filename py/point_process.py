@@ -18,6 +18,7 @@ import numpy as np
 import optax
 import pandas as pd
 import polars as pl
+import scipy
 import seaborn as sns
 
 
@@ -188,6 +189,9 @@ class ModelOutput(NamedTuple):
 
     @property
     def loglik(self):
+        # loglik =
+        #   sum(log(intensity)) at each event
+        #   - integral(intensity) over duration
         return self.point_term - self.compensator
 
 
@@ -425,32 +429,27 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
         decayed_count = carry
         count, elapsed = x
 
-        # loglik =
-        #   sum(log(intensity)) at each event
-        #   - integral(intensity) over duration
-
         # loglik of interval that just passed with no events
         integral_over_interval = -jnp.expm1(-decay_rate * elapsed)
-        interval_term = \
+        compensator = \
             base_intensity * elapsed  \
             + branching_ratio * decayed_count * integral_over_interval
 
-        # loglik of events at current timestamp
         decay_factor = jnp.exp(-decay_rate * elapsed)
         decayed_count *= decay_factor
         point_intensity = base_intensity \
             + branching_ratio * decay_rate * decayed_count
-        # assume events happen instantaneously without self-excitation
+        # KNOWN_LIMITATION: events assumed not to have self-excitation
         # 1. jittering is unacceptable as it increases data size too much
-        # 2. an attempt using logarithm of rising factorial aka Pochhammer
-        # symbol has resulted in decay_rate blowing up due to some terms
-        # going to 0 and the remaining terms being monotonic
+        # 2. an attempt using logarithm of rising factorial (Pochhammer) has
+        #   resulted in decay_rate blowing up due to some terms going to 0
+        #   and the remaining terms being monotonic
         point_term = count * jnp.log(point_intensity)
 
         decayed_count += count
         forecast_intensity = base_intensity \
             + branching_ratio * decay_rate * decayed_count
-        return decayed_count, (point_term, interval_term, forecast_intensity)
+        return decayed_count, (point_term, compensator, forecast_intensity)
 
     xs = dataset.curr_count, dataset.elapsed
     _, (point_term, compensator, intensity) = jax.lax.scan(step, 0, xs)
@@ -533,17 +532,16 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     decay_factors = jnp.exp(-decay_rate * dataset.elapsed)
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
 
-    # loglik of interval that just passed with no events
     prev_decayed_count = jnp.roll(decayed_count, 1).at[0].set(0.0)
     integral_over_interval = -jnp.expm1(-decay_rate * dataset.elapsed)
     compensator = \
         dataset.elapsed * base_intensity \
         + branching_ratio * prev_decayed_count * integral_over_interval
 
-    # loglik of event(s) at current timestamp
     curr_minus_count = prev_decayed_count * decay_factors
     point_intensity = base_intensity + \
         branching_ratio * decay_rate * curr_minus_count
+    # refer to `calc_hawkes_baseline` for known limitations
     point_term = dataset.curr_count * jnp.log(point_intensity)
 
     forecast_intensity = base_intensity \
@@ -648,17 +646,16 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
     decay_factors = jnp.exp(-decay_rate * dataset.elapsed)
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
 
-    # loglik of interval that just passed with no events
     prev_decayed_count = jnp.roll(decayed_count, 1).at[0].set(0.0)
     integral_over_interval = -jnp.expm1(-decay_rate * dataset.elapsed)
     interval_term = \
         dataset.elapsed * base_intensity \
         + branching_ratio * prev_decayed_count * integral_over_interval
 
-    # loglik of event(s) at current timestamp
     curr_minus_count = prev_decayed_count * decay_factors
     point_intensity = base_intensity \
         + branching_ratio * decay_rate * curr_minus_count
+    # refer to `calc_hawkes_baseline` for known limitations
     point_term = dataset.curr_count * jnp.log(point_intensity)
 
     forecast_intensity = base_intensity \
@@ -862,9 +859,8 @@ class PowerLawHawkesParams(NamedTuple):
 
 
 def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> ModelOutput:
-    # fix omega to min resolution (1ms) to avoid
-    # identifiability with beta. roughly corresponds to
-    # where the plateau crosses over to power-law tail
+    # KNOWN_LIMITATION: omega was fixed (1ms) to avoid identifiability with beta
+    # omega roughly corresponds to where the plateau crosses over to power-law tail
     omega = 1.0 / ONE_MILLISECOND
 
     n_exponentials = 10  # not differentiable
@@ -887,14 +883,13 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     kernel_factor = branching_ratio / approx_integral
 
     decay_factor_exponents = (
-        # note: this may run out of memory for large datasets
+        # KNOWN_LIMITATION: this may run out of memory for large datasets
         # switch to jax.lax.scan if necessary
         -jnp.outer(dataset.elapsed, rates)
     )
     decay_factors = jnp.exp(decay_factor_exponents)
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
 
-    # loglik of interval that just passed with no events
     prev_decayed_count = jnp.roll(decayed_count, 1, axis=0).at[0, :].set(0.0)
     term_per_exp = -jnp.expm1(decay_factor_exponents) / rates
     integral_history = (prev_decayed_count * term_per_exp) @ weights
@@ -903,12 +898,10 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
         (dataset.elapsed * base_intensity) \
         + (kernel_factor * integral_history)
 
-    # loglik of event(s) at current timestamp
     curr_minus_count = prev_decayed_count * decay_factors
     point_intensity = base_intensity \
         + kernel_factor * (curr_minus_count @ weights)
-    # refer to comments in `calc_hawkes_baseline` for explanation of
-    # modelling assumptions and implementation choices
+    # refer to `calc_hawkes_baseline` for known limitations
     point_term = dataset.curr_count * jnp.log(point_intensity)
 
     forecast_intensity = base_intensity \
@@ -956,10 +949,11 @@ show_power_law_hawkes(fitted_power_law_hawkes_params,
 def _calc_model_outputs[Params: chex.ArrayTree](prefix: str,
                                                 params: Params,
                                                 model_fn: ModelFn[Params]) -> dict[str, np.ndarray]:
-    # Validation loglik is biased downwards as the decayed counts need to
-    # "warm up" after starting from 0. The bias is kept as it is is analgous
-    # to having to restarting a trading system without replaying data that was
-    # published before the restart
+    # KNOWN_LIMITATION: Validation loglik is biased downwards as the decayed
+    # counts need to "warm up" after starting from 0. It is possible to resolve
+    # by "carrying over" the state from the training set. However, the bias is
+    # retained as it is analgous restarting a trading system intraday without
+    # any replay capabilities.
     train = model_fn(params, DATASET)
     val = model_fn(params, VAL_DATASET)
 
@@ -1001,6 +995,76 @@ display(
     .rename(columns=lambda x: x.replace('_loglik', ''))
     .style.background_gradient(axis=1)
 )
+
+
+# %%
+
+
+def plot_point_process_qq(start: datetime.datetime,
+                          end: datetime.datetime,
+                          title: str):
+    subset = WITH_MODEL_OUTPUTS.filter(
+        pl.col('time') >= start,
+        pl.col('time') <= end,
+    )
+    assert (subset['curr_count'] > 0).all(), \
+        'need to sum compensators by event'
+
+    # KNOWN_LIMITATION: There are many timestamps with more than one event.
+    # This is handled by introducing zero-valued compensators and should result
+    # in a poor fit to exponential distribution
+    extra_counts = (subset  # number of zero-compensators
+                    .select((pl.col('curr_count') - 1).clip(lower_bound=0).sum())
+                    .item())
+    n_events = subset.height + extra_counts
+    empties = jnp.zeros(extra_counts)
+
+    max_subsamples = 100_000
+    if n_events > max_subsamples:
+        indices = jnp.linspace(0, n_events-1, max_subsamples, dtype=int)
+    else:
+        indices = jnp.arange(n_events, dtype=int)
+
+    prefixes = [
+        'constant',
+        'rbf',
+        'hawkes',
+        'rbf_hawkes',
+        'pl_hawkes',
+    ]
+    f, axes = plt.subplots(3, 2, sharex=True, sharey=False, figsize=(6, 8))
+    f.suptitle(f'rescaled time plots for {title}\n[ {start} , {end}]')
+    for i, prefix in enumerate(prefixes):
+        compensator = (
+            subset[f'{prefix}_compensator']
+            .sort()  # needed for subsample indices to get the right quantiles
+                     # without missing tails
+            .to_jax()
+        )
+        rescaled_times = jnp.concat([empties, compensator])
+        assert jnp.all(jnp.diff(rescaled_times) >= 0)
+        assert len(rescaled_times) == n_events, \
+            f'{len(rescaled_times)=}, {n_events=}'
+        subsamples = rescaled_times[indices]
+
+        ax = axes[i // 2, i % 2]
+        scipy.stats.probplot(subsamples, dist='expon',
+                             sparams=(0, 1), plot=ax)
+        ax.set_title(f'{prefix}')
+        ax.set_ylabel('Predicted Quantiles')
+        ax.set_xlabel('Exponential(1) Quantiles')
+        ax.grid(True, alpha=0.3)
+
+    for j in range(len(prefixes), len(axes.flatten())):
+        axes.flatten()[j].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+
+
+plot_point_process_qq(DATA_START, TRAIN_END, 'train')
+plot_point_process_qq(TRAIN_END + datetime.timedelta(days=1), VAL_END,
+                      'validation')
 
 
 # %%
@@ -1087,11 +1151,11 @@ plot_results(DATA_START, VAL_END, duration='2h')
 
 
 # arbitrary training date
-plot_results(datetime.datetime(2025, 9, 17, hour=9),
-             datetime.datetime(2025, 9, 18, hour=6),
+plot_results(datetime.datetime(2025, 9, 20, hour=9),
+             datetime.datetime(2025, 9, 21, hour=6),
              duration='90s')
-plot_results(datetime.datetime(2025, 9, 17, hour=17),
-             datetime.datetime(2025, 9, 17, hour=20),
+plot_results(datetime.datetime(2025, 9, 20, hour=17),
+             datetime.datetime(2025, 9, 20, hour=20),
              duration='30s')
 
 
