@@ -22,16 +22,12 @@ OUTPUT_DIR = Path(__file__).parent.parent / 'data/raw'
 SYMBOLS = [
     'BTCUSDT',
     'ETHUSDT',
-    # 'XRPUSDT',
-    # 'SOLUSDT',
-    # 'ZECUSDT',
-    'BNBUSDT',
 ]
 
 
 DATES = pd.date_range(
-    start=datetime.date(2025, 12, 1),
-    end=datetime.date(2026, 1, 1),
+    start=datetime.date(2025, 9, 1),
+    end=datetime.date(2025, 10, 15),
 
     # high volume dates for testing:
     # start=datetime.date(2025, 10, 9),
