@@ -715,15 +715,13 @@ def power_law_decay_approx_params(omega: ArrayLike,
                                   min_history_duration_ms: ArrayLike,
                                   max_history_duration_ms: ArrayLike,
                                   n_exponentials: int) -> PowerLawApproxParams:
-    # to approximate lomax decay
-    #   g(t) = (1 + omega * t) ^ -(1 + beta)
-    #        = E[ h(X; t) ]
+    # to approximate lomax decay as a sum of exponentials by using the
+    # Laplace transform of Gamma(1+beta, scale=omega):
+    #   (1 + omega * t) ^ -(1 + beta) = E[ exp{-t * X} ]
     # where
-    #   X ~ Gamma(1+beta, scale=omega)
-    #       -> f(x) = k * x^{beta} * exp{-x / omega}
-    #   h(x; t) = exp{-x * t}
+    #   f(x) = k * x^{beta} * exp{-x / omega}
 
-    # decay rate for each exponential
+    # fix the decay rates for each exponential
     rates = jnp.geomspace(
         1 / max_history_duration_ms,
         1 / min_history_duration_ms,
@@ -732,7 +730,8 @@ def power_law_decay_approx_params(omega: ArrayLike,
     # quadrature weights:
     # approximate integral[ f(x)   * exp(-x   * t)   dx        ]
     # as               sum[ f(x_i) * exp(-x_i * t) * delta_x_i ]
-    # Since x_i is geomspaced, delta_x_i is proportional to x_i.
+    # delta_x_i is proportional to x_i because x_i is geomspaced.
+    # This can be derived using change of variable x = exp{u} for the integral
     log_pdf = jax.scipy.stats.gamma.logpdf(rates, a=1 + beta, scale=omega)
     unnorm_log_weights = log_pdf + jnp.log(rates)
     weights = jax.nn.softmax(unnorm_log_weights)
