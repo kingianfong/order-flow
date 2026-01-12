@@ -193,10 +193,14 @@ class ModelOutput(NamedTuple):
 
 
 def run_optim[Params: chex.ArrayTree](init_params: Params,
-                                      loss_fn: Callable[[Params, Dataset], Array],
+                                      model_fn: Callable[[Params, Dataset], ModelOutput],
                                       dataset: Dataset,
-                                      nll_samples: int | None = None,
-                                      verbose=False) -> Params:
+                                      show_hessian: bool,
+                                      verbose: bool = False) -> Params:
+
+    max_iter = 50
+    tol = 1e-5
+
     opt = optax.lbfgs(
         memory_size=20,
         linesearch=optax.scale_by_zoom_linesearch(
@@ -205,8 +209,10 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
             initial_guess_strategy='one'
         ),
     )
-    max_iter = 50
-    tol = 1e-5
+
+    def loss_fn(params: Params, dataset: Dataset) -> Array:
+        output = model_fn(params, dataset)
+        return -output.loglik.mean() + output.reg_penalty
 
     value_and_grad_fun = optax.value_and_grad_from_state(loss_fn)
 
@@ -247,7 +253,7 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
         print(f'did not converge: {n_eval=}, {err=}')
 
     # assume -mean(loglik) insetad of -sum(loglik)
-    if nll_samples is not None:
+    if show_hessian:
         print('calculating hessian')
         start_time = datetime.datetime.now()
 
@@ -278,7 +284,7 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
         plt.show()
 
         mean = flat_params
-        var = jnp.diag(inv_hess_mat) / nll_samples
+        var = jnp.diag(inv_hess_mat) / dataset.n_samples
         std_err = jnp.sqrt(var)
         display(
             pd.DataFrame(
@@ -305,24 +311,18 @@ def calc_const(params: ConstantRate, dataset: Dataset) -> ModelOutput:
     # assume constant rate throughout interval
     rate = jnp.exp(params.log_base_rate)
     return ModelOutput(
-        loglik=dataset.curr_count * jnp.log(rate) - rate * dataset.elapsed,
+        loglik=dataset.curr_count * params.log_base_rate - rate * dataset.elapsed,
         rate=rate * jnp.ones_like(dataset.elapsed),
     )
-
-
-@jax.jit
-def constant_rate_loss(params: ConstantRate, dataset: Dataset) -> Array:
-    output = calc_const(params, dataset)
-    return -output.loglik.mean()
 
 
 fitted_constant_rate_params = run_optim(
     init_params=ConstantRate(
         log_base_rate=jnp.log(closed_form_rate + 1e-4),
     ),
-    loss_fn=constant_rate_loss,
+    model_fn=calc_const,
     dataset=DATASET,
-    # nll_samples=DATASET.n_samples,
+    show_hessian=False,
 )
 assert jnp.allclose(fitted_constant_rate_params.log_base_rate,
                     jnp.log(closed_form_rate))
@@ -383,25 +383,17 @@ def plot_rbf(log_base_rate: Array, weights: Array) -> None:
 init_rbf_params = RbfRateParams(
     log_base_rate=fitted_constant_rate_params.log_base_rate,
 )
-
-
 plot_rbf(init_rbf_params.log_base_rate, init_rbf_params.weights)
 
 
 # %%
 
 
-@jax.jit
-def rbf_loss(params: RbfRateParams, dataset: Dataset) -> Array:
-    output = calc_rbf(params, dataset)
-    return -output.loglik.mean() + output.reg_penalty
-
-
 fitted_rbf_params = run_optim(
-    init_rbf_params,
-    rbf_loss,
+    init_params=init_rbf_params,
+    model_fn=calc_rbf,
     dataset=DATASET,
-    nll_samples=DATASET.n_samples,
+    show_hessian=True,
 )
 plot_rbf(fitted_rbf_params.log_base_rate, fitted_rbf_params.weights)
 
@@ -537,7 +529,6 @@ test_calculate_decayed_counts()
 # %%
 
 
-@jax.jit
 def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     base_rate = jnp.exp(params.log_base_rate)
     norm = jax.nn.sigmoid(params.logit_norm)
@@ -624,19 +615,12 @@ show_hawkes(init_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 # %%
 
 
-@jax.jit
-def hawkes_loss(params: HawkesParams, dataset: Dataset) -> Array:
-    output = calc_hawkes(params, dataset)
-    return -output.loglik.mean()
-
-
 fitted_hawkes_params = run_optim(
-    init_hawkes_params,
-    hawkes_loss,
+    init_params=init_hawkes_params,
+    model_fn=calc_hawkes,
     dataset=DATASET,
-    nll_samples=DATASET.n_samples,
+    show_hessian=True,
 )
-
 hawkes_outputs = calc_hawkes(fitted_hawkes_params, DATASET)
 show_hawkes(fitted_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 
@@ -651,7 +635,6 @@ class RbfHawkesParams(NamedTuple):
     weights: Array
 
 
-@jax.jit
 def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
     log_factor = dataset.rbf_basis @ params.weights
     base_rate = jnp.exp(params.log_base_rate + log_factor)
@@ -701,17 +684,11 @@ show_rbf_hawkes(init_rbf_hawkes, DATASET, INPUT_DF.filter('is_train'))
 # %%
 
 
-@jax.jit
-def rbf_hawkes_loss(params: RbfHawkesParams, dataset: Dataset) -> Array:
-    output = calc_rbf_hawkes(params, dataset)
-    return -output.loglik.mean() + output.reg_penalty
-
-
 fitted_rbf_hawkes_params = run_optim(
-    init_rbf_hawkes,
-    rbf_hawkes_loss,
+    init_params=init_rbf_hawkes,
+    model_fn=calc_rbf_hawkes,
     dataset=DATASET,
-    # nll_samples=DATASET.n_samples,
+    show_hessian=True,
 )
 
 
@@ -878,7 +855,6 @@ class PowerLawHawkesParams(NamedTuple):
     log_beta: Array = jnp.log(0.15)
 
 
-@jax.jit
 def calc_power_law_hawkes(params: PowerLawHawkesParams,
                           dataset: Dataset,
                           # fix omega to min resolution (1ms) to avoid
@@ -949,28 +925,19 @@ init_pl_hawkes_params = PowerLawHawkesParams(
     log_base_rate=fitted_hawkes_params.log_base_rate,
     logit_norm=fitted_hawkes_params.logit_norm,
 )
-
-
 show_power_law_hawkes(init_pl_hawkes_params, DATASET,
                       INPUT_DF.filter('is_train'))
+
 
 # %%
 
 
-@jax.jit
-def power_law_hawkes_loss(params: PowerLawHawkesParams, dataset: Dataset) -> Array:
-    output = calc_power_law_hawkes(params, dataset)
-    return -output.loglik.mean()
-
-
 fitted_power_law_hawkes_params = run_optim(
-    init_pl_hawkes_params,
-    power_law_hawkes_loss,
+    init_params=init_pl_hawkes_params,
+    model_fn=calc_power_law_hawkes,
     dataset=DATASET,
-    nll_samples=DATASET.n_samples,
+    show_hessian=True,
 )
-power_law_hawkes_outputs = calc_power_law_hawkes(
-    fitted_power_law_hawkes_params, DATASET)
 show_power_law_hawkes(fitted_power_law_hawkes_params,
                       DATASET, INPUT_DF.filter('is_train'))
 
