@@ -962,16 +962,22 @@ def _calc_model_outputs[Params: chex.ArrayTree](prefix: str,
     # published before the restart
     train = model_fn(params, DATASET)
     val = model_fn(params, VAL_DATASET)
-    loglik = np.asarray(jnp.concat([train.loglik, val.loglik]))
-    intensity = np.asarray(jnp.concat(
-        [train.forecast_intensity, val.forecast_intensity]))
+
+    def concat_arrays(train_arr, val_arr):
+        return np.asarray(jnp.concat([train_arr, val_arr]))
+
+    compensator = concat_arrays(train.compensator, val.compensator)
+    loglik = concat_arrays(train.loglik, val.loglik)
+    intensity = concat_arrays(train.forecast_intensity, val.forecast_intensity)
+
     return {
+        f'{prefix}_compensator': compensator,
         f'{prefix}_loglik': loglik,
         f'{prefix}_intensity': intensity,
     }
 
 
-with_logliks = (
+WITH_MODEL_OUTPUTS = (
     INPUT_DF
     .with_columns(
         **_calc_model_outputs('constant', fitted_constant_intensity_params, calc_const),
@@ -982,14 +988,14 @@ with_logliks = (
     )
 )
 
-display(with_logliks)
 
+display(WITH_MODEL_OUTPUTS)
 
 # %%
 
 
 display(
-    with_logliks
+    WITH_MODEL_OUTPUTS
     .group_by('is_train')
     .agg(pl.selectors.ends_with('_loglik').mean())
     .sort('is_train', descending=True)
@@ -1002,34 +1008,44 @@ display(
 # %%
 
 
-def plot_logliks(start: datetime.datetime,
+def plot_results(start: datetime.datetime,
                  end: datetime.datetime,
                  *,
                  duration: str) -> None:
-    time_until_next_sample = pl.col('elapsed').shift(-1)
-    expected_count_weight = ONE_SECOND * time_until_next_sample \
-        / time_until_next_sample.sum()
-
     df = (
-        with_logliks
+        WITH_MODEL_OUTPUTS
         .filter(
             pl.col('time') >= start,
             pl.col('time') <= end,
         )
+        .with_columns(
+            pl.col('curr_count').alias('actual_count'),
+            (
+                pl.col('elapsed').shift(-1).cast(float)
+                .alias('actual_wait_ms')
+            ),
+            (
+                pl.selectors.ends_with('_intensity').pow(-1)
+                .name.replace('_intensity', '_expected_wait_ms')
+            ),
+            (
+                pl.selectors.ends_with('_compensator')
+                .name.replace('_compensator', '_expected_count')
+            )
+        )
         .group_by(pl.col('time').dt.truncate(duration), maintain_order=True)
         .agg(
-            pl.col('curr_count').sum().alias('trade_count'),
+            pl.col('actual_count').sum(),
+            pl.col('actual_wait_ms').mean(),
             pl.selectors.ends_with('_loglik').sum(),
-            (
-                (pl.selectors.ends_with('_intensity') * expected_count_weight)
-                .sum()
-                .name.replace('_intensity', '_expected_count')
-                .round(2)
-            ),
+            pl.selectors.ends_with('_expected_count').sum(),
+            pl.selectors.ends_with('_expected_wait_ms').mean(),
         )
         .to_pandas()
         .set_index('time')
     )
+    display(df)
+
     prefixes = [
         'constant',
         'rbf',
@@ -1041,27 +1057,33 @@ def plot_logliks(start: datetime.datetime,
                            sharex=True, figsize=(8, 12))
     title = '\n'.join(
         (
-            f'log likelihood summed over {duration} buckets',
+            f'counts and waits summed over {duration} buckets',
             f'[ {start} , {end} ]',
         )
     )
     f.suptitle(title)
-    axes[0].set_title('trade_count')
-    axes[0].scatter(df.index, df['trade_count'], label='trade_count',
-                    alpha=0.4, marker='+', c='C0')
-    axes[0].set_ylabel('count', c='C0')
+    count_ax = axes[0]
+    count_ax.set_title('actual')
+    count_ax.scatter(df.index, df['actual_count'], label='actual_count',
+                     alpha=0.4, marker='+', c='C0')
+    count_ax.set_ylabel('actual count', c='C0')
+
+    wait_ax = count_ax.twinx()
+    wait_ax.scatter(df.index, df['actual_wait_ms'], label='actual_wait_ms',
+                    alpha=0.4, marker='+', c='C1')
+    wait_ax.set_ylabel('actual avg wait (ms)', c='C1')
 
     for i, prefix in enumerate(prefixes):
         ax1 = axes[1 + i]
         ax1.set_title(prefix)
         ax1.scatter(df.index, df[f'{prefix}_expected_count'],
-                    alpha=0.4, marker='+', c='C1')
-        ax1.set_ylabel('expected count', c='C1')
+                    alpha=0.4, marker='+', c='C2')
+        ax1.set_ylabel('expected count', c='C2')
 
         ax2 = ax1.twinx()
-        ax2.scatter(df.index, df[f'{prefix}_loglik'],
-                    alpha=0.4, marker='x', c='C2')
-        ax2.set_ylabel('loglik', c='C2')
+        ax2.scatter(df.index, df[f'{prefix}_expected_wait_ms'],
+                    alpha=0.4, marker='x', c='C3')
+        ax2.set_ylabel('expected avg wait (ms)', c='C3')
 
     for ax in axes:
         ax.grid(True, which="both", ls="--", alpha=0.4)
@@ -1071,17 +1093,17 @@ def plot_logliks(start: datetime.datetime,
     plt.show()
 
 
-plot_logliks(DATA_START, VAL_END, duration='2h')
+plot_results(DATA_START, VAL_END, duration='2h')
 
 
 # %%
 
 
 # arbitrary training date
-plot_logliks(datetime.datetime(2025, 9, 17, hour=9),
+plot_results(datetime.datetime(2025, 9, 17, hour=9),
              datetime.datetime(2025, 9, 18, hour=6),
              duration='90s')
-plot_logliks(datetime.datetime(2025, 9, 17, hour=17),
+plot_results(datetime.datetime(2025, 9, 17, hour=17),
              datetime.datetime(2025, 9, 17, hour=20),
              duration='30s')
 
@@ -1090,10 +1112,10 @@ plot_logliks(datetime.datetime(2025, 9, 17, hour=17),
 
 
 # 2025/10/10 volatility event
-plot_logliks(datetime.datetime(2025, 10, 10, hour=9),
+plot_results(datetime.datetime(2025, 10, 10, hour=9),
              datetime.datetime(2025, 10, 11, hour=6),
              duration='90s')
-plot_logliks(datetime.datetime(2025, 10, 10, hour=20),
+plot_results(datetime.datetime(2025, 10, 10, hour=20),
              datetime.datetime(2025, 10, 11, hour=1),
              duration='30s')
 
