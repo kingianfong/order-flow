@@ -968,12 +968,10 @@ def _calc_model_outputs[Params: chex.ArrayTree](prefix: str,
 
     compensator = concat_arrays(train.compensator, val.compensator)
     loglik = concat_arrays(train.loglik, val.loglik)
-    intensity = concat_arrays(train.forecast_intensity, val.forecast_intensity)
 
     return {
         f'{prefix}_compensator': compensator,
         f'{prefix}_loglik': loglik,
-        f'{prefix}_intensity': intensity,
     }
 
 
@@ -1020,26 +1018,18 @@ def plot_results(start: datetime.datetime,
         )
         .with_columns(
             pl.col('curr_count').alias('actual_count'),
-            (
-                pl.col('elapsed').shift(-1).cast(float)
-                .alias('actual_wait_ms')
-            ),
-            (
-                pl.selectors.ends_with('_intensity').pow(-1)
-                .name.replace('_intensity', '_expected_wait_ms')
-            ),
+            pl.col('elapsed').cast(float),
             (
                 pl.selectors.ends_with('_compensator')
                 .name.replace('_compensator', '_expected_count')
-            )
+            ),
         )
         .group_by(pl.col('time').dt.truncate(duration), maintain_order=True)
         .agg(
             pl.col('actual_count').sum(),
-            pl.col('actual_wait_ms').mean(),
+            pl.col('elapsed').sum().alias('duration_ms'),
             pl.selectors.ends_with('_loglik').sum(),
             pl.selectors.ends_with('_expected_count').sum(),
-            pl.selectors.ends_with('_expected_wait_ms').mean(),
         )
         .to_pandas()
         .set_index('time')
@@ -1057,33 +1047,30 @@ def plot_results(start: datetime.datetime,
                            sharex=True, figsize=(8, 12))
     title = '\n'.join(
         (
-            f'counts and waits summed over {duration} buckets',
+            f'counts and log likelihoods summed over {duration} buckets',
             f'[ {start} , {end} ]',
         )
     )
     f.suptitle(title)
     count_ax = axes[0]
     count_ax.set_title('actual')
+    count_ax.set_yscale('log')
     count_ax.scatter(df.index, df['actual_count'], label='actual_count',
                      alpha=0.4, marker='+', c='C0')
     count_ax.set_ylabel('actual count', c='C0')
 
-    wait_ax = count_ax.twinx()
-    wait_ax.scatter(df.index, df['actual_wait_ms'], label='actual_wait_ms',
-                    alpha=0.4, marker='+', c='C1')
-    wait_ax.set_ylabel('actual avg wait (ms)', c='C1')
-
     for i, prefix in enumerate(prefixes):
         ax1 = axes[1 + i]
         ax1.set_title(prefix)
+        ax1.set_yscale('log')
         ax1.scatter(df.index, df[f'{prefix}_expected_count'],
-                    alpha=0.4, marker='+', c='C2')
-        ax1.set_ylabel('expected count', c='C2')
+                    alpha=0.4, marker='+', c='C1')
+        ax1.set_ylabel('expected count', c='C1')
 
         ax2 = ax1.twinx()
-        ax2.scatter(df.index, df[f'{prefix}_expected_wait_ms'],
-                    alpha=0.4, marker='x', c='C3')
-        ax2.set_ylabel('expected avg wait (ms)', c='C3')
+        ax2.scatter(df.index, df[f'{prefix}_loglik'],
+                    alpha=0.4, marker='x', c='C2')
+        ax2.set_ylabel('log likelihood', c='C2')
 
     for ax in axes:
         ax.grid(True, which="both", ls="--", alpha=0.4)
