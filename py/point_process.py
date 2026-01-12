@@ -2,10 +2,11 @@
 
 
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import NamedTuple
 import datetime
 
 from IPython.display import display
+import chex
 from jax import Array
 from jax.flatten_util import ravel_pytree
 from jax.scipy.special import logit
@@ -185,9 +186,11 @@ def get_pytree_labels(params):
     return labels
 
 
-def run_optim(init_params, loss_fn, loss_kwargs,
-              nll_samples: int | None = None,
-              verbose=False) -> Any:
+def run_optim[Params: chex.ArrayTree](init_params: Params,
+                                      loss_fn,
+                                      loss_kwargs,
+                                      nll_samples: int | None = None,
+                                      verbose=False) -> Params:
     opt = optax.lbfgs(
         memory_size=20,
         linesearch=optax.scale_by_zoom_linesearch(
@@ -293,8 +296,13 @@ class ModelOutput(NamedTuple):
     rate: Array  # used for predictions after observing events at t
 
 
-def calc_const(rate: Array, dataset: Dataset) -> ModelOutput:
+class ConstantRate(NamedTuple):
+    log_base_rate: Array
+
+
+def calc_const(params: ConstantRate, dataset: Dataset) -> ModelOutput:
     # assume constant rate throughout interval
+    rate = jnp.exp(params.log_base_rate)
     return ModelOutput(
         loglik=dataset.curr_count * jnp.log(rate) - rate * dataset.elapsed,
         rate=rate * jnp.ones_like(dataset.elapsed),
@@ -302,23 +310,21 @@ def calc_const(rate: Array, dataset: Dataset) -> ModelOutput:
 
 
 @jax.jit
-def constant_rate_loss(params: Array, dataset: Dataset):
-    log_rate, = params
-    rate = jnp.exp(log_rate)
-    return -calc_const(rate, dataset).loglik.mean()
+def constant_rate_loss(params: ConstantRate, dataset: Dataset):
+    output = calc_const(params, dataset)
+    return -output.loglik.mean()
 
 
-log_constant_rate_result = run_optim(
-    init_params=(jnp.log(closed_form_rate + 1e-4), ),
+fitted_constant_rate_params = run_optim(
+    init_params=ConstantRate(
+        log_base_rate=jnp.log(closed_form_rate + 1e-4),
+    ),
     loss_fn=constant_rate_loss,
     loss_kwargs=dict(dataset=DATASET),
     # nll_samples=DATASET.n_samples,
 )
-
-
-constant_rate = jnp.exp(log_constant_rate_result[0]).item()
-
-print(f'{closed_form_rate=:.8f}, {constant_rate=:.8f}')
+assert jnp.allclose(fitted_constant_rate_params.log_base_rate,
+                    jnp.log(closed_form_rate))
 
 
 # %%
@@ -370,7 +376,7 @@ def plot_rbf(log_base_rate: Array, weights: Array) -> None:
 
 
 init_rbf_params = RbfRateParams(
-    log_base_rate=jnp.log(constant_rate),
+    log_base_rate=fitted_constant_rate_params.log_base_rate,
 )
 
 
@@ -386,14 +392,13 @@ def rbf_loss(params: RbfRateParams, dataset: Dataset):
     return -output.loglik.mean() + RbfConstants.reg_penalty(params.weights)
 
 
-rbf_optim_params = run_optim(
+fitted_rbf_params = run_optim(
     init_rbf_params,
     rbf_loss,
     loss_kwargs=dict(dataset=DATASET,),
     nll_samples=DATASET.n_samples,
 )
-rbf_outputs = calc_rbf(rbf_optim_params, DATASET)
-plot_rbf(rbf_optim_params.log_base_rate, rbf_optim_params.weights)
+plot_rbf(fitted_rbf_params.log_base_rate, fitted_rbf_params.weights)
 
 
 # %%
@@ -604,7 +609,7 @@ def show_hawkes(params, dataset: Dataset, input_df: pl.DataFrame) -> None:
 
 
 init_hawkes_params = HawkesParams(
-    log_base_rate=jnp.log(constant_rate),
+    log_base_rate=fitted_constant_rate_params.log_base_rate,
 )
 
 
@@ -620,15 +625,15 @@ def hawkes_loss(params: HawkesParams, dataset: Dataset):
     return -output.loglik.mean()
 
 
-hawkes_optim_params = run_optim(
+fitted_hawkes_params = run_optim(
     init_hawkes_params,
     hawkes_loss,
     loss_kwargs=dict(dataset=DATASET),
     nll_samples=DATASET.n_samples,
 )
 
-hawkes_outputs = calc_hawkes(hawkes_optim_params, DATASET)
-show_hawkes(hawkes_optim_params, DATASET, INPUT_DF.filter('is_train'))
+hawkes_outputs = calc_hawkes(fitted_hawkes_params, DATASET)
+show_hawkes(fitted_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 
 
 # %%
@@ -677,10 +682,10 @@ def show_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset, input_df: pl.Data
 
 
 init_rbf_hawkes = RbfHawkesParams(
-    log_base_rate=hawkes_optim_params.log_base_rate,
-    logit_norm=hawkes_optim_params.logit_norm,
-    log_omega=hawkes_optim_params.log_omega,
-    weights=rbf_optim_params.weights,
+    log_base_rate=fitted_hawkes_params.log_base_rate,
+    logit_norm=fitted_hawkes_params.logit_norm,
+    log_omega=fitted_hawkes_params.log_omega,
+    weights=fitted_rbf_params.weights,
 )
 
 
@@ -696,14 +701,15 @@ def rbf_hawkes_loss(params: RbfHawkesParams, dataset: Dataset):
     return -output.loglik.mean() + RbfConstants.reg_penalty(params.weights)
 
 
-rbf_hawkes_optim_params = run_optim(
+fitted_rbf_hawkes_params = run_optim(
     init_rbf_hawkes,
     rbf_hawkes_loss,
     loss_kwargs=dict(dataset=DATASET),
     # nll_samples=DATASET.n_samples,
 )
-rbf_hawkes_outputs = calc_rbf_hawkes(rbf_hawkes_optim_params, DATASET)
-show_rbf_hawkes(rbf_hawkes_optim_params, DATASET, INPUT_DF.filter('is_train'))
+
+
+show_rbf_hawkes(fitted_rbf_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 
 
 # %%
@@ -934,8 +940,8 @@ def show_power_law_hawkes(params: PowerLawHawkesParams,
 
 
 init_pl_hawkes_params = PowerLawHawkesParams(
-    log_base_rate=hawkes_optim_params.log_base_rate,
-    logit_norm=hawkes_optim_params.logit_norm,
+    log_base_rate=fitted_hawkes_params.log_base_rate,
+    logit_norm=fitted_hawkes_params.logit_norm,
 )
 
 
@@ -951,15 +957,15 @@ def power_law_hawkes_loss(params: PowerLawHawkesParams, dataset: Dataset):
     return -output.loglik.mean()
 
 
-power_law_hawkes_optim_params = run_optim(
+fitted_power_law_hawkes_params = run_optim(
     init_pl_hawkes_params,
     power_law_hawkes_loss,
     loss_kwargs=dict(dataset=DATASET),
     nll_samples=DATASET.n_samples,
 )
 power_law_hawkes_outputs = calc_power_law_hawkes(
-    power_law_hawkes_optim_params, DATASET)
-show_power_law_hawkes(power_law_hawkes_optim_params,
+    fitted_power_law_hawkes_params, DATASET)
+show_power_law_hawkes(fitted_power_law_hawkes_params,
                       DATASET, INPUT_DF.filter('is_train'))
 
 
@@ -984,15 +990,15 @@ def _calc_model_outputs(prefix: str, params, calc_output_fn):
 with_logliks = (
     INPUT_DF
     .with_columns(
-        **_calc_model_outputs('constant', constant_rate, calc_const),
-        **_calc_model_outputs('rbf', rbf_optim_params, calc_rbf),
-        **_calc_model_outputs('hawkes', hawkes_optim_params, calc_hawkes),
-        **_calc_model_outputs('rbf_hawkes', rbf_hawkes_optim_params, calc_rbf_hawkes),
-        **_calc_model_outputs('pl_hawkes', power_law_hawkes_optim_params, calc_power_law_hawkes),
+        **_calc_model_outputs('constant', fitted_constant_rate_params, calc_const),
+        **_calc_model_outputs('rbf', fitted_rbf_params, calc_rbf),
+        **_calc_model_outputs('hawkes', fitted_hawkes_params, calc_hawkes),
+        **_calc_model_outputs('rbf_hawkes', fitted_rbf_hawkes_params, calc_rbf_hawkes),
+        **_calc_model_outputs('pl_hawkes', fitted_power_law_hawkes_params, calc_power_law_hawkes),
     )
 )
 
-with_logliks
+display(with_logliks)
 
 
 # %%
