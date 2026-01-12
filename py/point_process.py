@@ -6,10 +6,11 @@ from typing import Any, NamedTuple, Callable
 import datetime
 
 from IPython.display import display
-import chex
 from jax import Array
 from jax.flatten_util import ravel_pytree
 from jax.scipy.special import logit
+from jax.typing import ArrayLike
+import chex
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -125,10 +126,10 @@ class Dataset(NamedTuple):
     n_samples: int
 
 
-ONE_MILLISECOND: Array = jnp.array(1.0)  # timestamp resolution
-ONE_SECOND: Array = jnp.array(1.0 * 1e3)
-ONE_MIN: Array = jnp.array(60.0 * 1e3)
-ONE_HOUR: Array = jnp.array(3600.0 * 1e3)
+ONE_MILLISECOND: float = 1.0  # timestamp resolution
+ONE_SECOND: float = 1.0 * 1e3
+ONE_MIN: float = 60.0 * 1e3
+ONE_HOUR: float = 3600.0 * 1e3
 
 
 def create_dataset(df: pl.DataFrame) -> Dataset:
@@ -696,9 +697,10 @@ class PowerLawApproxParams(NamedTuple):
     rates: Array
 
 
-def power_law_decay_approx_params(omega: Array, beta: Array,
-                                  min_history_duration_ms: Array,
-                                  max_history_duration_ms: Array,
+def power_law_decay_approx_params(omega: ArrayLike,
+                                  beta: ArrayLike,
+                                  min_history_duration_ms: ArrayLike,
+                                  max_history_duration_ms: ArrayLike,
                                   n_exponentials: int) -> PowerLawApproxParams:
     # to approximate lomax decay
     #   g(t) = (1 + omega * t) ^ -(1 + beta)
@@ -729,7 +731,7 @@ def power_law_decay_approx_params(omega: Array, beta: Array,
 
 
 def plot_power_law_decay() -> None:
-    def calc_exact(t: Array, omega: Array, beta: Array):
+    def calc_exact(t: Array, omega: ArrayLike, beta: ArrayLike):
         return (1.0 + omega * t) ** -(1.0 + beta)
 
     # done sequentially to ensure markovian nature holds
@@ -750,7 +752,7 @@ def plot_power_law_decay() -> None:
     n_exponentials = 14  # 2x orders of magnitude
 
     inv_omegas = ONE_MILLISECOND,  ONE_MIN,  ONE_HOUR
-    betas: tuple = 0.15, 0.3, 0.5
+    betas = 0.15, 0.3, 0.5
 
     f1, axes1 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
     f1.suptitle('Lomax Kernel')
@@ -847,7 +849,7 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     # fix omega to min resolution (1ms) to avoid
     # identifiability with beta. roughly corresponds to
     # where the plateau crosses over to power-law tail
-    omega: Array = 1.0 / ONE_MILLISECOND
+    omega = 1.0 / ONE_MILLISECOND
 
     n_exponentials = 10  # not differentiable
     min_history_duration_ms = ONE_MILLISECOND
@@ -985,7 +987,7 @@ def plot_logliks(start: datetime.datetime,
                  *,
                  duration: str) -> None:
     time_until_next_sample = pl.col('elapsed').shift(-1)
-    expected_count_weight = time_until_next_sample \
+    expected_count_weight = ONE_SECOND * time_until_next_sample \
         / time_until_next_sample.sum()
 
     df = (
