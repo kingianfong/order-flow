@@ -2,7 +2,7 @@
 
 
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, Callable
 import datetime
 
 from IPython.display import display
@@ -186,9 +186,15 @@ def get_pytree_labels(params):
     return labels
 
 
+class ModelOutput(NamedTuple):
+    loglik: Array  # loglik of (no event since prev t) + (events at t)
+    rate: Array  # used for predictions after observing events at t
+    reg_penalty: Array = jnp.array(0)
+
+
 def run_optim[Params: chex.ArrayTree](init_params: Params,
-                                      loss_fn,
-                                      loss_kwargs,
+                                      loss_fn: Callable[[Params, Dataset], Array],
+                                      dataset: Dataset,
                                       nll_samples: int | None = None,
                                       verbose=False) -> Params:
     opt = optax.lbfgs(
@@ -205,15 +211,15 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
     value_and_grad_fun = optax.value_and_grad_from_state(loss_fn)
 
     @jax.jit
-    def update(carry, loss_kwargs):
+    def update(carry, dataset):
         params, state = carry
-        value, grad = value_and_grad_fun(params, state=state, **loss_kwargs)
+        value, grad = value_and_grad_fun(params, state=state, dataset=dataset)
         updates, state = opt.update(
             grad, state, params,
             value=value,
             grad=grad,
             value_fn=loss_fn,
-            **loss_kwargs,
+            dataset=dataset,
         )
         params = optax.apply_updates(params, updates)
         return params, state
@@ -224,7 +230,7 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
 
     # this loop may force syncs between GPU and CPU
     for n_iter in range(max_iter):
-        params, state = update((params, state), loss_kwargs)
+        params, state = update((params, state), dataset=dataset)
         *_, linesearch_state = state
         assert isinstance(linesearch_state, optax.ScaleByZoomLinesearchState), \
             f'{type(linesearch_state)=}'
@@ -250,7 +256,7 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
         def flat_loss_fn(flat_p, dataset):
             return loss_fn(unravel(flat_p), dataset)
         calc_hess = jax.jit(jax.hessian(flat_loss_fn))
-        hess_mat = calc_hess(flat_params, **loss_kwargs)
+        hess_mat = calc_hess(flat_params, dataset=dataset)
 
         eigvals = jnp.linalg.eigvalsh(hess_mat)
         if jnp.any(eigvals <= 0):
@@ -291,11 +297,6 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
     return params
 
 
-class ModelOutput(NamedTuple):
-    loglik: Array  # loglik of (no event since prev t) + (events at t)
-    rate: Array  # used for predictions after observing events at t
-
-
 class ConstantRate(NamedTuple):
     log_base_rate: Array
 
@@ -310,7 +311,7 @@ def calc_const(params: ConstantRate, dataset: Dataset) -> ModelOutput:
 
 
 @jax.jit
-def constant_rate_loss(params: ConstantRate, dataset: Dataset):
+def constant_rate_loss(params: ConstantRate, dataset: Dataset) -> Array:
     output = calc_const(params, dataset)
     return -output.loglik.mean()
 
@@ -320,7 +321,7 @@ fitted_constant_rate_params = run_optim(
         log_base_rate=jnp.log(closed_form_rate + 1e-4),
     ),
     loss_fn=constant_rate_loss,
-    loss_kwargs=dict(dataset=DATASET),
+    dataset=DATASET,
     # nll_samples=DATASET.n_samples,
 )
 assert jnp.allclose(fitted_constant_rate_params.log_base_rate,
@@ -342,7 +343,11 @@ def calc_rbf(params: RbfRateParams, dataset: Dataset) -> ModelOutput:
     loglik = \
         dataset.curr_count * log_rate \
         - rate * dataset.elapsed  # assume constant rate throughout interval
-    return ModelOutput(loglik=loglik, rate=rate)
+    return ModelOutput(
+        loglik=loglik,
+        rate=rate,
+        reg_penalty=RbfConstants.reg_penalty(params.weights)
+    )
 
 
 def plot_rbf(log_base_rate: Array, weights: Array) -> None:
@@ -387,15 +392,15 @@ plot_rbf(init_rbf_params.log_base_rate, init_rbf_params.weights)
 
 
 @jax.jit
-def rbf_loss(params: RbfRateParams, dataset: Dataset):
+def rbf_loss(params: RbfRateParams, dataset: Dataset) -> Array:
     output = calc_rbf(params, dataset)
-    return -output.loglik.mean() + RbfConstants.reg_penalty(params.weights)
+    return -output.loglik.mean() + output.reg_penalty
 
 
 fitted_rbf_params = run_optim(
     init_rbf_params,
     rbf_loss,
-    loss_kwargs=dict(dataset=DATASET,),
+    dataset=DATASET,
     nll_samples=DATASET.n_samples,
 )
 plot_rbf(fitted_rbf_params.log_base_rate, fitted_rbf_params.weights)
@@ -620,7 +625,7 @@ show_hawkes(init_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 
 
 @jax.jit
-def hawkes_loss(params: HawkesParams, dataset: Dataset):
+def hawkes_loss(params: HawkesParams, dataset: Dataset) -> Array:
     output = calc_hawkes(params, dataset)
     return -output.loglik.mean()
 
@@ -628,7 +633,7 @@ def hawkes_loss(params: HawkesParams, dataset: Dataset):
 fitted_hawkes_params = run_optim(
     init_hawkes_params,
     hawkes_loss,
-    loss_kwargs=dict(dataset=DATASET),
+    dataset=DATASET,
     nll_samples=DATASET.n_samples,
 )
 
@@ -671,6 +676,7 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
     return ModelOutput(
         loglik=event_term - interval_term,
         rate=forecast_rate,
+        reg_penalty=RbfConstants.reg_penalty(params.weights),
     )
 
 
@@ -696,15 +702,15 @@ show_rbf_hawkes(init_rbf_hawkes, DATASET, INPUT_DF.filter('is_train'))
 
 
 @jax.jit
-def rbf_hawkes_loss(params: RbfHawkesParams, dataset: Dataset):
+def rbf_hawkes_loss(params: RbfHawkesParams, dataset: Dataset) -> Array:
     output = calc_rbf_hawkes(params, dataset)
-    return -output.loglik.mean() + RbfConstants.reg_penalty(params.weights)
+    return -output.loglik.mean() + output.reg_penalty
 
 
 fitted_rbf_hawkes_params = run_optim(
     init_rbf_hawkes,
     rbf_hawkes_loss,
-    loss_kwargs=dict(dataset=DATASET),
+    dataset=DATASET,
     # nll_samples=DATASET.n_samples,
 )
 
@@ -952,7 +958,7 @@ show_power_law_hawkes(init_pl_hawkes_params, DATASET,
 
 
 @jax.jit
-def power_law_hawkes_loss(params: PowerLawHawkesParams, dataset: Dataset):
+def power_law_hawkes_loss(params: PowerLawHawkesParams, dataset: Dataset) -> Array:
     output = calc_power_law_hawkes(params, dataset)
     return -output.loglik.mean()
 
@@ -960,7 +966,7 @@ def power_law_hawkes_loss(params: PowerLawHawkesParams, dataset: Dataset):
 fitted_power_law_hawkes_params = run_optim(
     init_pl_hawkes_params,
     power_law_hawkes_loss,
-    loss_kwargs=dict(dataset=DATASET),
+    dataset=DATASET,
     nll_samples=DATASET.n_samples,
 )
 power_law_hawkes_outputs = calc_power_law_hawkes(
