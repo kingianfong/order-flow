@@ -309,11 +309,11 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
     return params
 
 
-class ConstanIntensityParams(NamedTuple):
+class ConstantIntensityParams(NamedTuple):
     log_base_intensity: Array
 
 
-def calc_const(params: ConstanIntensityParams, dataset: Dataset) -> ModelOutput:
+def calc_const(params: ConstantIntensityParams, dataset: Dataset) -> ModelOutput:
     intensity = jnp.exp(params.log_base_intensity)
     return ModelOutput(
         forecast_intensity=intensity * jnp.ones_like(dataset.elapsed),
@@ -323,7 +323,7 @@ def calc_const(params: ConstanIntensityParams, dataset: Dataset) -> ModelOutput:
 
 
 fitted_constant_intensity_params = run_optim(
-    init_params=ConstanIntensityParams(
+    init_params=ConstantIntensityParams(
         log_base_intensity=jnp.log(closed_form_intensity + 1e-4),
     ),
     model_fn=calc_const,
@@ -844,8 +844,7 @@ def plot_power_law_decay() -> None:
     plt.show()
 
 
-if __name__ == '__main__':
-    plot_power_law_decay()
+plot_power_law_decay()
 
 
 # %%
