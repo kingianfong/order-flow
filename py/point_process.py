@@ -10,7 +10,6 @@ import chex
 from jax import Array
 from jax.flatten_util import ravel_pytree
 from jax.scipy.special import logit
-from jax.typing import ArrayLike
 import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -51,6 +50,7 @@ def load_data(raw_data_dir: Path,
             pl.col('date') <= val_end,
         )
         .with_columns(
+            pl.col('time').cast(pl.Datetime('ms')),
             is_train=pl.col('date') <= train_end,
         )
         .drop('sym', 'date')
@@ -61,23 +61,20 @@ def load_data(raw_data_dir: Path,
             curr_count=pl.len(),
         )
         .with_columns(
-            pl.col('time').cast(pl.Datetime('ms')),
-        )
-        .with_columns(
-            elapsed_ms=(pl.col('time').diff()
-                        .dt.total_milliseconds(fractional=True)),
+            elapsed=pl.col('time').diff(),
             hour=((pl.col('time') - pl.col('time').dt.truncate('1d'))
                   .dt.total_hours(fractional=True)),
         )
-        .filter(pl.col('elapsed_ms').is_not_null())
+        .filter(pl.col('elapsed').is_not_null())
         .collect()
     )
 
-    assert (df['curr_count'] > 0).all()
-    assert (df['elapsed_ms'] > 0).all()
-    assert (df['hour'] >= 0).all()
     assert df['time'].is_unique().all()
     assert df['time'].is_sorted()
+    assert (df['curr_count'] > 0).all()
+    assert (df['elapsed'] > datetime.timedelta(0)).all()
+    assert (df['hour'] >= 0).all()
+    assert (df['hour'] <= 24).all()
     return df
 
 
@@ -128,10 +125,16 @@ class Dataset(NamedTuple):
     n_samples: int
 
 
+ONE_MILLISECOND: Array = jnp.array(1.0)  # timestamp resolution
+ONE_SECOND: Array = jnp.array(1.0 * 1e3)
+ONE_MIN: Array = jnp.array(60.0 * 1e3)
+ONE_HOUR: Array = jnp.array(3600.0 * 1e3)
+
+
 def create_dataset(df: pl.DataFrame) -> Dataset:
     return Dataset(
-        curr_count=df['curr_count'].cast(pl.Float32).to_jax(),
-        elapsed=df['elapsed_ms'].to_jax(),
+        curr_count=df['curr_count'].cast(float).to_jax(),
+        elapsed=df['elapsed'].dt.total_milliseconds(fractional=True).to_jax(),
         rbf_basis=calc_rbf_basis(df['hour'].to_jax()),
         n_samples=df.height,
     )
@@ -145,7 +148,7 @@ VAL_DATASET = create_dataset(INPUT_DF.filter(~pl.col('is_train')))
 
 
 closed_form_rate = (DATASET.curr_count.sum() / DATASET.elapsed.sum()).item()
-print(f'{closed_form_rate=}, around {closed_form_rate*1000:.2f}/second')
+print(f'{closed_form_rate=}, around {closed_form_rate*ONE_SECOND:.2f}/second')
 print(f'{jnp.log(closed_form_rate)=:.4f}')
 
 
@@ -348,7 +351,7 @@ def plot_rbf(log_base_rate: Array, weights: Array) -> None:
     log_factor = bases @ weights
     base_rate = jnp.exp(log_base_rate).item()
     rate = jnp.exp(log_base_rate + log_factor)
-    per_second = base_rate * 1000
+    per_second = base_rate * ONE_SECOND
     per_basis = bases * weights
 
     f, axes = plt.subplots(2, 1, sharex=True)
@@ -693,11 +696,6 @@ class PowerLawApproxParams(NamedTuple):
     rates: Array
 
 
-_one_millisecond = jnp.array(1.0)  # timestamp resolution
-_one_minute = _one_millisecond * 60e3
-_one_hour = _one_minute * 60
-
-
 def power_law_decay_approx_params(omega: Array, beta: Array,
                                   min_history_duration_ms: Array,
                                   max_history_duration_ms: Array,
@@ -744,14 +742,14 @@ def plot_power_law_decay() -> None:
         return decayed_counts @ params.weights
 
     n = 10_000
-    min_t_ms = _one_millisecond
-    max_t_ms = _one_hour
+    min_t_ms = ONE_MILLISECOND
+    max_t_ms = ONE_HOUR
     t_geom = jnp.geomspace(min_t_ms, max_t_ms * 10, n)
     orders_of_magnitude = jnp.log10(max_t_ms / min_t_ms).item()
     print(f'{orders_of_magnitude=:.2f}')
     n_exponentials = 14  # 2x orders of magnitude
 
-    inv_omegas = _one_millisecond,  _one_minute,  _one_hour
+    inv_omegas = ONE_MILLISECOND,  ONE_MIN,  ONE_HOUR
     betas: tuple = 0.15, 0.3, 0.5
 
     f1, axes1 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
@@ -805,7 +803,7 @@ def plot_power_law_decay() -> None:
             ax2.legend(loc='upper right')
 
             ax3 = axes3[r, c]
-            keep = t_geom < (2 * _one_hour)
+            keep = t_geom < (2 * ONE_HOUR)
             ax3.plot(t_geom[keep], exact[keep], 'k-', label='exact', lw=2)
             ax3.plot(t_geom[keep], approx[keep], 'r--', label='approx', lw=2)
             ax3.axvline(inv_omega, c='g', linestyle='--', alpha=0.6,
@@ -849,11 +847,11 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     # fix omega to min resolution (1ms) to avoid
     # identifiability with beta. roughly corresponds to
     # where the plateau crosses over to power-law tail
-    omega: Array = 1.0 / _one_millisecond
+    omega: Array = 1.0 / ONE_MILLISECOND
 
     n_exponentials = 10  # not differentiable
-    min_history_duration_ms = _one_millisecond
-    max_history_duration_ms = _one_hour * 2
+    min_history_duration_ms = ONE_MILLISECOND
+    max_history_duration_ms = ONE_HOUR * 2
 
     base_rate = jnp.exp(params.log_base_rate)
     norm = jax.nn.sigmoid(params.logit_norm)
@@ -986,8 +984,8 @@ def plot_logliks(start: datetime.datetime,
                  end: datetime.datetime,
                  *,
                  duration: str) -> None:
-    time_until_next_sample = pl.col('elapsed_ms').shift(-1)
-    expected_count_weight = 1000 * time_until_next_sample \
+    time_until_next_sample = pl.col('elapsed').shift(-1)
+    expected_count_weight = time_until_next_sample \
         / time_until_next_sample.sum()
 
     df = (
