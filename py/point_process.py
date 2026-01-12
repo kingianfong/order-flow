@@ -65,7 +65,7 @@ def load_data(raw_data_dir: Path,
         )
         .with_columns(
             elapsed_ms=(pl.col('time').diff()
-                        .dt.total_milliseconds().cast(pl.Float32)),
+                        .dt.total_milliseconds(fractional=True)),
             hour=((pl.col('time') - pl.col('time').dt.truncate('1d'))
                   .dt.total_hours(fractional=True)),
         )
@@ -128,26 +128,17 @@ class Dataset(NamedTuple):
     n_samples: int
 
 
-def create_datasets(input_df: pl.DataFrame) -> tuple[Dataset, Dataset]:
-    train_df = input_df.filter(pl.col('is_train'))
-    val_df = input_df.filter(~pl.col('is_train'))
-
-    train_ds = Dataset(
-        curr_count=train_df['curr_count'].cast(pl.Float32).to_jax(),
-        elapsed=train_df['elapsed_ms'].to_jax(),
-        rbf_basis=calc_rbf_basis(train_df['hour'].to_jax()),
-        n_samples=train_df.height,
+def create_dataset(df: pl.DataFrame) -> Dataset:
+    return Dataset(
+        curr_count=df['curr_count'].cast(pl.Float32).to_jax(),
+        elapsed=df['elapsed_ms'].to_jax(),
+        rbf_basis=calc_rbf_basis(df['hour'].to_jax()),
+        n_samples=df.height,
     )
-    val_ds = Dataset(
-        curr_count=val_df['curr_count'].cast(pl.Float32).to_jax(),
-        elapsed=val_df['elapsed_ms'].to_jax(),
-        rbf_basis=calc_rbf_basis(val_df['hour'].to_jax()),
-        n_samples=val_df.height,
-    )
-    return train_ds, val_ds
 
 
-DATASET, VAL_DATASET = create_datasets(INPUT_DF)
+DATASET = create_dataset(INPUT_DF.filter(pl.col('is_train')))
+VAL_DATASET = create_dataset(INPUT_DF.filter(~pl.col('is_train')))
 
 
 # %%
