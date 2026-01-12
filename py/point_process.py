@@ -2,7 +2,7 @@
 
 
 from pathlib import Path
-from typing import NamedTuple, Callable
+from typing import Any, NamedTuple, Callable
 import datetime
 
 from IPython.display import display
@@ -38,9 +38,9 @@ VAL_END = datetime.datetime(2025, 10, 15)
 # there can be multiple trades per timestamp
 def load_data(raw_data_dir: Path,
               sym: str,
-              start: datetime.date,
-              train_end: datetime.date,
-              val_end: datetime.date) -> pl.DataFrame:
+              start: datetime.datetime,
+              train_end: datetime.datetime,
+              val_end: datetime.datetime) -> pl.DataFrame:
     assert start <= train_end <= val_end, \
         f'{start=}, {train_end=}, {val_end=}'
     df = (
@@ -103,12 +103,12 @@ class RbfConstants:
     centers: Array = jnp.linspace(0, n_hours, n_centers, endpoint=False)
 
     width_factor: float = 0.5
-    sigma = width_factor * n_hours / n_centers
-    inv_sigma_sq = 1.0 / (sigma**2)
+    sigma: float = width_factor * n_hours / n_centers
+    inv_sigma_sq: float = 1.0 / (sigma**2)
 
     @staticmethod
     def reg_penalty(weights: Array) -> Array:
-        l2_reg: float = 0.1
+        l2_reg = 0.1
         return jnp.sum(jnp.square(weights)) * l2_reg
 
 
@@ -128,7 +128,7 @@ class Dataset(NamedTuple):
     n_samples: int
 
 
-def create_datasets(input_df: pl.DataFrame):
+def create_datasets(input_df: pl.DataFrame) -> tuple[Dataset, Dataset]:
     train_df = input_df.filter(pl.col('is_train'))
     val_df = input_df.filter(~pl.col('is_train'))
 
@@ -161,12 +161,10 @@ print(f'{jnp.log(closed_form_rate)=:.4f}')
 # %%
 
 
-def get_pytree_labels(params):
+def get_pytree_labels(params: chex.ArrayTree) -> list[str]:
     """Generates a list of strings representing each scalar in the PyTree."""
-    # We need the paths (keys) to each leaf
-    # This requires jax.tree_util.tree_leaves_with_path (available in modern JAX)
-    leaves_with_path = jax.tree_util.tree_leaves_with_path(params)
 
+    leaves_with_path = jax.tree_util.tree_leaves_with_path(params)
     labels = []
     for path, leaf in leaves_with_path:
         # Convert path tuple (e.g., (DictKey(key='w'),)) to a string "w"
@@ -189,11 +187,14 @@ def get_pytree_labels(params):
 class ModelOutput(NamedTuple):
     loglik: Array  # loglik of (no event since prev t) + (events at t)
     rate: Array  # used for predictions after observing events at t
-    reg_penalty: Array = jnp.array(0)
+    reg_penalty: Array = jnp.array(0.0)
+
+
+type ModelFn[Params: chex.ArrayTree] = Callable[[Params, Dataset], ModelOutput]
 
 
 def run_optim[Params: chex.ArrayTree](init_params: Params,
-                                      model_fn: Callable[[Params, Dataset], ModelOutput],
+                                      model_fn: ModelFn[Params],
                                       dataset: Dataset,
                                       show_hessian: bool,
                                       verbose: bool = False) -> Params:
@@ -303,12 +304,11 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
     return params
 
 
-class ConstantRate(NamedTuple):
+class ConstantRateParams(NamedTuple):
     log_base_rate: Array
 
 
-def calc_const(params: ConstantRate, dataset: Dataset) -> ModelOutput:
-    # assume constant rate throughout interval
+def calc_const(params: ConstantRateParams, dataset: Dataset) -> ModelOutput:
     rate = jnp.exp(params.log_base_rate)
     return ModelOutput(
         loglik=dataset.curr_count * params.log_base_rate - rate * dataset.elapsed,
@@ -317,7 +317,7 @@ def calc_const(params: ConstantRate, dataset: Dataset) -> ModelOutput:
 
 
 fitted_constant_rate_params = run_optim(
-    init_params=ConstantRate(
+    init_params=ConstantRateParams(
         log_base_rate=jnp.log(closed_form_rate + 1e-4),
     ),
     model_fn=calc_const,
@@ -401,7 +401,7 @@ plot_rbf(fitted_rbf_params.log_base_rate, fitted_rbf_params.weights)
 # %%
 
 
-# exponential decay kernel for now
+# exponential decay kernel
 class HawkesParams(NamedTuple):
     log_base_rate: Array
     logit_norm: Array = logit(0.9)
@@ -466,10 +466,6 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
 @jax.jit
 def calculate_decayed_counts(decay_factors: Array, counts: Array) -> Array:
     def combine(prefix, step):
-        # f_left(x)  = a_left * x + b_left
-        # f_right(x) = a_right * x + b_right
-        # f_right(f_left(x)) = a_right * (a_left * x + b_left) + b_right
-        #                    = (a_right * a_left) * x + (a_right * b_left + b_right)
         decay_left, count_left = prefix
         decay_right, count_right = step
         combined_decay = decay_right * decay_left
@@ -485,7 +481,9 @@ def calculate_decayed_counts(decay_factors: Array, counts: Array) -> Array:
     return decayed_counts
 
 
-def test_calculate_decayed_counts():
+def test_calculate_decayed_counts() -> None:
+
+    @jax.jit
     def linear_scan_step(carry, xs):
         decayed_count = carry
         decay_factor, count = xs
@@ -555,7 +553,7 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     )
 
 
-def plot_model_output(outputs: ModelOutput, input_df: pl.DataFrame):
+def plot_model_output(outputs: ModelOutput, input_df: pl.DataFrame) -> None:
     df = (
         input_df
         .with_columns(
@@ -578,7 +576,7 @@ def plot_model_output(outputs: ModelOutput, input_df: pl.DataFrame):
     plt.show()
 
 
-def print_params(params):
+def print_params(params: Any) -> None:
     to_print = {}
     if hasattr(params, 'log_base_rate'):
         to_print['base_rate'] = jnp.exp(params.log_base_rate).item()
@@ -593,7 +591,9 @@ def print_params(params):
     display(pd.Series(to_print, name='param').to_frame())
 
 
-def show_hawkes(params, dataset: Dataset, input_df: pl.DataFrame) -> None:
+def show_hawkes(params: HawkesParams,
+                dataset: Dataset,
+                input_df: pl.DataFrame) -> None:
     baseline_outputs = calc_hawkes_baseline(params, dataset)
 
     outputs = calc_hawkes(params, dataset)
@@ -607,8 +607,6 @@ def show_hawkes(params, dataset: Dataset, input_df: pl.DataFrame) -> None:
 init_hawkes_params = HawkesParams(
     log_base_rate=fitted_constant_rate_params.log_base_rate,
 )
-
-
 show_hawkes(init_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 
 
@@ -663,7 +661,8 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
     )
 
 
-def show_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset, input_df: pl.DataFrame):
+def show_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset,
+                    input_df: pl.DataFrame) -> None:
     outputs = calc_rbf_hawkes(params, dataset)
     print_params(params)
     plot_model_output(outputs, input_df)
@@ -703,14 +702,14 @@ class PowerLawApproxParams(NamedTuple):
     rates: Array
 
 
-_one_millisecond = 1.0  # timestamp resolution
+_one_millisecond = jnp.array(1.0)  # timestamp resolution
 _one_minute = _one_millisecond * 60e3
 _one_hour = _one_minute * 60
 
 
-def power_law_decay_approx_params(omega: ArrayLike, beta: ArrayLike,
-                                  min_history_duration_ms: ArrayLike,
-                                  max_history_duration_ms: ArrayLike,
+def power_law_decay_approx_params(omega: Array, beta: Array,
+                                  min_history_duration_ms: Array,
+                                  max_history_duration_ms: Array,
                                   n_exponentials: int) -> PowerLawApproxParams:
     # to approximate lomax decay
     #   g(t) = (1 + omega * t) ^ -(1 + beta)
@@ -740,8 +739,8 @@ def power_law_decay_approx_params(omega: ArrayLike, beta: ArrayLike,
     )
 
 
-def plot_power_law_decay():
-    def calc_exact(t: Array, omega: float, beta: float):
+def plot_power_law_decay() -> None:
+    def calc_exact(t: Array, omega: Array, beta: Array):
         return (1.0 + omega * t) ** -(1.0 + beta)
 
     # done sequentially to ensure markovian nature holds
@@ -761,8 +760,8 @@ def plot_power_law_decay():
     print(f'{orders_of_magnitude=:.2f}')
     n_exponentials = 14  # 2x orders of magnitude
 
-    omegas = 1 / _one_millisecond, 1 / _one_minute, 1 / _one_hour
-    betas = 0.15, 0.3, 0.5
+    inv_omegas = _one_millisecond,  _one_minute,  _one_hour
+    betas: tuple = 0.15, 0.3, 0.5
 
     f1, axes1 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
     f1.suptitle('Lomax Kernel')
@@ -775,8 +774,8 @@ def plot_power_law_decay():
     f5, axes5 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
     f5.suptitle('relative error')
 
-    for r, omega in enumerate(omegas):
-        inv_omega = 1.0 / omega
+    for r, inv_omega in enumerate(inv_omegas):
+        omega = 1.0 / inv_omega
         for c, beta in enumerate(betas):
 
             kernel_params = power_law_decay_approx_params(
@@ -855,16 +854,15 @@ class PowerLawHawkesParams(NamedTuple):
     log_beta: Array = jnp.log(0.15)
 
 
-def calc_power_law_hawkes(params: PowerLawHawkesParams,
-                          dataset: Dataset,
-                          # fix omega to min resolution (1ms) to avoid
-                          # identifiability with beta. roughly corresponds to
-                          # where the plateau crosses over to power-law tail
-                          omega: float = 1.0 / _one_millisecond,
-                          ) -> ModelOutput:
+def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> ModelOutput:
+    # fix omega to min resolution (1ms) to avoid
+    # identifiability with beta. roughly corresponds to
+    # where the plateau crosses over to power-law tail
+    omega: Array = 1.0 / _one_millisecond
+
     n_exponentials = 10  # not differentiable
-    min_history_duration_ms: Array = jnp.array(_one_millisecond)
-    max_history_duration_ms: Array = jnp.array(_one_hour * 2)
+    min_history_duration_ms = _one_millisecond
+    max_history_duration_ms = _one_hour * 2
 
     base_rate = jnp.exp(params.log_base_rate)
     norm = jax.nn.sigmoid(params.logit_norm)
@@ -945,13 +943,15 @@ show_power_law_hawkes(fitted_power_law_hawkes_params,
 # %%
 
 
-def _calc_model_outputs(prefix: str, params, calc_output_fn):
+def _calc_model_outputs[Params: chex.ArrayTree](prefix: str,
+                                                params: Params,
+                                                model_fn: ModelFn[Params]) -> dict[str, np.ndarray]:
     # Validation loglik is biased downwards as the decayed counts need to
     # "warm up" after starting from 0. The bias is kept as it is is analgous
     # to having to restarting a trading system without replaying data that was
     # published before the restart
-    train = calc_output_fn(params, DATASET)
-    val = calc_output_fn(params, VAL_DATASET)
+    train = model_fn(params, DATASET)
+    val = model_fn(params, VAL_DATASET)
     loglik = np.asarray(jnp.concat([train.loglik, val.loglik]))
     rate = np.asarray(jnp.concat([train.rate, val.rate]))
     return {
@@ -994,7 +994,7 @@ display(
 def plot_logliks(start: datetime.datetime,
                  end: datetime.datetime,
                  *,
-                 duration: str):
+                 duration: str) -> None:
     time_until_next_sample = pl.col('elapsed_ms').shift(-1)
     expected_count_weight = 1000 * time_until_next_sample \
         / time_until_next_sample.sum()
