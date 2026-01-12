@@ -405,7 +405,7 @@ plot_rbf(fitted_rbf_params.log_base_intensity, fitted_rbf_params.weights)
 class HawkesParams(NamedTuple):
     log_base_intensity: Array
     logit_branching_ratio: Array = logit(0.9)
-    log_omega: Array = jnp.log(1)  # log(1 / avg_life_ms)
+    log_decay_rate: Array = jnp.log(1)  # log(1 / avg_life_ms)
 
 
 def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
@@ -419,7 +419,7 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
 
     base_intensity = jnp.exp(params.log_base_intensity)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
-    omega = jnp.exp(params.log_omega)
+    decay_rate = jnp.exp(params.log_decay_rate)
 
     def step(carry, x):
         decayed_count = carry
@@ -430,25 +430,26 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
         #   - integral(intensity) over duration
 
         # loglik of interval that just passed with no events
-        integral_over_interval = -jnp.expm1(-omega * elapsed)
+        integral_over_interval = -jnp.expm1(-decay_rate * elapsed)
         interval_term = \
             base_intensity * elapsed  \
             + branching_ratio * decayed_count * integral_over_interval
 
         # loglik of events at current timestamp
-        decay_factor = jnp.exp(-omega * elapsed)
+        decay_factor = jnp.exp(-decay_rate * elapsed)
         decayed_count *= decay_factor
         point_intensity = base_intensity \
-            + branching_ratio * omega * decayed_count
+            + branching_ratio * decay_rate * decayed_count
         # assume events happen instantaneously without self-excitation
         # 1. jittering is unacceptable as it increases data size too much
         # 2. an attempt using logarithm of rising factorial aka Pochhammer
-        # symbol has resulted in omega blowing up due to some terms going to 0
-        # and the remaining terms being monotonic
+        # symbol has resulted in decay_rate blowing up due to some terms
+        # going to 0 and the remaining terms being monotonic
         point_term = count * jnp.log(point_intensity)
 
         decayed_count += count
-        forecast_intensity = base_intensity + branching_ratio * omega * decayed_count
+        forecast_intensity = base_intensity \
+            + branching_ratio * decay_rate * decayed_count
         return decayed_count, (point_term, interval_term, forecast_intensity)
 
     xs = dataset.curr_count, dataset.elapsed
@@ -528,13 +529,13 @@ test_calculate_decayed_counts()
 def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     base_intensity = jnp.exp(params.log_base_intensity)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
-    omega = jnp.exp(params.log_omega)
-    decay_factors = jnp.exp(-omega * dataset.elapsed)
+    decay_rate = jnp.exp(params.log_decay_rate)
+    decay_factors = jnp.exp(-decay_rate * dataset.elapsed)
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
 
     # loglik of interval that just passed with no events
     prev_decayed_count = jnp.roll(decayed_count, 1).at[0].set(0.0)
-    integral_over_interval = -jnp.expm1(-omega * dataset.elapsed)
+    integral_over_interval = -jnp.expm1(-decay_rate * dataset.elapsed)
     compensator = \
         dataset.elapsed * base_intensity \
         + branching_ratio * prev_decayed_count * integral_over_interval
@@ -542,11 +543,11 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     # loglik of event(s) at current timestamp
     curr_minus_count = prev_decayed_count * decay_factors
     point_intensity = base_intensity + \
-        branching_ratio * omega * curr_minus_count
+        branching_ratio * decay_rate * curr_minus_count
     point_term = dataset.curr_count * jnp.log(point_intensity)
 
     forecast_intensity = base_intensity \
-        + branching_ratio * omega * decayed_count
+        + branching_ratio * decay_rate * decayed_count
     return ModelOutput(
         point_term=point_term,
         compensator=compensator,
@@ -585,9 +586,12 @@ def print_params(params: Any) -> None:
     if hasattr(params, 'logit_branching_ratio'):
         to_print['branching_ratio'] = jax.nn.sigmoid(
             params.logit_branching_ratio).item()
+    if hasattr(params, 'log_decay_rate'):
+        to_print['decay_rate'] = jnp.exp(params.log_decay_rate).item()
+        to_print['decay_avg_life_seconds'] = \
+            ONE_SECOND / to_print['decay_rate']
     if hasattr(params, 'log_omega'):
         to_print['omega'] = jnp.exp(params.log_omega).item()
-        to_print['decay_avg_life_seconds'] = 1_000 / to_print['omega']
     if hasattr(params, 'log_beta'):
         to_print['beta'] = jnp.exp(params.log_beta).item()
     display(pd.Series(to_print, name='param').to_frame())
@@ -632,7 +636,7 @@ show_hawkes(fitted_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 class RbfHawkesParams(NamedTuple):
     log_base_intensity: Array
     logit_branching_ratio: Array
-    log_omega: Array
+    log_decay_rate: Array
     weights: Array
 
 
@@ -640,13 +644,13 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
     log_factor = dataset.rbf_basis @ params.weights
     base_intensity = jnp.exp(params.log_base_intensity + log_factor)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
-    omega = jnp.exp(params.log_omega)
-    decay_factors = jnp.exp(-omega * dataset.elapsed)
+    decay_rate = jnp.exp(params.log_decay_rate)
+    decay_factors = jnp.exp(-decay_rate * dataset.elapsed)
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
 
     # loglik of interval that just passed with no events
     prev_decayed_count = jnp.roll(decayed_count, 1).at[0].set(0.0)
-    integral_over_interval = -jnp.expm1(-omega * dataset.elapsed)
+    integral_over_interval = -jnp.expm1(-decay_rate * dataset.elapsed)
     interval_term = \
         dataset.elapsed * base_intensity \
         + branching_ratio * prev_decayed_count * integral_over_interval
@@ -654,11 +658,11 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
     # loglik of event(s) at current timestamp
     curr_minus_count = prev_decayed_count * decay_factors
     point_intensity = base_intensity \
-        + branching_ratio * omega * curr_minus_count
+        + branching_ratio * decay_rate * curr_minus_count
     point_term = dataset.curr_count * jnp.log(point_intensity)
 
     forecast_intensity = base_intensity \
-        + branching_ratio * omega * decayed_count
+        + branching_ratio * decay_rate * decayed_count
     return ModelOutput(
         point_term=point_term,
         compensator=interval_term,
@@ -679,7 +683,7 @@ def show_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset,
 init_rbf_hawkes = RbfHawkesParams(
     log_base_intensity=fitted_hawkes_params.log_base_intensity,
     logit_branching_ratio=fitted_hawkes_params.logit_branching_ratio,
-    log_omega=fitted_hawkes_params.log_omega,
+    log_decay_rate=fitted_hawkes_params.log_decay_rate,
     weights=fitted_rbf_params.weights,
 )
 
