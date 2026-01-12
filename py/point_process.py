@@ -148,9 +148,10 @@ VAL_DATASET = create_dataset(INPUT_DF.filter(~pl.col('is_train')))
 # %%
 
 
-closed_form_rate = (DATASET.curr_count.sum() / DATASET.elapsed.sum()).item()
-print(f'{closed_form_rate=}, around {closed_form_rate*ONE_SECOND:.2f}/second')
-print(f'{jnp.log(closed_form_rate)=:.4f}')
+closed_form_intensity = (DATASET.curr_count.sum() /
+                         DATASET.elapsed.sum()).item()
+print(f'{closed_form_intensity=}, around {closed_form_intensity*ONE_SECOND:.2f}/second')
+print(f'{jnp.log(closed_form_intensity)=:.4f}')
 
 
 # %%
@@ -180,9 +181,9 @@ def get_pytree_labels(params: chex.ArrayTree) -> list[str]:
 
 
 class ModelOutput(NamedTuple):
-    point_term: Array  # count * log(rate) at t_i
-    compensator: Array  # integral(rate) from t_{i-1} to t_i
-    rate: Array  # used for predictions after observing events at t
+    point_term: Array  # count * log(intensity) at t_i
+    compensator: Array  # integral(intensity) from t_{i-1} to t_i
+    forecast_intensity: Array  # for predictions after observing events at t
     reg_penalty: Array = jnp.array(0.0)
 
     @property
@@ -304,74 +305,72 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
     return params
 
 
-class ConstantRateParams(NamedTuple):
-    log_base_rate: Array
+class ConstanIntensityParams(NamedTuple):
+    log_base_intensity: Array
 
 
-def calc_const(params: ConstantRateParams, dataset: Dataset) -> ModelOutput:
-    rate = jnp.exp(params.log_base_rate)
-    point_term = dataset.curr_count * params.log_base_rate
-    compensator = rate * dataset.elapsed
+def calc_const(params: ConstanIntensityParams, dataset: Dataset) -> ModelOutput:
+    intensity = jnp.exp(params.log_base_intensity)
     return ModelOutput(
-        rate=rate * jnp.ones_like(dataset.elapsed),
-        point_term=point_term,
-        compensator=compensator,
+        forecast_intensity=intensity * jnp.ones_like(dataset.elapsed),
+        point_term=dataset.curr_count * params.log_base_intensity,
+        compensator=intensity * dataset.elapsed,
     )
 
 
-fitted_constant_rate_params = run_optim(
-    init_params=ConstantRateParams(
-        log_base_rate=jnp.log(closed_form_rate + 1e-4),
+fitted_constant_intensity_params = run_optim(
+    init_params=ConstanIntensityParams(
+        log_base_intensity=jnp.log(closed_form_intensity + 1e-4),
     ),
     model_fn=calc_const,
     dataset=DATASET,
     show_hessian=False,
 )
-assert jnp.allclose(fitted_constant_rate_params.log_base_rate,
-                    jnp.log(closed_form_rate))
+assert jnp.allclose(fitted_constant_intensity_params.log_base_intensity,
+                    jnp.log(closed_form_intensity))
 
 
 # %%
 
 
-class RbfRateParams(NamedTuple):
-    log_base_rate: Array
+class RbfParams(NamedTuple):
+    log_base_intensity: Array
     weights: Array = jnp.zeros((RbfConstants.n_centers,),) + 0.1
 
 
-def calc_rbf(params: RbfRateParams, dataset: Dataset) -> ModelOutput:
-    log_rate_factor = dataset.rbf_basis @ params.weights
-    log_rate = params.log_base_rate + log_rate_factor
-    rate = jnp.exp(log_rate)
+def calc_rbf(params: RbfParams, dataset: Dataset) -> ModelOutput:
+    log_intensity_factor = dataset.rbf_basis @ params.weights
+    log_intensity = params.log_base_intensity + log_intensity_factor
+    intensity = jnp.exp(log_intensity)
     return ModelOutput(
-        point_term=dataset.curr_count * log_rate,
-        compensator=rate * dataset.elapsed,
-        rate=rate,
+        point_term=dataset.curr_count * log_intensity,
+        compensator=intensity * dataset.elapsed,
+        forecast_intensity=intensity,
         reg_penalty=RbfConstants.reg_penalty(params.weights)
     )
 
 
-def plot_rbf(log_base_rate: Array, weights: Array) -> None:
+def plot_rbf(log_base_intensity: Array, weights: Array) -> None:
     # exceed [0, 24] to verify periodic boundary conditions
     time_of_day = jnp.linspace(-4, 28, 500, endpoint=False)
     bases = calc_rbf_basis(time_of_day)
     log_factor = bases @ weights
-    base_rate = jnp.exp(log_base_rate).item()
-    rate = jnp.exp(log_base_rate + log_factor)
-    per_second = base_rate * ONE_SECOND
+    base_intensity = jnp.exp(log_base_intensity).item()
+    intensity = jnp.exp(log_base_intensity + log_factor)
+    per_second = base_intensity * ONE_SECOND
     per_basis = bases * weights
 
     f, axes = plt.subplots(2, 1, sharex=True)
-    f.suptitle('exogenous rate')
+    f.suptitle('exogenous intensity')
     for ax in axes:
         ax.axvline(0, c='k', alpha=0.2, linestyle='--')
         ax.axvline(24, c='k', alpha=0.2, linestyle='--')
 
     ax1, ax2 = axes
-    ax1.plot(time_of_day, rate)
-    ax1.axhline(base_rate, label=f'baseline $\\approx${per_second:.2f}/s',
+    ax1.plot(time_of_day, intensity)
+    ax1.axhline(base_intensity, label=f'baseline $\\approx${per_second:.2f}/s',
                 c='g', alpha=0.4, linestyle='-')
-    ax1.set_ylabel('rate')
+    ax1.set_ylabel('intensity')
     ax1.legend(loc='upper left')
 
     ax2.plot(time_of_day, per_basis, alpha=0.6)
@@ -381,10 +380,10 @@ def plot_rbf(log_base_rate: Array, weights: Array) -> None:
     plt.show()
 
 
-init_rbf_params = RbfRateParams(
-    log_base_rate=fitted_constant_rate_params.log_base_rate,
+init_rbf_params = RbfParams(
+    log_base_intensity=fitted_constant_intensity_params.log_base_intensity,
 )
-plot_rbf(init_rbf_params.log_base_rate, init_rbf_params.weights)
+plot_rbf(init_rbf_params.log_base_intensity, init_rbf_params.weights)
 
 
 # %%
@@ -396,7 +395,7 @@ fitted_rbf_params = run_optim(
     dataset=DATASET,
     show_hessian=True,
 )
-plot_rbf(fitted_rbf_params.log_base_rate, fitted_rbf_params.weights)
+plot_rbf(fitted_rbf_params.log_base_intensity, fitted_rbf_params.weights)
 
 
 # %%
@@ -404,8 +403,8 @@ plot_rbf(fitted_rbf_params.log_base_rate, fitted_rbf_params.weights)
 
 # exponential decay kernel
 class HawkesParams(NamedTuple):
-    log_base_rate: Array
-    logit_norm: Array = logit(0.9)
+    log_base_intensity: Array
+    logit_branching_ratio: Array = logit(0.9)
     log_omega: Array = jnp.log(1)  # log(1 / avg_life_ms)
 
 
@@ -418,49 +417,47 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     assert jnp.all(dataset.curr_count > 0.0)
     assert jnp.all(dataset.elapsed > 0.0)
 
-    base_rate = jnp.exp(params.log_base_rate)
-    norm = jax.nn.sigmoid(params.logit_norm)
+    base_intensity = jnp.exp(params.log_base_intensity)
+    branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
     omega = jnp.exp(params.log_omega)
 
     def step(carry, x):
         decayed_count = carry
         count, elapsed = x
 
-        # rate(t) = base_rate + norm * omega * decayed_count
-
         # loglik =
-        #   sum(log(rate)) at each event
-        #   - integral(rate) over duration
+        #   sum(log(intensity)) at each event
+        #   - integral(intensity) over duration
 
         # loglik of interval that just passed with no events
         integral_over_interval = -jnp.expm1(-omega * elapsed)
         interval_term = \
-            base_rate * elapsed  \
-            + norm * decayed_count * integral_over_interval
+            base_intensity * elapsed  \
+            + branching_ratio * decayed_count * integral_over_interval
 
         # loglik of events at current timestamp
         decay_factor = jnp.exp(-omega * elapsed)
         decayed_count *= decay_factor
-
-        event_rate = base_rate + norm * omega * decayed_count
+        point_intensity = base_intensity \
+            + branching_ratio * omega * decayed_count
         # assume events happen instantaneously without self-excitation
         # 1. jittering is unacceptable as it increases data size too much
         # 2. an attempt using logarithm of rising factorial aka Pochhammer
         # symbol has resulted in omega blowing up due to some terms going to 0
         # and the remaining terms being monotonic
-        event_term = count * jnp.log(event_rate)
+        point_term = count * jnp.log(point_intensity)
 
         decayed_count += count
-        forecast_rate = base_rate + norm * omega * decayed_count
-        return decayed_count, (event_term, interval_term, forecast_rate)
+        forecast_intensity = base_intensity + branching_ratio * omega * decayed_count
+        return decayed_count, (point_term, interval_term, forecast_intensity)
 
     xs = dataset.curr_count, dataset.elapsed
-    _, (point_term, compensator, rate) = jax.lax.scan(step, 0, xs)
+    _, (point_term, compensator, intensity) = jax.lax.scan(step, 0, xs)
 
     return ModelOutput(
         point_term=point_term,
         compensator=compensator,
-        rate=rate,
+        forecast_intensity=intensity,
     )
 
 
@@ -529,8 +526,8 @@ test_calculate_decayed_counts()
 
 
 def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
-    base_rate = jnp.exp(params.log_base_rate)
-    norm = jax.nn.sigmoid(params.logit_norm)
+    base_intensity = jnp.exp(params.log_base_intensity)
+    branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
     omega = jnp.exp(params.log_omega)
     decay_factors = jnp.exp(-omega * dataset.elapsed)
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
@@ -538,20 +535,22 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     # loglik of interval that just passed with no events
     prev_decayed_count = jnp.roll(decayed_count, 1).at[0].set(0.0)
     integral_over_interval = -jnp.expm1(-omega * dataset.elapsed)
-    interval_term = \
-        dataset.elapsed * base_rate \
-        + norm * prev_decayed_count * integral_over_interval
+    compensator = \
+        dataset.elapsed * base_intensity \
+        + branching_ratio * prev_decayed_count * integral_over_interval
 
     # loglik of event(s) at current timestamp
     curr_minus_count = prev_decayed_count * decay_factors
-    event_rate = base_rate + norm * omega * curr_minus_count
-    event_term = dataset.curr_count * jnp.log(event_rate)
+    point_intensity = base_intensity + \
+        branching_ratio * omega * curr_minus_count
+    point_term = dataset.curr_count * jnp.log(point_intensity)
 
-    forecast_rate = base_rate + norm * omega * decayed_count
+    forecast_intensity = base_intensity \
+        + branching_ratio * omega * decayed_count
     return ModelOutput(
-        point_term=event_term,
-        compensator=interval_term,
-        rate=forecast_rate,
+        point_term=point_term,
+        compensator=compensator,
+        forecast_intensity=forecast_intensity,
     )
 
 
@@ -560,7 +559,7 @@ def plot_model_output(outputs: ModelOutput, input_df: pl.DataFrame) -> None:
         input_df
         .with_columns(
             loglik=np.asarray(outputs.loglik),
-            rate=np.asarray(outputs.rate),
+            intensity=np.asarray(outputs.forecast_intensity),
         )
     )
     display(df)
@@ -572,7 +571,7 @@ def plot_model_output(outputs: ModelOutput, input_df: pl.DataFrame) -> None:
     )
     _, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True)
     ax1.scatter(subset['time'], subset[['curr_count']], alpha=0.05, marker='.')
-    ax2.plot(subset['time'], subset[['rate']])
+    ax2.plot(subset['time'], subset[['intensity']])
     ax3.plot(subset['time'], subset[['loglik']])
     plt.tight_layout()
     plt.show()
@@ -580,11 +579,12 @@ def plot_model_output(outputs: ModelOutput, input_df: pl.DataFrame) -> None:
 
 def print_params(params: Any) -> None:
     to_print = {}
-    if hasattr(params, 'log_base_rate'):
-        to_print['base_rate'] = jnp.exp(params.log_base_rate).item()
-        to_print['per_second'] = to_print['base_rate'] * 1_000
-    if hasattr(params, 'logit_norm'):
-        to_print['norm'] = jax.nn.sigmoid(params.logit_norm).item()
+    if hasattr(params, 'log_base_intensity'):
+        to_print['base_intensity'] = jnp.exp(params.log_base_intensity).item()
+        to_print['per_second'] = to_print['base_intensity'] * 1_000
+    if hasattr(params, 'logit_branching_ratio'):
+        to_print['branching_ratio'] = jax.nn.sigmoid(
+            params.logit_branching_ratio).item()
     if hasattr(params, 'log_omega'):
         to_print['omega'] = jnp.exp(params.log_omega).item()
         to_print['decay_avg_life_seconds'] = 1_000 / to_print['omega']
@@ -600,14 +600,15 @@ def show_hawkes(params: HawkesParams,
 
     outputs = calc_hawkes(params, dataset)
     assert jnp.allclose(outputs.loglik, baseline_outputs.loglik, atol=1e-4)
-    assert jnp.allclose(outputs.rate, baseline_outputs.rate, rtol=1e-4)
+    assert jnp.allclose(outputs.forecast_intensity,
+                        baseline_outputs.forecast_intensity, rtol=1e-4)
 
     print_params(params)
     plot_model_output(outputs, input_df)
 
 
 init_hawkes_params = HawkesParams(
-    log_base_rate=fitted_constant_rate_params.log_base_rate,
+    log_base_intensity=fitted_constant_intensity_params.log_base_intensity,
 )
 show_hawkes(init_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 
@@ -629,16 +630,16 @@ show_hawkes(fitted_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 
 
 class RbfHawkesParams(NamedTuple):
-    log_base_rate: Array
-    logit_norm: Array
+    log_base_intensity: Array
+    logit_branching_ratio: Array
     log_omega: Array
     weights: Array
 
 
 def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
     log_factor = dataset.rbf_basis @ params.weights
-    base_rate = jnp.exp(params.log_base_rate + log_factor)
-    norm = jax.nn.sigmoid(params.logit_norm)
+    base_intensity = jnp.exp(params.log_base_intensity + log_factor)
+    branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
     omega = jnp.exp(params.log_omega)
     decay_factors = jnp.exp(-omega * dataset.elapsed)
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
@@ -647,19 +648,21 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
     prev_decayed_count = jnp.roll(decayed_count, 1).at[0].set(0.0)
     integral_over_interval = -jnp.expm1(-omega * dataset.elapsed)
     interval_term = \
-        dataset.elapsed * base_rate \
-        + norm * prev_decayed_count * integral_over_interval
+        dataset.elapsed * base_intensity \
+        + branching_ratio * prev_decayed_count * integral_over_interval
 
     # loglik of event(s) at current timestamp
     curr_minus_count = prev_decayed_count * decay_factors
-    event_rate = base_rate + norm * omega * curr_minus_count
-    event_term = dataset.curr_count * jnp.log(event_rate)
+    point_intensity = base_intensity \
+        + branching_ratio * omega * curr_minus_count
+    point_term = dataset.curr_count * jnp.log(point_intensity)
 
-    forecast_rate = base_rate + norm * omega * decayed_count
+    forecast_intensity = base_intensity \
+        + branching_ratio * omega * decayed_count
     return ModelOutput(
-        point_term=event_term,
+        point_term=point_term,
         compensator=interval_term,
-        rate=forecast_rate,
+        forecast_intensity=forecast_intensity,
         reg_penalty=RbfConstants.reg_penalty(params.weights),
     )
 
@@ -669,12 +672,13 @@ def show_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset,
     outputs = calc_rbf_hawkes(params, dataset)
     print_params(params)
     plot_model_output(outputs, input_df)
-    plot_rbf(log_base_rate=params.log_base_rate, weights=params.weights)
+    plot_rbf(log_base_intensity=params.log_base_intensity,
+             weights=params.weights)
 
 
 init_rbf_hawkes = RbfHawkesParams(
-    log_base_rate=fitted_hawkes_params.log_base_rate,
-    logit_norm=fitted_hawkes_params.logit_norm,
+    log_base_intensity=fitted_hawkes_params.log_base_intensity,
+    logit_branching_ratio=fitted_hawkes_params.logit_branching_ratio,
     log_omega=fitted_hawkes_params.log_omega,
     weights=fitted_rbf_params.weights,
 )
@@ -848,8 +852,8 @@ if __name__ == '__main__':
 
 
 class PowerLawHawkesParams(NamedTuple):
-    log_base_rate: Array
-    logit_norm: Array
+    log_base_intensity: Array
+    logit_branching_ratio: Array
     log_beta: Array = jnp.log(0.15)
 
 
@@ -863,8 +867,8 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     min_history_duration_ms = ONE_MILLISECOND
     max_history_duration_ms = ONE_HOUR * 2
 
-    base_rate = jnp.exp(params.log_base_rate)
-    norm = jax.nn.sigmoid(params.logit_norm)
+    base_intensity = jnp.exp(params.log_base_intensity)
+    branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
     beta = jnp.exp(params.log_beta)
 
     approx_params = power_law_decay_approx_params(
@@ -876,7 +880,7 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     )
     weights, rates = approx_params.weights, approx_params.rates
     approx_integral = jnp.sum(weights / rates)
-    kernel_factor = norm / approx_integral
+    kernel_factor = branching_ratio / approx_integral
 
     decay_factor_exponents = (
         # note: this may run out of memory for large datasets
@@ -892,22 +896,24 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     integral_history = (prev_decayed_count * term_per_exp) @ weights
 
     interval_term = \
-        (dataset.elapsed * base_rate) \
+        (dataset.elapsed * base_intensity) \
         + (kernel_factor * integral_history)
 
     # loglik of event(s) at current timestamp
     curr_minus_count = prev_decayed_count * decay_factors
-    event_rate = base_rate + kernel_factor * (curr_minus_count @ weights)
+    point_intensity = base_intensity \
+        + kernel_factor * (curr_minus_count @ weights)
     # refer to comments in `calc_hawkes_baseline` for explanation of
     # modelling assumptions and implementation choices
-    event_term = dataset.curr_count * jnp.log(event_rate)
+    point_term = dataset.curr_count * jnp.log(point_intensity)
 
-    forecast_rate = base_rate + kernel_factor * (decayed_count @ weights)
+    forecast_intensity = base_intensity \
+        + kernel_factor * (decayed_count @ weights)
 
     return ModelOutput(
-        point_term=event_term,
+        point_term=point_term,
         compensator=interval_term,
-        rate=forecast_rate,
+        forecast_intensity=forecast_intensity,
     )
 
 
@@ -920,8 +926,8 @@ def show_power_law_hawkes(params: PowerLawHawkesParams,
 
 
 init_pl_hawkes_params = PowerLawHawkesParams(
-    log_base_rate=fitted_hawkes_params.log_base_rate,
-    logit_norm=fitted_hawkes_params.logit_norm,
+    log_base_intensity=fitted_hawkes_params.log_base_intensity,
+    logit_branching_ratio=fitted_hawkes_params.logit_branching_ratio,
 )
 show_power_law_hawkes(init_pl_hawkes_params, DATASET,
                       INPUT_DF.filter('is_train'))
@@ -953,17 +959,18 @@ def _calc_model_outputs[Params: chex.ArrayTree](prefix: str,
     train = model_fn(params, DATASET)
     val = model_fn(params, VAL_DATASET)
     loglik = np.asarray(jnp.concat([train.loglik, val.loglik]))
-    rate = np.asarray(jnp.concat([train.rate, val.rate]))
+    intensity = np.asarray(jnp.concat(
+        [train.forecast_intensity, val.forecast_intensity]))
     return {
         f'{prefix}_loglik': loglik,
-        f'{prefix}_rate': rate,
+        f'{prefix}_intensity': intensity,
     }
 
 
 with_logliks = (
     INPUT_DF
     .with_columns(
-        **_calc_model_outputs('constant', fitted_constant_rate_params, calc_const),
+        **_calc_model_outputs('constant', fitted_constant_intensity_params, calc_const),
         **_calc_model_outputs('rbf', fitted_rbf_params, calc_rbf),
         **_calc_model_outputs('hawkes', fitted_hawkes_params, calc_hawkes),
         **_calc_model_outputs('rbf_hawkes', fitted_rbf_hawkes_params, calc_rbf_hawkes),
@@ -1010,9 +1017,9 @@ def plot_logliks(start: datetime.datetime,
             pl.col('curr_count').sum().alias('trade_count'),
             pl.selectors.ends_with('_loglik').sum(),
             (
-                (pl.selectors.ends_with('_rate') * expected_count_weight)
+                (pl.selectors.ends_with('_intensity') * expected_count_weight)
                 .sum()
-                .name.replace('_rate', '_expected_count')
+                .name.replace('_intensity', '_expected_count')
                 .round(2)
             ),
         )
