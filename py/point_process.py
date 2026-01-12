@@ -180,9 +180,14 @@ def get_pytree_labels(params: chex.ArrayTree) -> list[str]:
 
 
 class ModelOutput(NamedTuple):
-    loglik: Array  # loglik of (no event since prev t) + (events at t)
+    point_term: Array  # count * log(rate) at t_i
+    compensator: Array  # integral(rate) from t_{i-1} to t_i
     rate: Array  # used for predictions after observing events at t
     reg_penalty: Array = jnp.array(0.0)
+
+    @property
+    def loglik(self):
+        return self.point_term - self.compensator
 
 
 type ModelFn[Params: chex.ArrayTree] = Callable[[Params, Dataset], ModelOutput]
@@ -305,9 +310,12 @@ class ConstantRateParams(NamedTuple):
 
 def calc_const(params: ConstantRateParams, dataset: Dataset) -> ModelOutput:
     rate = jnp.exp(params.log_base_rate)
+    point_term = dataset.curr_count * params.log_base_rate
+    compensator = rate * dataset.elapsed
     return ModelOutput(
-        loglik=dataset.curr_count * params.log_base_rate - rate * dataset.elapsed,
         rate=rate * jnp.ones_like(dataset.elapsed),
+        point_term=point_term,
+        compensator=compensator,
     )
 
 
@@ -335,11 +343,9 @@ def calc_rbf(params: RbfRateParams, dataset: Dataset) -> ModelOutput:
     log_rate_factor = dataset.rbf_basis @ params.weights
     log_rate = params.log_base_rate + log_rate_factor
     rate = jnp.exp(log_rate)
-    loglik = \
-        dataset.curr_count * log_rate \
-        - rate * dataset.elapsed  # assume constant rate throughout interval
     return ModelOutput(
-        loglik=loglik,
+        point_term=dataset.curr_count * log_rate,
+        compensator=rate * dataset.elapsed,
         rate=rate,
         reg_penalty=RbfConstants.reg_penalty(params.weights)
     )
@@ -443,17 +449,17 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
         # symbol has resulted in omega blowing up due to some terms going to 0
         # and the remaining terms being monotonic
         event_term = count * jnp.log(event_rate)
-        loglik = event_term - interval_term
 
         decayed_count += count
         forecast_rate = base_rate + norm * omega * decayed_count
-        return decayed_count, (loglik, forecast_rate)
+        return decayed_count, (event_term, interval_term, forecast_rate)
 
     xs = dataset.curr_count, dataset.elapsed
-    _, (loglik, rate) = jax.lax.scan(step, 0, xs)
+    _, (point_term, compensator, rate) = jax.lax.scan(step, 0, xs)
 
     return ModelOutput(
-        loglik=loglik,
+        point_term=point_term,
+        compensator=compensator,
         rate=rate,
     )
 
@@ -543,7 +549,8 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
 
     forecast_rate = base_rate + norm * omega * decayed_count
     return ModelOutput(
-        loglik=event_term - interval_term,
+        point_term=event_term,
+        compensator=interval_term,
         rate=forecast_rate,
     )
 
@@ -650,7 +657,8 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
 
     forecast_rate = base_rate + norm * omega * decayed_count
     return ModelOutput(
-        loglik=event_term - interval_term,
+        point_term=event_term,
+        compensator=interval_term,
         rate=forecast_rate,
         reg_penalty=RbfConstants.reg_penalty(params.weights),
     )
@@ -897,7 +905,8 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     forecast_rate = base_rate + kernel_factor * (decayed_count @ weights)
 
     return ModelOutput(
-        loglik=event_term - interval_term,
+        point_term=event_term,
+        compensator=interval_term,
         rate=forecast_rate,
     )
 
