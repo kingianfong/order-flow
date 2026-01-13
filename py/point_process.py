@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, Callable
 import datetime
 import re
+import time
 
 from IPython.display import display
 from jax import Array
@@ -546,34 +547,57 @@ def test_calculate_decayed_counts() -> None:
         decayed_count += count
         return decayed_count, decayed_count
 
-    n = 1_000
-    for i in range(10):
+    n = 10_000_000
+    print('1d')
+    for i in range(3):
         k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(i), 4)
 
-        # 1d
         normal = 10 * jax.random.normal(k1, (n, ))
         decay_factors = jax.nn.sigmoid(normal)
         counts = 1.0 + jax.random.randint(k2, (n, ), 0, 5)
 
+        baseline_start = time.time_ns()
         init = 0
         xs = decay_factors, counts
         _, expected = jax.lax.scan(linear_scan_step, init, xs)
+        expected.block_until_ready()
+        baseline_elapsed = time.time_ns() - baseline_start
 
+        assoc_start = time.time_ns()
         actual = calculate_decayed_counts(decay_factors, counts)
+        actual.block_until_ready()
+        assoc_elapsed = time.time_ns() - assoc_start
         assert jnp.allclose(actual, expected)
 
-        # multidim
-        m = 5
+        improvement_ms = (baseline_elapsed - assoc_elapsed) * 1e-6
+        improvement_rel = (baseline_elapsed - assoc_elapsed) / baseline_elapsed
+        print(f'{improvement_ms=:.2f}, {improvement_rel=:.2%}')
+
+    print('multidimensional')
+    for i in range(3):
+        k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(i), 4)
+
+        m = 16
         normal = 10 * jax.random.normal(k3, (n, m))
         decay_factors = jax.nn.sigmoid(normal)
         counts = 1.0 + jax.random.randint(k4, (n, ), 0, 5)
 
+        baseline_start = time.time_ns()
         init = jnp.zeros((m,))
         xs = decay_factors, counts
         _, expected = jax.lax.scan(linear_scan_step, init, xs)
+        expected.block_until_ready()
+        baseline_elapsed = time.time_ns() - baseline_start
 
+        assoc_start = time.time_ns()
         actual = calculate_decayed_counts(decay_factors, counts)
+        actual.block_until_ready()
+        assoc_elapsed = time.time_ns() - assoc_start
         assert jnp.allclose(actual, expected)
+
+        improvement_ms = (baseline_elapsed - assoc_elapsed) * 1e-6
+        improvement_rel = (baseline_elapsed - assoc_elapsed) / baseline_elapsed
+        print(f'{improvement_ms=:.2f}, {improvement_rel=:.2%}')
 
 
 test_calculate_decayed_counts()
