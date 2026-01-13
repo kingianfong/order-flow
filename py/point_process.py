@@ -27,7 +27,7 @@ import seaborn as sns
 
 RAW_DATA_DIR = Path(__file__).parent.parent / 'data/raw'
 SYM = 'BTCUSDT'
-DATA_START = datetime.datetime(2025, 8, 1)
+DATA_START = datetime.datetime(2025, 9, 1)
 TRAIN_END = datetime.datetime(2025, 9, 30)
 VAL_END = datetime.datetime(2025, 10, 15)
 
