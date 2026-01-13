@@ -27,7 +27,7 @@ import seaborn as sns
 # %%
 
 
-RAW_DATA_DIR = Path(__file__).parent.parent / 'data/raw'
+RAW_DATA_DIR = Path.cwd().parent / 'data/raw'
 SYM = 'BTCUSDT'
 DATA_START = datetime.datetime(2025, 9, 1)
 TRAIN_END = datetime.datetime(2025, 9, 30)
@@ -200,12 +200,12 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
                                       dataset: Dataset,
                                       show_hessian: bool,
                                       verbose: bool = False) -> Params:
-
+    timeout = datetime.timedelta(seconds=150)
     max_iter = 50
     tol = 1e-3
 
     opt = optax.lbfgs(
-        memory_size=20,
+        memory_size=100,
         linesearch=optax.scale_by_zoom_linesearch(
             max_linesearch_steps=20,
             verbose=verbose,
@@ -215,7 +215,7 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
 
     def loss_fn(params: Params, dataset: Dataset) -> Array:
         output = model_fn(params, dataset)
-        return -output.loglik.mean() + output.reg_penalty
+        return -output.loglik.mean() + output.reg_penalty / dataset.n_samples
 
     value_and_grad_fun = optax.value_and_grad_from_state(loss_fn)
 
@@ -237,7 +237,6 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
     params = init_params
     state = opt.init(init_params)
 
-    timeout = datetime.timedelta(seconds=120)
     stop_time = datetime.datetime.now() + timeout
     n_linesearch = 0
     params_hist = []
@@ -266,52 +265,52 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
             print(f'timed out after {timeout}, {n_iter=}, {n_linesearch=}')
             break
 
+    labels = get_pytree_labels(params)
     if not converged:
         grad = optax.tree.get(state, 'grad')
         err = optax.tree.norm(grad)
         print(f'did not converge: {n_linesearch=}, {err=}')
 
-    labels = get_pytree_labels(params)
+        def _get_key(label):
+            return re.sub(r'\[\d+\]', '[]', label)
 
-    def _get_key(label):
-        return re.sub(r'\[\d+\]', '[]', label)
-
-    params_df = (
-        pd.DataFrame(
-            list(ravel_pytree(p)[0] for p in params_hist),
-            columns=labels,
+        params_df = (
+            pd.DataFrame(
+                list(ravel_pytree(p)[0] for p in params_hist),
+                columns=labels,
+            )
+            .rename(columns=lambda x: f'{x} values')
+            .astype(float)
         )
-        .rename(columns=lambda x: f'{x} values')
-        .astype(float)
-    )
 
-    metrics_df = (
-        pd.DataFrame(
-            list(ravel_pytree(g)[0] for g in grads_hist),
-            columns=labels,
+        metrics_df = (
+            pd.DataFrame(
+                list(ravel_pytree(g)[0] for g in grads_hist),
+                columns=labels,
+            )
+            .rename(columns=lambda x: f'{x} grads')
+            .assign(loss=losses_hist)
+            .astype(float)
         )
-        .rename(columns=lambda x: f'{x} grads')
-        .assign(loss=losses_hist)
-        .astype(float)
-    )
-    optim_df = pd.concat([params_df, metrics_df], axis=1)
+        optim_df = pd.concat([params_df, metrics_df], axis=1)
 
-    col_keys = sorted({_get_key(col) for col in optim_df.columns})
-    n_rows = len(col_keys)
-    f, axes = plt.subplots(n_rows, 1, figsize=(8, n_rows*2))
-    key_to_ax = dict(zip(col_keys, axes))
+        col_keys = sorted({_get_key(col) for col in optim_df.columns})
+        n_rows = len(col_keys)
+        f, axes = plt.subplots(n_rows, 1, figsize=(8, n_rows*2))
+        key_to_ax = dict(zip(col_keys, axes))
 
-    f.suptitle('optimisation outputs')
-    assert n_rows > 1
-    for col in optim_df.columns:
-        key = _get_key(col)
-        ax = key_to_ax[key]
-        ax.plot(optim_df[col], drawstyle='steps-post', label=col)
-        ax.set_title(key)
-        ax.grid(True, which="both", ls="--", alpha=0.2)
+        f.suptitle('optimisation outputs')
+        assert n_rows > 1
+        for col in optim_df.columns:
+            key = _get_key(col)
+            ax = key_to_ax[key]
+            ax.plot(optim_df[col], drawstyle='steps-post', label=col)
+            ax.set_title(key)
+            ax.grid(True, which="both", ls="--", alpha=0.2)
 
-    plt.tight_layout()
-    plt.show()
+        plt.tight_layout()
+        plt.show()
+        display(optim_df)
 
     # assume -mean(loglik) insetad of -sum(loglik)
     if show_hessian:
@@ -405,7 +404,7 @@ def calc_rbf(params: RbfParams, dataset: Dataset) -> ModelOutput:
         compensator=intensity * dataset.elapsed,
         forecast_intensity=intensity,
         reg_penalty=(
-            jnp.sum(jnp.square(params.weights)) * 0.05
+            jnp.sum(jnp.square(params.weights)) * 1e6
         ),
     )
 
@@ -644,9 +643,9 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
         compensator=compensator,
         forecast_intensity=forecast_intensity,
         reg_penalty=(
-            jnp.square(params.log_base_intensity) * 0.05
-            + jnp.square(params.logit_branching_ratio) * 0.05
-            + jnp.square(params.log_decay_rate) * 0.05
+            jnp.square(params.log_base_intensity) * 1e6
+            + jnp.square(params.logit_branching_ratio) * 1e6
+            + jnp.square(params.log_decay_rate) * 1e6
         ),
     )
 
@@ -675,22 +674,18 @@ def plot_model_output(outputs: ModelOutput, input_df: pl.DataFrame) -> None:
 
 
 def print_params(params: Any) -> None:
-    to_print = {}
-    if hasattr(params, 'log_base_intensity'):
-        to_print['base_intensity'] = jnp.exp(params.log_base_intensity).item()
-        to_print['per_second'] = to_print['base_intensity'] * ONE_SECOND
-    if hasattr(params, 'logit_branching_ratio'):
-        to_print['branching_ratio'] = jax.nn.sigmoid(
-            params.logit_branching_ratio).item()
-    if hasattr(params, 'log_decay_rate'):
-        to_print['decay_rate'] = jnp.exp(params.log_decay_rate).item()
-        to_print['decay_avg_life_seconds'] = \
-            ONE_SECOND / to_print['decay_rate']
-    if hasattr(params, 'log_omega'):
-        to_print['omega'] = jnp.exp(params.log_omega).item()
-    if hasattr(params, 'log_beta'):
-        to_print['beta'] = jnp.exp(params.log_beta).item()
-    display(pd.Series(to_print, name='param').to_frame())
+    prev = params._asdict()
+    series = pd.Series(prev, name='param')
+
+    prefix_transforms = dict(
+        log_=jnp.exp,
+        logit_=jax.nn.sigmoid,
+    )
+    for k, v in prev.items():
+        for prefix, transform in prefix_transforms.items():
+            if k.startswith(prefix):
+                series[k.replace(prefix, '')] = transform(v)
+    display(series.to_frame())
 
 
 def show_hawkes(params: HawkesParams,
@@ -773,10 +768,10 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
         compensator=interval_term,
         forecast_intensity=forecast_intensity,
         reg_penalty=(
-            jnp.square(params.log_base_intensity) * 0.05
-            + jnp.square(params.logit_branching_ratio) * 0.05
-            + jnp.square(params.log_decay_rate) * 0.05
-            + jnp.sum(jnp.square(params.weights)) * 0.05
+            jnp.square(params.log_base_intensity) * 1e6
+            + jnp.square(params.logit_branching_ratio) * 1e6
+            + jnp.square(params.log_decay_rate) * 1e6
+            + jnp.sum(jnp.square(params.weights)) * 1e6
         ),
     )
 
@@ -821,8 +816,8 @@ class PowerLawApproxParams(NamedTuple):
 
 def power_law_decay_approx_params(omega: ArrayLike,
                                   beta: ArrayLike,
-                                  min_history_duration_ms: ArrayLike,
-                                  max_history_duration_ms: ArrayLike,
+                                  min_history_duration: ArrayLike,
+                                  max_history_duration: ArrayLike,
                                   n_exponentials: int) -> PowerLawApproxParams:
     # to approximate lomax decay as a sum of exponentials by using the
     # Laplace transform of Gamma(1+beta, scale=omega):
@@ -832,8 +827,8 @@ def power_law_decay_approx_params(omega: ArrayLike,
 
     # fix the decay rates for each exponential
     rates = jnp.geomspace(
-        1 / max_history_duration_ms,
-        1 / min_history_duration_ms,
+        1 / max_history_duration,
+        1 / min_history_duration,
         n_exponentials,
     )
     # quadrature weights:
@@ -865,10 +860,10 @@ def plot_power_law_decay() -> None:
         return decayed_counts @ params.weights
 
     n = 10_000
-    min_t_ms = ONE_MILLISECOND
-    max_t_ms = ONE_HOUR
-    t_geom = jnp.geomspace(min_t_ms, max_t_ms * 10, n)
-    orders_of_magnitude = jnp.log10(max_t_ms / min_t_ms).item()
+    min_t = ONE_MILLISECOND
+    max_t = ONE_HOUR
+    t_geom = jnp.geomspace(min_t, max_t * 10, n)
+    orders_of_magnitude = jnp.log10(max_t / min_t).item()
     print(f'{orders_of_magnitude=:.2f}')
     n_exponentials = 14  # 2x orders of magnitude
 
@@ -893,8 +888,8 @@ def plot_power_law_decay() -> None:
             kernel_params = power_law_decay_approx_params(
                 omega=omega,
                 beta=beta,
-                min_history_duration_ms=min_t_ms,
-                max_history_duration_ms=max_t_ms,
+                min_history_duration=min_t,
+                max_history_duration=max_t,
                 n_exponentials=n_exponentials,
             )
             exact_integral = 1 / (omega * beta)
@@ -919,7 +914,7 @@ def plot_power_law_decay() -> None:
             ax2.plot(t_geom, approx, 'r--', label='approx', lw=2)
             ax2.axvline(inv_omega, c='g', linestyle='--', alpha=0.6,
                         label=r'$\omega^{-1}$')
-            ax2.axvline(max_t_ms, c='k', linestyle='--', alpha=0.2)
+            ax2.axvline(max_t, c='k', linestyle='--', alpha=0.2)
             ax2.set_xscale('log')
             ax2.set_title(f"$\\omega$={omega:1.1e},$\\beta$={beta}")
             ax2.grid(True, which="both", ls="--", alpha=0.2)
@@ -962,7 +957,7 @@ plot_power_law_decay()
 class PowerLawHawkesParams(NamedTuple):
     log_base_intensity: Array
     logit_branching_ratio: Array
-    log_beta: Array = jnp.log(0.2)
+    log_beta_raw: Array = jnp.log(0.2)
 
 
 def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> ModelOutput:
@@ -971,13 +966,13 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     # power-law tail
     omega = 1.0 / ONE_MILLISECOND
 
-    n_exponentials = 10  # not differentiable
-    min_history_duration_ms = ONE_MILLISECOND
-    max_history_duration_ms = ONE_MIN
+    n_exponentials = 12  # not differentiable
+    min_history_duration = ONE_MILLISECOND
+    max_history_duration = ONE_MIN
 
     base_intensity = jnp.exp(params.log_base_intensity)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
-    beta = jnp.exp(params.log_beta)
+    beta = jnp.exp(params.log_beta_raw * 0.1)
     chex.assert_tree_all_finite(base_intensity)
     chex.assert_tree_all_finite(branching_ratio)
     chex.assert_tree_all_finite(beta)
@@ -985,8 +980,8 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     approx_params = power_law_decay_approx_params(
         omega=omega,
         beta=beta,
-        min_history_duration_ms=min_history_duration_ms,
-        max_history_duration_ms=max_history_duration_ms,
+        min_history_duration=min_history_duration,
+        max_history_duration=max_history_duration,
         n_exponentials=n_exponentials,
     )
     weights, rates = approx_params.weights, approx_params.rates
@@ -1028,9 +1023,9 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
         compensator=interval_term,
         forecast_intensity=forecast_intensity,
         reg_penalty=(
-            jnp.square(params.log_base_intensity) * 0.1
-            + jnp.square(params.logit_branching_ratio) * 0.05
-            + jnp.square(params.log_beta) * 0.01
+            jnp.square(params.log_base_intensity) * 1e4
+            + jnp.square(params.logit_branching_ratio) * 1e4
+            + jnp.square(params.log_beta_raw) * 1e4
         ),
     )
 
@@ -1072,9 +1067,9 @@ def _calc_model_outputs[Params: chex.ArrayTree](prefix: str,
                                                 model_fn: ModelFn[Params]) -> dict[str, np.ndarray]:
     # KNOWN_LIMITATION: Validation loglik is biased downwards as the decayed
     # counts need to "warm up" after starting from 0. It is possible to resolve
-    # by "carrying over" the state from the training set. However, the bias is
-    # retained as it is analgous restarting a trading system intraday without
-    # any replay capabilities.
+    # by "carrying over" the state from the training set. This is ignored as
+    # the warm up duration (minutes) is short relative to the training
+    # training data (weeks)
     train = model_fn(params, DATASET)
     val = model_fn(params, VAL_DATASET)
 
@@ -1215,7 +1210,6 @@ def plot_results(start: datetime.datetime,
             pl.col('hi_price').max(),
             pl.col('lo_price').min(),
             pl.col('actual_count').sum(),
-            pl.col('elapsed').sum().alias('duration_ms'),
             pl.selectors.ends_with('_expected_count').sum(),
         )
         .with_columns(
