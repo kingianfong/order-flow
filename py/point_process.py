@@ -61,6 +61,8 @@ def load_data(raw_data_dir: Path,
         .agg(
             pl.col('is_train').first(),
             curr_count=pl.len(),
+            hi_price=pl.col('price').max(),
+            lo_price=pl.col('price').min(),
         )
         .with_columns(
             elapsed=pl.col('time').diff(),
@@ -260,15 +262,18 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
 
     # assume -mean(loglik) insetad of -sum(loglik)
     if show_hessian:
-        print('calculating hessian')
-        start_time = datetime.datetime.now()
-
         flat_params, unravel = ravel_pytree(params)
 
         def flat_loss_fn(flat_p, dataset):
             return loss_fn(unravel(flat_p), dataset)
+
+        print('calculating hessian')
+        start_time = datetime.datetime.now()
         calc_hess = jax.jit(jax.hessian(flat_loss_fn))
         hess_mat = calc_hess(flat_params, dataset=dataset)
+        stop_time = datetime.datetime.now()
+        elapsed = stop_time - start_time
+        print(f'hessian took {elapsed}')
 
         eigvals = jnp.linalg.eigvalsh(hess_mat)
         if jnp.any(eigvals <= 0):
@@ -302,9 +307,6 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
                 index=labels,
             )
         )
-        stop_time = datetime.datetime.now()
-        elapsed = stop_time - start_time
-        print(f'hessian took {elapsed}')
 
     return params
 
@@ -1071,7 +1073,8 @@ plot_point_process_qq(TRAIN_END + datetime.timedelta(days=1), VAL_END,
 def plot_results(start: datetime.datetime,
                  end: datetime.datetime,
                  *,
-                 duration: str) -> None:
+                 duration: str,
+                 prefixes: list[str] | None = None) -> None:
     df = (
         WITH_MODEL_OUTPUTS
         .filter(
@@ -1088,17 +1091,25 @@ def plot_results(start: datetime.datetime,
         )
         .group_by(pl.col('time').dt.truncate(duration), maintain_order=True)
         .agg(
+            pl.col('hi_price').max(),
+            pl.col('lo_price').min(),
             pl.col('actual_count').sum(),
             pl.col('elapsed').sum().alias('duration_ms'),
-            pl.selectors.ends_with('_loglik').sum(),
             pl.selectors.ends_with('_expected_count').sum(),
+        )
+        .with_columns(
+            (
+                -pl.selectors.ends_with('_expected_count')
+                .name.replace('_expected_count', '_err')
+                + pl.col('actual_count')
+            )
+            / pl.selectors.ends_with('_expected_count').sqrt(),
         )
         .to_pandas()
         .set_index('time')
     )
-    display(df)
 
-    prefixes = [
+    prefixes = prefixes or [
         'constant',
         'rbf',
         'hawkes',
@@ -1106,10 +1117,10 @@ def plot_results(start: datetime.datetime,
         'pl_hawkes',
     ]
     f, axes = plt.subplots(1 + len(prefixes), 1,
-                           sharex=True, figsize=(8, 12))
+                           sharex=True, sharey=False, figsize=(8, 12))
     title = '\n'.join(
         (
-            f'counts and log likelihoods summed over {duration} buckets',
+            f'counts over {duration} buckets',
             f'[ {start} , {end} ]',
         )
     )
@@ -1117,27 +1128,34 @@ def plot_results(start: datetime.datetime,
     count_ax = axes[0]
     count_ax.set_title('actual')
     count_ax.set_yscale('log')
-    count_ax.scatter(df.index, df['actual_count'], label='actual_count',
+    count_ax.scatter(df.index, df['actual_count'],
                      alpha=0.4, marker='+', c='C0')
-    count_ax.set_ylabel('actual count', c='C0')
+    count_ax.set_ylabel('actual count $y$', c='C0')
+
+    price_ax = count_ax.twinx()
+    price_ax.plot(df.index, df[['hi_price', 'lo_price']],
+                  alpha=0.6, drawstyle='steps-post', c='C1')
+    price_ax.set_ylabel('price (hi, lo)', c='C1')
 
     for i, prefix in enumerate(prefixes):
         ax1 = axes[1 + i]
         ax1.set_title(prefix)
         ax1.set_yscale('log')
         ax1.scatter(df.index, df[f'{prefix}_expected_count'],
-                    alpha=0.4, marker='+', c='C1')
-        ax1.set_ylabel('expected count', c='C1')
+                    alpha=0.6, marker='+', c='C0')
+        ax1.set_ylabel('expected count $\\hat y$', c='C0')
 
         ax2 = ax1.twinx()
-        ax2.scatter(df.index, df[f'{prefix}_loglik'],
+        ax2.scatter(df.index, df[f'{prefix}_err'],
                     alpha=0.4, marker='x', c='C2')
-        ax2.set_ylabel('log likelihood', c='C2')
+        ax2.set_ylabel(r'$(y - \hat y) / \sqrt{\hat y}$', c='C2')
 
     for ax in axes:
         ax.grid(True, which="both", ls="--", alpha=0.4)
+        ax.tick_params(axis='x', labelrotation=30)
         if start <= TRAIN_END and TRAIN_END <= end:
-            ax.axvline(TRAIN_END, linestyle='--', alpha=0.6)  # type: ignore
+            ax.axvline(TRAIN_END, linestyle='--', c='k', alpha=0.4)
+
     plt.tight_layout()
     plt.show()
 
@@ -1146,27 +1164,35 @@ plot_results(DATA_START, VAL_END, duration='2h')
 
 
 # %%
-
-
 # arbitrary training date
-plot_results(datetime.datetime(2025, 9, 20, hour=9),
-             datetime.datetime(2025, 9, 21, hour=6),
-             duration='90s')
-plot_results(datetime.datetime(2025, 9, 20, hour=17),
-             datetime.datetime(2025, 9, 20, hour=20),
-             duration='30s')
+plot_results(datetime.datetime(2025, 9, 17, hour=9),
+             datetime.datetime(2025, 9, 18, hour=6),
+             duration='120s')
+# %%
+plot_results(datetime.datetime(2025, 9, 17, hour=17),
+             datetime.datetime(2025, 9, 17, hour=20),
+             duration='20s', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'])
+# %%
+plot_results(datetime.datetime(2025, 9, 17, hour=17, minute=59, second=45,
+                               microsecond=0),
+             datetime.datetime(2025, 9, 17, hour=18, minute=0, second=15,
+                               microsecond=0),
+             duration='100ms', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'])
 
 
 # %%
-
-
 # 2025/10/10 volatility event
 plot_results(datetime.datetime(2025, 10, 10, hour=9),
              datetime.datetime(2025, 10, 11, hour=6),
              duration='90s')
-plot_results(datetime.datetime(2025, 10, 10, hour=20),
+# %%
+plot_results(datetime.datetime(2025, 10, 10, hour=19),
              datetime.datetime(2025, 10, 11, hour=1),
-             duration='30s')
+             duration='30s', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'])
+# %%
+plot_results(datetime.datetime(2025, 10, 10, hour=21, minute=12, second=45),
+             datetime.datetime(2025, 10, 10, hour=21, minute=13, second=45),
+             duration='100ms', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'])
 
 
 # %%
