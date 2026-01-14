@@ -97,22 +97,20 @@ display(INPUT_DF)
 # %%
 
 
-# for multipliers based on time-of-day
-class RbfConstants:
-    n_centers: int = 24
-    n_hours: int = 24
-    centers: Array = jnp.linspace(0, n_hours, n_centers, endpoint=False)
-
-    width_factor: float = 0.5
-    sigma: float = width_factor * n_hours / n_centers
-    inv_sigma_sq: float = 1.0 / (sigma**2)
+N_RBF_CENTERS: int = 24
 
 
 def calc_rbf_basis(time_of_day: Array) -> Array:
-    half = RbfConstants.n_hours / 2
-    dist_from_ctrs = time_of_day[:, None] - RbfConstants.centers[None, :]
-    dist_from_ctrs = (dist_from_ctrs + half) % RbfConstants.n_hours - half
-    exponent = -0.5 * (dist_from_ctrs**2) * RbfConstants.inv_sigma_sq
+    n_hours_in_a_day = 24
+    centers = jnp.linspace(0, n_hours_in_a_day, N_RBF_CENTERS, endpoint=False)
+    width_factor = 0.5
+    sigma = width_factor * n_hours_in_a_day / N_RBF_CENTERS
+    inv_sigma_sq = 1.0 / (sigma**2)
+
+    half = n_hours_in_a_day / 2
+    dist_from_ctrs = time_of_day[:, None] - centers[None, :]
+    dist_from_ctrs = (dist_from_ctrs + half) % n_hours_in_a_day - half
+    exponent = -0.5 * (dist_from_ctrs**2) * inv_sigma_sq
     basis = jnp.exp(exponent)
     return basis
 
@@ -392,7 +390,7 @@ assert jnp.allclose(fitted_constant_intensity_params.log_base_intensity,
 
 class RbfParams(NamedTuple):
     log_base_intensity: Array
-    weights: Array = jnp.zeros((RbfConstants.n_centers,),) + 0.1
+    weights: Array = jnp.zeros((N_RBF_CENTERS,),) + 0.1
 
 
 def calc_rbf(params: RbfParams, dataset: Dataset) -> ModelOutput:
