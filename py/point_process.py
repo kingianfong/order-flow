@@ -184,7 +184,6 @@ def create_dataset(df: pl.DataFrame) -> Dataset:
 
 
 DATASET = create_dataset(INPUT_DF.filter(pl.col('is_train')))
-VAL_DATASET = create_dataset(INPUT_DF.filter(~pl.col('is_train')))
 
 
 # %%
@@ -966,26 +965,18 @@ show_power_law_hawkes(fitted_power_law_hawkes_params,
 # %%
 
 
+DATASET_INCLUDING_VALIDATION_DATA = create_dataset(INPUT_DF)
+
+
 def _calc_model_outputs[Params: chex.ArrayTree](prefix: str,
                                                 params: Params,
                                                 model_fn: ModelFn[Params]) -> dict[str, np.ndarray]:
-    # KNOWN_LIMITATION: Validation loglik is biased downwards as the decayed
-    # counts need to "warm up" after starting from 0. It is possible to resolve
-    # by "carrying over" the state from the training set. This is ignored as
-    # the warm up duration (minutes) is short relative to the training
-    # training data (weeks)
-    train = model_fn(params, DATASET)
-    val = model_fn(params, VAL_DATASET)
-
-    def concat_arrays(train_arr, val_arr):
-        return np.asarray(jnp.concat([train_arr, val_arr]))
-
-    compensator = concat_arrays(train.compensator, val.compensator)
-    loglik = concat_arrays(train.loglik, val.loglik)
-
+    # full dataset is used to avoid bias from a separate "warm up" step
+    # without having to pass state across datasets
+    outputs = model_fn(params, DATASET_INCLUDING_VALIDATION_DATA)
     return {
-        f'{prefix}_compensator': compensator,
-        f'{prefix}_loglik': loglik,
+        f'{prefix}_compensator': np.asarray(outputs.compensator),
+        f'{prefix}_loglik': np.asarray(outputs.loglik),
     }
 
 
