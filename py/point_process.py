@@ -2,7 +2,7 @@
 
 
 from pathlib import Path
-from typing import Any, NamedTuple, Callable
+from typing import NamedTuple, Callable
 import datetime
 import re
 
@@ -121,7 +121,7 @@ class PowerLawCache(NamedTuple):
     decay_rates: Array
     decayed_count: Array
     curr_minus_count: Array
-    decay_integral: Any  # for compensator
+    decay_integral: Array  # for compensator
 
 
 def calc_power_law_cache(curr_count: Array,
@@ -732,7 +732,7 @@ def plot_model_output(outputs: ModelOutput, input_df: pl.DataFrame) -> None:
     plt.show()
 
 
-def print_params(params: Any) -> None:
+def print_params(params) -> None:
     prev = params._asdict()
     series = pd.Series(prev, name='param')
 
