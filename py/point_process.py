@@ -9,7 +9,7 @@ import re
 from IPython.display import display
 from jax import Array
 from jax.flatten_util import ravel_pytree
-from jax.scipy.special import logit, gammaln
+from jax.scipy.special import logit, gammaln, erfc
 from jax.typing import ArrayLike
 import chex
 import jax
@@ -239,6 +239,33 @@ class ModelOutput(NamedTuple):
 type ModelFn[Params: chex.ArrayTree] = Callable[[Params, Dataset], ModelOutput]
 
 
+def calc_robust_var[Params: chex.ArrayTree](params: Params,
+                                            dataset: Dataset,
+                                            model_fn: ModelFn[Params]):
+    """Sandwich estimator: Var = B^-1 @ A @ B^-1"""
+
+    flat_params, unravel = ravel_pytree(params)
+
+    def flat_loss_fn_no_reg(p):
+        out = model_fn(unravel(p), dataset)
+        return -jnp.mean(out.loglik)
+
+    hess = chex.chexify(jax.hessian(flat_loss_fn_no_reg))(flat_params)
+    bread = jnp.linalg.pinv(hess)
+
+    def per_obs_grad(p):
+        out = model_fn(unravel(p), dataset)
+        return out.loglik
+
+    # (N_samples, N_params)
+    jacobian = chex.chexify(jax.jacfwd(per_obs_grad))(flat_params)
+    # Outer product of gradients: (N_params, N_params)
+    meat = (jacobian.T @ jacobian) / dataset.n_samples
+    # Scale by 1/N because B is based on the mean loss
+    robust_var = (bread @ meat @ bread) / dataset.n_samples
+    return robust_var
+
+
 def run_optim[Params: chex.ArrayTree](init_params: Params,
                                       model_fn: ModelFn[Params],
                                       dataset: Dataset,
@@ -395,9 +422,12 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
         cond = jnp.linalg.cond(hess_mat).item()
         inv_hess_mat = jnp.linalg.pinv(hess_mat)
         diag_sqrt = jnp.sqrt(jnp.diag(inv_hess_mat))
+        hess_se = diag_sqrt / jnp.sqrt(dataset.n_samples)
         corr_mat = inv_hess_mat / jnp.outer(diag_sqrt, diag_sqrt)
         mask = np.triu(np.ones_like(corr_mat, dtype=bool))
 
+        print('plotting hessian')
+        start_time = datetime.datetime.now()
         plt.figure(figsize=(8, 6))
         sns.heatmap(
             data=pd.DataFrame(corr_mat, index=labels, columns=labels),
@@ -405,18 +435,33 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
         )
         plt.title(f"Inverse Hessian Matrix {cond=:.2f}")
         plt.show()
+        print(f'plotting took {datetime.datetime.now() - start_time}')
+
+        print('calculating errors')
+        start_time = datetime.datetime.now()
+        robust_var = calc_robust_var(params, dataset, model_fn)
+        robust_se = jnp.sqrt(jnp.diag(robust_var))
+        print(f'errors took {datetime.datetime.now() - start_time}')
 
         mean = flat_params
-        var = jnp.diag(inv_hess_mat) / dataset.n_samples
-        std_err = jnp.sqrt(var)
+        z_score = mean / robust_se
+        p_value = erfc(jnp.abs(z_score) / jnp.sqrt(2))
+        meff = robust_se / hess_se
         display(
             pd.DataFrame(
                 dict(
                     mean=mean,
-                    std_err=std_err,
-                    z=mean / std_err,
+                    hess_se=hess_se,
+                    robust_se=robust_se,
+                    z_score=z_score,
+                    p_value=map(lambda x: f'{x:.4%}', p_value),
+                    meff=meff,
                 ),
                 index=labels,
+            )
+            .style
+            .background_gradient(
+                subset=['hess_se', 'robust_se', 'meff'],
             )
         )
 
@@ -485,14 +530,18 @@ class RbfParams(NamedTuple):
 def calc_rbf(params: RbfParams, dataset: Dataset) -> ModelOutput:
     intensity = jax.nn.softplus(params.sp_inv_base_rate
                                 + dataset.rbf_basis @ params.weights)
+    # diffs = params.weights - jnp.roll(params.weights, 1)
+
     return ModelOutput(
         point_term=dataset.curr_count * jnp.log(intensity),
         compensator=intensity * dataset.time_since_prev,
         forecast_intensity=intensity,
         reg_penalty=(
             jnp.zeros(())
-            + jnp.sum(jnp.square(params.weights)) * 1e5
-            + jnp.square(jnp.sum(params.weights)) * 1e5
+            + jnp.square(params.sp_inv_base_rate) * 1e2
+            + jnp.sum(jnp.square(params.weights)) * 1e2
+            + jnp.square(jnp.sum(params.weights)) * 1e2
+            # + jnp.sum(jnp.square(diffs)) * 1e4
         ),
     )
 
@@ -777,11 +826,11 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
         compensator=interval_term,
         forecast_intensity=forecast_intensity,
         reg_penalty=(
-            jnp.square(params.sp_inv_base_intensity) * 1e5
-            + jnp.square(params.logit_branching_ratio) * 1e5
-            + jnp.square(params.sp_inv_decay_rate) * 1e5
-            + jnp.sum(jnp.square(params.weights)) * 1e5
-            + jnp.square(jnp.sum(params.weights)) * 1e5
+            jnp.square(params.sp_inv_base_intensity) * 1e3
+            + jnp.square(params.logit_branching_ratio) * 1e3
+            + jnp.square(params.sp_inv_decay_rate) * 1e3
+            + jnp.sum(jnp.square(params.weights)) * 1e2
+            + jnp.square(jnp.sum(params.weights)) * 1e2
         ),
     )
 
@@ -878,9 +927,9 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
         forecast_intensity=forecast_intensity,
         reg_penalty=(
             jnp.zeros(())
-            + jnp.square(params.sp_inv_base_intensity) * 1e5
-            + jnp.square(params.logit_branching_ratio) * 1e5
-            + jnp.square(params.sp_inv_beta_raw) * 1e5
+            # + jnp.square(params.sp_inv_base_intensity) * 1e5
+            # + jnp.square(params.logit_branching_ratio) * 1e5
+            # + jnp.square(params.sp_inv_beta_raw) * 1e5
         ),
     )
 
