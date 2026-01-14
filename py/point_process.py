@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Any, NamedTuple, Callable
 import datetime
 import re
-import time
 
 from IPython.display import display
 from jax import Array
@@ -22,6 +21,8 @@ import pandas as pd
 import polars as pl
 import scipy
 import seaborn as sns
+
+from decayed_counts import calculate_decayed_counts
 
 
 # %%
@@ -514,91 +515,6 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
         compensator=compensator,
         forecast_intensity=intensity,
     )
-
-
-@jax.jit
-def calculate_decayed_counts(decay_factors: Array, counts: Array) -> Array:
-    def combine(prefix, step):
-        decay_left, count_left = prefix
-        decay_right, count_right = step
-        combined_decay = decay_right * decay_left
-        combined_count = decay_right * count_left + count_right
-        return combined_decay, combined_count
-
-    if counts.ndim == 1 and decay_factors.ndim > 1:
-        counts = counts[:, jnp.newaxis]
-        counts = jnp.broadcast_to(counts, decay_factors.shape)
-
-    elems = decay_factors, counts
-    _, decayed_counts = jax.lax.associative_scan(combine, elems)
-    return decayed_counts
-
-
-def test_calculate_decayed_counts() -> None:
-
-    @jax.jit
-    def linear_scan_step(carry, xs):
-        decayed_count = carry
-        decay_factor, count = xs
-        decayed_count *= decay_factor
-        decayed_count += count
-        return decayed_count, decayed_count
-
-    n = 10_000_000
-    print('1d')
-    for i in range(3):
-        k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(i), 4)
-
-        normal = 10 * jax.random.normal(k1, (n, ))
-        decay_factors = jax.nn.sigmoid(normal)
-        counts = 1.0 + jax.random.randint(k2, (n, ), 0, 5)
-
-        baseline_start = time.time_ns()
-        init = 0
-        xs = decay_factors, counts
-        _, expected = jax.lax.scan(linear_scan_step, init, xs)
-        expected.block_until_ready()
-        baseline_elapsed = time.time_ns() - baseline_start
-
-        assoc_start = time.time_ns()
-        actual = calculate_decayed_counts(decay_factors, counts)
-        actual.block_until_ready()
-        assoc_elapsed = time.time_ns() - assoc_start
-        assert jnp.allclose(actual, expected)
-
-        improvement_ms = (baseline_elapsed - assoc_elapsed) * 1e-6
-        improvement_rel = (baseline_elapsed - assoc_elapsed) / baseline_elapsed
-        print(f'{improvement_ms=:.2f}, {improvement_rel=:.2%}')
-
-    print('multidimensional')
-    for i in range(3):
-        k1, k2, k3, k4 = jax.random.split(jax.random.PRNGKey(i), 4)
-
-        m = 16
-        normal = 10 * jax.random.normal(k3, (n, m))
-        decay_factors = jax.nn.sigmoid(normal)
-        counts = 1.0 + jax.random.randint(k4, (n, ), 0, 5)
-
-        baseline_start = time.time_ns()
-        init = jnp.zeros((m,))
-        xs = decay_factors, counts
-        _, expected = jax.lax.scan(linear_scan_step, init, xs)
-        expected.block_until_ready()
-        baseline_elapsed = time.time_ns() - baseline_start
-
-        assoc_start = time.time_ns()
-        actual = calculate_decayed_counts(decay_factors, counts)
-        actual.block_until_ready()
-        assoc_elapsed = time.time_ns() - assoc_start
-        assert jnp.allclose(actual, expected)
-
-        improvement_ms = (baseline_elapsed - assoc_elapsed) * 1e-6
-        improvement_rel = (baseline_elapsed - assoc_elapsed) / baseline_elapsed
-        print(f'{improvement_ms=:.2f}, {improvement_rel=:.2%}')
-
-
-test_calculate_decayed_counts()
-
 
 # %%
 
