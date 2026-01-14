@@ -116,10 +116,44 @@ def calc_rbf_basis(time_of_day: Array) -> Array:
     return basis
 
 
+class PowerLawCache(NamedTuple):
+    decay_rates: Array
+    decayed_count: Array
+    curr_minus_count: Array
+    decay_integral: Any  # for compensator
+
+
+def calc_power_law_cache(curr_count: Array,
+                         time_since_prev: Array) -> PowerLawCache:
+    decay_rates = power_law_approx.calc_decay_rates(
+        min_history=ONE_MILLISECOND,
+        max_history=ONE_HOUR,
+        n_exponentials=14,  # 3.6e6 ms in an hour, 2x orders of magnitude
+    )
+    decay_factor_exponents = (
+        # KNOWN_LIMITATION: this may run out of memory for large datasets
+        # switch to jax.lax.scan if necessary
+        -jnp.outer(time_since_prev, decay_rates)
+    )
+    decay_factors = jnp.exp(decay_factor_exponents)
+    decayed_count = calculate_decayed_counts(decay_factors, curr_count)
+    prev_decayed_count = jnp.roll(decayed_count, 1, axis=0) .at[0, :].set(0.0)
+
+    return PowerLawCache(
+        decay_rates=decay_rates,
+        decayed_count=decayed_count,
+        curr_minus_count=prev_decayed_count * decay_factors,
+        decay_integral=(prev_decayed_count
+                        * -jnp.expm1(decay_factor_exponents)
+                        / decay_rates),
+    )
+
+
 class Dataset(NamedTuple):
     curr_count: Array
     time_since_prev: Array
     rbf_basis: Array
+    power_law_cache: PowerLawCache
     n_samples: int
 
 
@@ -131,14 +165,19 @@ ONE_HOUR: float = 3600.0 * 1e0
 
 def create_dataset(df: pl.DataFrame) -> Dataset:
     assert ONE_SECOND == 1.0, f'{ONE_SECOND=}'
+
+    curr_count = df['curr_count'].cast(float).to_jax()
+    time_since_prev = (df['time_since_prev']
+                       .dt.total_seconds(fractional=True)
+                       .to_jax())
     return Dataset(
-        curr_count=df['curr_count'].cast(float).to_jax(),
-        time_since_prev=(
-            df['time_since_prev']
-            .dt.total_seconds(fractional=True)
-            .to_jax()
-        ),
+        curr_count=curr_count,
+        time_since_prev=time_since_prev,
         rbf_basis=calc_rbf_basis(df['hour'].to_jax()),
+        power_law_cache=calc_power_law_cache(
+            curr_count=curr_count,
+            time_since_prev=time_since_prev,
+        ),
         n_samples=df.height,
     )
 
@@ -737,12 +776,6 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     # omega^{-1} roughly corresponds to where the plateau crosses over to
     # power-law tail
     omega = 1.0 / ONE_MILLISECOND
-    decay_rates = power_law_approx.calc_decay_rates(
-        min_history=ONE_MILLISECOND,
-        max_history=ONE_HOUR,
-        n_exponentials=14,  # 3.6e6 ms in an hour, 2x orders of magnitude
-    )
-
     base_intensity = jnp.exp(params.log_base_intensity)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
     beta = jnp.exp(params.log_beta_raw * 0.1)
@@ -750,47 +783,37 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     chex.assert_tree_all_finite(branching_ratio)
     chex.assert_tree_all_finite(beta)
 
+    cache = dataset.power_law_cache
     weights = power_law_approx.calc_weights(
         omega=omega,
         beta=beta,
-        rates=decay_rates,
+        rates=cache.decay_rates,
     )
-    approx_integral = jnp.sum(weights / decay_rates)
-    kernel_factor = branching_ratio / approx_integral
-
-    decay_factor_exponents = (
-        # KNOWN_LIMITATION: this may run out of memory for large datasets
-        # switch to jax.lax.scan if necessary
-        -jnp.outer(dataset.time_since_prev, decay_rates)
-    )
-    decay_factors = jnp.exp(decay_factor_exponents)
-    decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
-
-    prev_decayed_count = jnp.roll(decayed_count, 1, axis=0).at[0, :].set(0.0)
-    term_per_exp = -jnp.expm1(decay_factor_exponents) / decay_rates
-    integral_history = (prev_decayed_count * term_per_exp) @ weights
-    interval_term = \
-        (dataset.time_since_prev * base_intensity) \
-        + (kernel_factor * integral_history)
-    chex.assert_tree_all_finite(interval_term)
+    kernel_integral = jnp.sum(weights / cache.decay_rates)
+    kernel_factor = branching_ratio / kernel_integral
+    compensator_integral = cache.decay_integral @ weights
+    compensator = \
+        dataset.time_since_prev * base_intensity \
+        + kernel_factor * compensator_integral
+    chex.assert_tree_all_finite(compensator)
 
     # rising factorial / pochhammer
-    curr_minus_count = prev_decayed_count * decay_factors
-    total_a = base_intensity + kernel_factor * (curr_minus_count @ weights)
-    total_d = kernel_factor * jnp.sum(weights)
-    a_over_d = (total_a / total_d)
-    p1 = dataset.curr_count * jnp.log(total_d)
-    p2 = gammaln(a_over_d + dataset.curr_count)
-    p3 = -gammaln(a_over_d)
-    point_term = p1 + p2 + p3
+    total_a = base_intensity \
+        + kernel_factor * (cache.curr_minus_count @ weights)
+    total_d = kernel_factor  # weights sum to 1
+    a_over_d = total_a / total_d
+    point_term = \
+        dataset.curr_count * jnp.log(total_d) \
+        + gammaln(a_over_d + dataset.curr_count) \
+        - gammaln(a_over_d)
     chex.assert_tree_all_finite(point_term)
 
     forecast_intensity = base_intensity \
-        + kernel_factor * (decayed_count @ weights)
+        + kernel_factor * cache.decayed_count @ weights
 
     return ModelOutput(
         point_term=point_term,
-        compensator=interval_term,
+        compensator=compensator,
         forecast_intensity=forecast_intensity,
         reg_penalty=(
             jnp.square(params.log_base_intensity) * 1e4
