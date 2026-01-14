@@ -1168,6 +1168,7 @@ def plot_results(start: datetime.datetime,
         ax2.scatter(df.index, df[f'{prefix}_err'],
                     alpha=0.4, marker='x', c='C2')
         ax2.set_ylabel(r'$(y - \hat y) / \sqrt{\hat y}$', c='C2')
+        ax2.axhline(0.0, linestyle='--', c='C2', alpha=0.6)
 
     for ax in axes:
         ax.grid(True, which="both", ls="--", alpha=0.4)
