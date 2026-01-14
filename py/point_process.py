@@ -131,22 +131,28 @@ def calc_power_law_cache(curr_count: Array,
         max_history=ONE_HOUR,
         n_exponentials=14,  # 3.6e6 ms in an hour, 2x orders of magnitude
     )
-    decay_factor_exponents = (
-        # KNOWN_LIMITATION: this may run out of memory for large datasets
-        # switch to jax.lax.scan if necessary
-        -jnp.outer(time_since_prev, decay_rates)
-    )
-    decay_factors = jnp.exp(decay_factor_exponents)
-    decayed_count = calculate_decayed_counts(decay_factors, curr_count)
-    prev_decayed_count = jnp.roll(decayed_count, 1, axis=0).at[0, :].set(0.0)
+
+    def step(carry, xs):
+        prev_decayed_count = carry
+        count, time_since_prev = xs
+        decay_factor_exponents = time_since_prev * decay_rates
+        decay_factor = jnp.exp(-decay_factor_exponents)
+        curr_minus_count = prev_decayed_count * decay_factor
+        decay_integral = (prev_decayed_count *
+                          -jnp.expm1(-decay_factor_exponents)) / decay_rates
+        curr_decayed_count = curr_minus_count + count
+        y = curr_decayed_count, curr_minus_count, decay_integral
+        return curr_decayed_count, y
+
+    init = jnp.zeros_like(decay_rates)
+    _, ys = jax.lax.scan(step, init, (curr_count, time_since_prev))
+    decayed_count, curr_minus_count, decay_integral = ys
 
     return PowerLawCache(
         decay_rates=decay_rates,
         decayed_count=decayed_count,
-        curr_minus_count=prev_decayed_count * decay_factors,
-        decay_integral=(prev_decayed_count
-                        * -jnp.expm1(decay_factor_exponents)
-                        / decay_rates),
+        curr_minus_count=curr_minus_count,
+        decay_integral=decay_integral,
     )
 
 

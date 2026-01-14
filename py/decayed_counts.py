@@ -14,11 +14,6 @@ def calculate_decayed_counts(decay_factors: Array, counts: Array) -> Array:
         combined_count = decay_right * count_left + count_right
         return combined_decay, combined_count
 
-    # Handle broadcasting if counts is 1D but decay_factors is 2D
-    if counts.ndim == 1 and decay_factors.ndim > 1:
-        counts = counts[:, jnp.newaxis]
-        counts = jnp.broadcast_to(counts, decay_factors.shape)
-
     elems = decay_factors, counts
     _, decayed_counts = jax.lax.associative_scan(combine, elems)
     return decayed_counts
@@ -39,21 +34,15 @@ def get_scan_baseline(decay_factors: Array, counts: Array) -> Array:
 
 
 @pytest.mark.parametrize("seed", [0, 1, 2])
-@pytest.mark.parametrize("shape_type", ["1d", "multidimensional"])
-def test_decayed_counts_correctness(seed, shape_type):
+def test_decayed_counts_correctness(seed):
     """Verifies that associative scan matches the sequential scan baseline."""
     key = jax.random.PRNGKey(seed)
     k1, k2 = jax.random.split(key)
 
     n = 1_000
 
-    if shape_type == "1d":
-        decay_factors = jax.nn.sigmoid(10 * jax.random.normal(k1, (n,)))
-        counts = 1.0 + jax.random.randint(k2, (n,), 0, 5)
-    else:
-        m = 8
-        decay_factors = jax.nn.sigmoid(10 * jax.random.normal(k1, (n, m)))
-        counts = 1.0 + jax.random.randint(k2, (n,), 0, 5)
+    decay_factors = jax.nn.sigmoid(10 * jax.random.normal(k1, (n,)))
+    counts = 1.0 + jax.random.randint(k2, (n,), 0, 5)
 
     actual = calculate_decayed_counts(decay_factors, counts)
     expected = get_scan_baseline(decay_factors, counts)
