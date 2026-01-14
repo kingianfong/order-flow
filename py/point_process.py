@@ -10,7 +10,6 @@ from IPython.display import display
 from jax import Array
 from jax.flatten_util import ravel_pytree
 from jax.scipy.special import logit, gammaln
-from jax.typing import ArrayLike
 import chex
 import jax
 import jax.numpy as jnp
@@ -23,6 +22,7 @@ import scipy
 import seaborn as sns
 
 from decayed_counts import calculate_decayed_counts
+import power_law_approx
 
 
 # %%
@@ -723,151 +723,6 @@ show_rbf_hawkes(fitted_rbf_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 # %%
 
 
-class PowerLawApproxParams(NamedTuple):
-    weights: Array
-    rates: Array
-
-
-def power_law_decay_approx_params(omega: ArrayLike,
-                                  beta: ArrayLike,
-                                  min_history_duration: ArrayLike,
-                                  max_history_duration: ArrayLike,
-                                  n_exponentials: int) -> PowerLawApproxParams:
-    # to approximate lomax decay as a sum of exponentials by using the
-    # Laplace transform of Gamma(1+beta, scale=omega):
-    #   (1 + omega * t) ^ -(1 + beta) = E[ exp{-t * X} ]
-    # where
-    #   f(x) = k * x^{beta} * exp{-x / omega}
-
-    # fix the decay rates for each exponential
-    rates = jnp.geomspace(
-        1 / max_history_duration,
-        1 / min_history_duration,
-        n_exponentials,
-    )
-    # quadrature weights:
-    # approximate integral[ f(x)   * exp(-x   * t)   dx        ]
-    # as               sum[ f(x_i) * exp(-x_i * t) * delta_x_i ]
-    # delta_x_i is proportional to x_i because x_i is geomspaced.
-    # This can be derived using change of variable x = exp{u} for the integral
-    log_pdf = jax.scipy.stats.gamma.logpdf(rates, a=1 + beta, scale=omega)
-    unnorm_log_weights = log_pdf + jnp.log(rates)
-    weights = jax.nn.softmax(unnorm_log_weights)
-
-    return PowerLawApproxParams(
-        weights=jnp.asarray(weights),
-        rates=jnp.asarray(rates),
-    )
-
-
-def plot_power_law_decay() -> None:
-    def calc_exact(t: Array, omega: ArrayLike, beta: ArrayLike):
-        return (1.0 + omega * t) ** -(1.0 + beta)
-
-    # done sequentially to ensure markovian nature holds
-    def calc_approx(t: Array, params: PowerLawApproxParams) -> Array:
-        elapsed = jnp.concat([jnp.zeros(1), jnp.diff(t)])
-        counts = jnp.zeros_like(elapsed).at[0].set(1)
-        outer = jnp.outer(elapsed, params.rates)
-        decay_rates = jnp.exp(-outer)
-        decayed_counts = calculate_decayed_counts(decay_rates, counts)
-        return decayed_counts @ params.weights
-
-    n = 10_000
-    min_t = ONE_MILLISECOND
-    max_t = ONE_HOUR
-    t_geom = jnp.geomspace(min_t, max_t * 10, n)
-    orders_of_magnitude = jnp.log10(max_t / min_t).item()
-    print(f'{orders_of_magnitude=:.2f}')
-    n_exponentials = 14  # 2x orders of magnitude
-
-    inv_omegas = ONE_MILLISECOND,  ONE_MIN,  ONE_HOUR
-    betas = 0.15, 0.3, 0.5
-
-    f1, axes1 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
-    f1.suptitle('Lomax Kernel')
-    f2, axes2 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
-    f2.suptitle('linear y')
-    f3, axes3 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
-    f3.suptitle('linear x, linear y')
-    f4, axes4 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
-    f4.suptitle('absolute error')
-    f5, axes5 = plt.subplots(3, 3, sharex=True, sharey=True, figsize=(9, 9))
-    f5.suptitle('relative error')
-
-    for r, inv_omega in enumerate(inv_omegas):
-        omega = 1.0 / inv_omega
-        for c, beta in enumerate(betas):
-
-            kernel_params = power_law_decay_approx_params(
-                omega=omega,
-                beta=beta,
-                min_history_duration=min_t,
-                max_history_duration=max_t,
-                n_exponentials=n_exponentials,
-            )
-            exact_integral = 1 / (omega * beta)
-            approx_integral = jnp.sum(kernel_params.weights
-                                      / kernel_params.rates).item()
-            assert jnp.allclose(approx_integral, exact_integral,
-                                rtol=1e-4, atol=jnp.inf), \
-                f'{approx_integral=}, {exact_integral=}'
-
-            exact = calc_exact(t_geom, omega=omega, beta=beta)
-            approx = calc_approx(t_geom, kernel_params)
-
-            ax1 = axes1[r, c]
-            ax1.loglog(t_geom, exact, 'k-', label='exact', lw=2)
-            ax1.loglog(t_geom, approx, 'r--', label='approx', lw=2)
-            ax1.set_title(f"$\\omega$={omega:1.1e},$\\beta$={beta}")
-            ax1.grid(True, which="both", ls="--", alpha=0.2)
-            ax1.legend(loc='lower left')
-
-            ax2 = axes2[r, c]
-            ax2.plot(t_geom, exact, 'k-', label='exact', lw=2)
-            ax2.plot(t_geom, approx, 'r--', label='approx', lw=2)
-            ax2.axvline(inv_omega, c='g', linestyle='--', alpha=0.6,
-                        label=r'$\omega^{-1}$')
-            ax2.axvline(max_t, c='k', linestyle='--', alpha=0.2)
-            ax2.set_xscale('log')
-            ax2.set_title(f"$\\omega$={omega:1.1e},$\\beta$={beta}")
-            ax2.grid(True, which="both", ls="--", alpha=0.2)
-            ax2.legend(loc='upper right')
-
-            ax3 = axes3[r, c]
-            keep = t_geom < (2 * ONE_HOUR)
-            ax3.plot(t_geom[keep], exact[keep], 'k-', label='exact', lw=2)
-            ax3.plot(t_geom[keep], approx[keep], 'r--', label='approx', lw=2)
-            ax3.axvline(inv_omega, c='g', linestyle='--', alpha=0.6,
-                        label=r'$\omega^{-1}$')
-            ax3.set_title(f"$\\omega$={omega:1.1e},$\\beta$={beta}")
-            ax3.grid(True, which="both", ls="--", alpha=0.2)
-            ax3.legend(loc='upper right')
-
-            ax4 = axes4[r, c]
-            ax4.loglog(t_geom, abs(approx - exact), 'k-', lw=2)
-            ax4.axvline(inv_omega, c='g', linestyle='--', alpha=0.6,
-                        label=r'$\omega^{-1}$')
-            ax4.set_title(f"$\\omega$={omega:1.1e},$\\beta$={beta}")
-            ax4.grid(True, which="both", ls="--", alpha=0.2)
-
-            ax5 = axes5[r, c]
-            ax5.loglog(t_geom, abs(approx - exact) / exact, 'k-', lw=2)
-            ax5.axvline(inv_omega, c='g', linestyle='--', alpha=0.6,
-                        label=r'$\omega^{-1}$')
-            ax5.set_title(f"$\\omega$={omega:1.1e},$\\beta$={beta}")
-            ax5.grid(True, which="both", ls="--", alpha=0.2)
-
-    plt.tight_layout()
-    plt.show()
-
-
-plot_power_law_decay()
-
-
-# %%
-
-
 class PowerLawHawkesParams(NamedTuple):
     log_base_intensity: Array
     logit_branching_ratio: Array
@@ -879,10 +734,11 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     # omega^{-1} roughly corresponds to where the plateau crosses over to
     # power-law tail
     omega = 1.0 / ONE_MILLISECOND
-
-    n_exponentials = 12  # not differentiable
-    min_history_duration = ONE_MILLISECOND
-    max_history_duration = ONE_MIN
+    decay_rates = power_law_approx.calc_decay_rates(
+        min_history=ONE_MILLISECOND,
+        max_history=ONE_HOUR,
+        n_exponentials=14,  # 3.6e6 ms in an hour, 2x orders of magnitude
+    )
 
     base_intensity = jnp.exp(params.log_base_intensity)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
@@ -891,27 +747,24 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     chex.assert_tree_all_finite(branching_ratio)
     chex.assert_tree_all_finite(beta)
 
-    approx_params = power_law_decay_approx_params(
+    weights = power_law_approx.calc_weights(
         omega=omega,
         beta=beta,
-        min_history_duration=min_history_duration,
-        max_history_duration=max_history_duration,
-        n_exponentials=n_exponentials,
+        rates=decay_rates,
     )
-    weights, rates = approx_params.weights, approx_params.rates
-    approx_integral = jnp.sum(weights / rates)
+    approx_integral = jnp.sum(weights / decay_rates)
     kernel_factor = branching_ratio / approx_integral
 
     decay_factor_exponents = (
         # KNOWN_LIMITATION: this may run out of memory for large datasets
         # switch to jax.lax.scan if necessary
-        -jnp.outer(dataset.elapsed, rates)
+        -jnp.outer(dataset.elapsed, decay_rates)
     )
     decay_factors = jnp.exp(decay_factor_exponents)
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
 
     prev_decayed_count = jnp.roll(decayed_count, 1, axis=0).at[0, :].set(0.0)
-    term_per_exp = -jnp.expm1(decay_factor_exponents) / rates
+    term_per_exp = -jnp.expm1(decay_factor_exponents) / decay_rates
     integral_history = (prev_decayed_count * term_per_exp) @ weights
     interval_term = \
         (dataset.elapsed * base_intensity) \
