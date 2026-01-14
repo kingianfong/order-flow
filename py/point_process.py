@@ -68,18 +68,18 @@ def load_data(raw_data_dir: Path,
             lo_price=pl.col('price').min(),
         )
         .with_columns(
-            elapsed=pl.col('time').diff(),
+            time_since_prev=pl.col('time').diff(),
             hour=((pl.col('time') - pl.col('time').dt.truncate('1d'))
                   .dt.total_hours(fractional=True)),
         )
-        .filter(pl.col('elapsed').is_not_null())
+        .filter(pl.col('time_since_prev').is_not_null())
         .collect()
     )
 
     assert df['time'].is_unique().all()
     assert df['time'].is_sorted()
     assert (df['curr_count'] > 0).all()
-    assert (df['elapsed'] > datetime.timedelta(0)).all()
+    assert (df['time_since_prev'] > datetime.timedelta(0)).all()
     assert (df['hour'] >= 0).all()
     assert (df['hour'] <= 24).all()
     return df
@@ -118,7 +118,7 @@ def calc_rbf_basis(time_of_day: Array) -> Array:
 
 class Dataset(NamedTuple):
     curr_count: Array
-    elapsed: Array
+    time_since_prev: Array
     rbf_basis: Array
     n_samples: int
 
@@ -130,9 +130,14 @@ ONE_HOUR: float = 3600.0 * 1e0
 
 
 def create_dataset(df: pl.DataFrame) -> Dataset:
+    assert ONE_SECOND == 1.0, f'{ONE_SECOND=}'
     return Dataset(
         curr_count=df['curr_count'].cast(float).to_jax(),
-        elapsed=df['elapsed'].dt.total_seconds(fractional=True).to_jax(),
+        time_since_prev=(
+            df['time_since_prev']
+            .dt.total_seconds(fractional=True)
+            .to_jax()
+        ),
         rbf_basis=calc_rbf_basis(df['hour'].to_jax()),
         n_samples=df.height,
     )
@@ -146,7 +151,7 @@ VAL_DATASET = create_dataset(INPUT_DF.filter(~pl.col('is_train')))
 
 
 closed_form_intensity = (DATASET.curr_count.sum() /
-                         DATASET.elapsed.sum()).item()
+                         DATASET.time_since_prev.sum()).item()
 print(f'{closed_form_intensity=}, around {closed_form_intensity*ONE_SECOND:.2f}/second')
 print(f'{jnp.log(closed_form_intensity)=:.4f}')
 
@@ -322,9 +327,7 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
         start_time = datetime.datetime.now()
         calc_hess = chex.chexify(jax.jit(jax.hessian(flat_loss_fn)))
         hess_mat = calc_hess(flat_params, dataset=dataset)
-        stop_time = datetime.datetime.now()
-        elapsed = stop_time - start_time
-        print(f'hessian took {elapsed}')
+        print(f'hessian took {datetime.datetime.now() - start_time}')
 
         eigvals = jnp.linalg.eigvalsh(hess_mat)
         if jnp.any(eigvals <= 0):
@@ -368,9 +371,9 @@ class ConstantIntensityParams(NamedTuple):
 def calc_const(params: ConstantIntensityParams, dataset: Dataset) -> ModelOutput:
     intensity = jnp.exp(params.log_base_intensity)
     return ModelOutput(
-        forecast_intensity=intensity * jnp.ones_like(dataset.elapsed),
+        forecast_intensity=intensity * jnp.ones_like(dataset.time_since_prev),
         point_term=dataset.curr_count * params.log_base_intensity,
-        compensator=intensity * dataset.elapsed,
+        compensator=intensity * dataset.time_since_prev,
     )
 
 
@@ -400,7 +403,7 @@ def calc_rbf(params: RbfParams, dataset: Dataset) -> ModelOutput:
     intensity = jnp.exp(log_intensity)
     return ModelOutput(
         point_term=dataset.curr_count * log_intensity,
-        compensator=intensity * dataset.elapsed,
+        compensator=intensity * dataset.time_since_prev,
         forecast_intensity=intensity,
         reg_penalty=(
             jnp.sum(jnp.square(params.weights)) * 1e6
@@ -473,7 +476,7 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     performance, intended for comparison against optimised implementations.
     """
     assert jnp.all(dataset.curr_count > 0.0)
-    assert jnp.all(dataset.elapsed > 0.0)
+    assert jnp.all(dataset.time_since_prev > 0.0)
 
     base_intensity = jnp.exp(params.log_base_intensity)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
@@ -481,14 +484,14 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
 
     def step(carry, x):
         decayed_count = carry
-        count, elapsed = x
+        count, time_since_prev = x
 
-        integral_over_interval = -jnp.expm1(-decay_rate * elapsed)
+        integral_over_interval = -jnp.expm1(-decay_rate * time_since_prev)
         compensator = \
-            base_intensity * elapsed  \
+            base_intensity * time_since_prev  \
             + branching_ratio * decayed_count * integral_over_interval
 
-        decay_factor = jnp.exp(-decay_rate * elapsed)
+        decay_factor = jnp.exp(-decay_rate * time_since_prev)
         decayed_count *= decay_factor
         point_intensity = base_intensity \
             + branching_ratio * decay_rate * decayed_count
@@ -507,7 +510,7 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
             + branching_ratio * decay_rate * decayed_count
         return decayed_count, (point_term, compensator, forecast_intensity)
 
-    xs = dataset.curr_count, dataset.elapsed
+    xs = dataset.curr_count, dataset.time_since_prev
     _, (point_term, compensator, intensity) = jax.lax.scan(step, 0, xs)
 
     return ModelOutput(
@@ -528,15 +531,15 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     chex.assert_tree_all_finite(branching_ratio)
     chex.assert_tree_all_finite(decay_rate)
 
-    decay_factors = jnp.exp(-decay_rate * dataset.elapsed)
+    decay_factors = jnp.exp(-decay_rate * dataset.time_since_prev)
     chex.assert_tree_all_finite(decay_factors)
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
     chex.assert_tree_all_finite(decayed_count)
 
     prev_decayed_count = jnp.roll(decayed_count, 1).at[0].set(0.0)
-    integral_over_interval = -jnp.expm1(-decay_rate * dataset.elapsed)
+    integral_over_interval = -jnp.expm1(-decay_rate * dataset.time_since_prev)
     compensator = \
-        dataset.elapsed * base_intensity \
+        dataset.time_since_prev * base_intensity \
         + branching_ratio * prev_decayed_count * integral_over_interval
     chex.assert_tree_all_finite(compensator)
 
@@ -656,13 +659,13 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
     base_intensity = jnp.exp(params.log_base_intensity + log_factor)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
     decay_rate = jnp.exp(params.log_decay_rate)
-    decay_factors = jnp.exp(-decay_rate * dataset.elapsed)
+    decay_factors = jnp.exp(-decay_rate * dataset.time_since_prev)
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
 
     prev_decayed_count = jnp.roll(decayed_count, 1).at[0].set(0.0)
-    integral_over_interval = -jnp.expm1(-decay_rate * dataset.elapsed)
+    integral_over_interval = -jnp.expm1(-decay_rate * dataset.time_since_prev)
     interval_term = \
-        dataset.elapsed * base_intensity \
+        dataset.time_since_prev * base_intensity \
         + branching_ratio * prev_decayed_count * integral_over_interval
 
     # rising factorial / pochhammer
@@ -758,7 +761,7 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     decay_factor_exponents = (
         # KNOWN_LIMITATION: this may run out of memory for large datasets
         # switch to jax.lax.scan if necessary
-        -jnp.outer(dataset.elapsed, decay_rates)
+        -jnp.outer(dataset.time_since_prev, decay_rates)
     )
     decay_factors = jnp.exp(decay_factor_exponents)
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
@@ -767,7 +770,7 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     term_per_exp = -jnp.expm1(decay_factor_exponents) / decay_rates
     integral_history = (prev_decayed_count * term_per_exp) @ weights
     interval_term = \
-        (dataset.elapsed * base_intensity) \
+        (dataset.time_since_prev * base_intensity) \
         + (kernel_factor * integral_history)
     chex.assert_tree_all_finite(interval_term)
 
@@ -966,7 +969,7 @@ def plot_results(start: datetime.datetime,
         )
         .with_columns(
             pl.col('curr_count').alias('actual_count'),
-            pl.col('elapsed').cast(float),
+            pl.col('time_since_prev').cast(float),
             (
                 pl.selectors.ends_with('_compensator')
                 .name.replace('_compensator', '_expected_count')
