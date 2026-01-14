@@ -1075,7 +1075,8 @@ def plot_point_process_qq(start: datetime.datetime,
 
     # KNOWN_LIMITATION: There are many timestamps with more than one event.
     # This is handled by introducing zero-valued compensators and should result
-    # in a poor fit to exponential distribution
+    # in a poor fit to exponential distribution. Jittering is not acceptable
+    # as it increases data size by too much
     extra_counts = (subset  # number of zero-compensators
                     .select((pl.col('curr_count') - 1).clip(lower_bound=0).sum())
                     .item())
