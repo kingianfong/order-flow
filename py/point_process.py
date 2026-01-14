@@ -50,7 +50,7 @@ def load_data(raw_data_dir: Path,
     df = (
         pl.scan_parquet(raw_data_dir)
         .filter(
-            pl.col('sym') == pl.lit(sym),
+            pl.col('sym') == sym,
             pl.col('date') >= start,
             pl.col('date') <= val_end,
         )
