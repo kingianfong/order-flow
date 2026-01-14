@@ -705,25 +705,74 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     )
 
 
-def plot_model_output(outputs: ModelOutput, input_df: pl.DataFrame) -> None:
+def plot_model_output(outputs: ModelOutput,
+                      input_df: pl.DataFrame,
+                      *,
+                      duration: str = '1s') -> None:
     df = (
         input_df
         .with_columns(
-            loglik=np.asarray(outputs.loglik),
-            intensity=np.asarray(outputs.forecast_intensity),
+            pl.col('curr_count').alias('actual_count'),
+            pl.col('time_since_prev').cast(float),
+            expected_count=np.asarray(outputs.compensator),
         )
-    )
-    display(df)
-    subset = (
-        df
         .filter(
-            pl.col('time').dt.date() == pl.col('time').dt.date().min(),
+            pl.col('time') < pl.col('time').min().dt.offset_by('5m'),
+        )
+        .group_by(pl.col('time').dt.truncate(duration), maintain_order=True)
+        .agg(
+            pl.col('hi_price').max(),
+            pl.col('lo_price').min(),
+            pl.col('actual_count').sum(),
+            pl.col('expected_count').sum(),
+        )
+        .with_columns(
+            err=(pl.col('actual_count') - pl.col('expected_count'))
+            / pl.col('expected_count').sqrt(),
+        )
+        .to_pandas()
+        .set_index('time')
+    )
+    start = df.index.min()
+    end = df.index.max()
+
+    f, axes = plt.subplots(2, 1, sharex=True, sharey=False, figsize=(8, 6))
+    title = '\n'.join(
+        (
+            f'counts over {duration} buckets',
+            f'[ {start} , {end} ]',
         )
     )
-    _, (ax1, ax2, ax3) = plt.subplots(3, 1, sharex=True)
-    ax1.scatter(subset['time'], subset[['curr_count']], alpha=0.05, marker='.')
-    ax2.plot(subset['time'], subset[['intensity']])
-    ax3.plot(subset['time'], subset[['loglik']])
+    f.suptitle(title)
+
+    count_ax = axes[0]
+    count_ax.set_title('actual')
+    count_ax.set_yscale('log')
+    count_ax.scatter(df.index, df['actual_count'],
+                     alpha=0.4, marker='+', c='C0')
+    count_ax.set_ylabel('actual count $y$', c='C0')
+
+    price_ax = count_ax.twinx()
+    price_ax.plot(df.index, df[['hi_price', 'lo_price']],
+                  alpha=0.6, drawstyle='steps-post', c='C1')
+    price_ax.set_ylabel('price (hi, lo)', c='C1')
+
+    expected_count_ax = axes[1]
+    expected_count_ax.set_yscale('log')
+    expected_count_ax.scatter(df.index, df['expected_count'],
+                              alpha=0.6, marker='+', c='C0')
+    expected_count_ax.set_ylabel('expected count $\\hat y$', c='C0')
+
+    err_ax = expected_count_ax.twinx()
+    err_ax.scatter(df.index, df['err'],
+                   alpha=0.4, marker='x', c='C2')
+    err_ax.set_ylabel(r'$(y - \hat y) / \sqrt{\hat y}$', c='C2')
+    err_ax.axhline(0.0, linestyle='--', c='C2', alpha=0.6)
+
+    for ax in axes:
+        ax.grid(True, which="both", ls="--", alpha=0.4)
+        ax.tick_params(axis='x', labelrotation=30)
+
     plt.tight_layout()
     plt.show()
 
