@@ -473,7 +473,7 @@ def softplus_inverse(x: ArrayLike) -> Array:
         x = jnp.array(x)
     # based on https://www.tensorflow.org/probability/api_docs/python/tfp/math/softplus_inverse
     threshold = jnp.log(jnp.finfo(x.dtype).eps) + 2.0
-    is_too_small = x < np.exp(threshold)
+    is_too_small = x < jnp.exp(threshold)
     is_too_large = x > -threshold
     too_small_value = jnp.log(x)
     too_large_value = x
