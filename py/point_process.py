@@ -529,8 +529,6 @@ class RbfParams(NamedTuple):
 def calc_rbf(params: RbfParams, dataset: Dataset) -> ModelOutput:
     intensity = jax.nn.softplus(params.sp_inv_base_rate
                                 + dataset.rbf_basis @ params.weights)
-    # diffs = params.weights - jnp.roll(params.weights, 1)
-
     return ModelOutput(
         point_term=dataset.curr_count * jnp.log(intensity),
         compensator=intensity * dataset.time_since_prev,
@@ -540,7 +538,6 @@ def calc_rbf(params: RbfParams, dataset: Dataset) -> ModelOutput:
             + jnp.square(params.sp_inv_base_rate) * 1e2
             + jnp.sum(jnp.square(params.weights)) * 1e2
             + jnp.square(jnp.sum(params.weights)) * 1e2
-            # + jnp.sum(jnp.square(diffs)) * 1e4
         ),
     )
 
