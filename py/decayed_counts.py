@@ -28,17 +28,12 @@ def get_scan_baseline(decay_factors: Array, counts: Array) -> Array:
     """Reference implementation using sequential jax.lax.scan."""
     @jax.jit
     def linear_scan_step(carry, xs):
-        decay_factor, count = xs
-        next_count = carry * decay_factor + count
-        return next_count, next_count
+        prev_decayed = carry
+        decay_factor, curr_count = xs
+        next_decayed = prev_decayed * decay_factor + curr_count
+        return next_decayed, next_decayed
 
-    # Handle broadcasting for baseline to match logic
-    if counts.ndim == 1 and decay_factors.ndim > 1:
-        counts = jnp.broadcast_to(counts[:, jnp.newaxis], decay_factors.shape)
-        init = jnp.zeros(decay_factors.shape[1])
-    else:
-        init = 0.0
-
+    init = jnp.zeros_like(decay_factors[0])
     _, expected = jax.lax.scan(linear_scan_step, init, (decay_factors, counts))
     return expected
 
@@ -63,8 +58,6 @@ def test_decayed_counts_correctness(seed, shape_type):
     actual = calculate_decayed_counts(decay_factors, counts)
     expected = get_scan_baseline(decay_factors, counts)
 
-    # Use higher tolerance for float32 accumulation if necessary,
-    # though allclose is usually fine.
     assert jnp.allclose(actual, expected)
 
 
