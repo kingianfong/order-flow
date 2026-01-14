@@ -10,6 +10,7 @@ from IPython.display import display
 from jax import Array
 from jax.flatten_util import ravel_pytree
 from jax.scipy.special import logit, gammaln
+from jax.typing import ArrayLike
 import chex
 import jax
 import jax.numpy as jnp
@@ -137,7 +138,7 @@ def calc_power_law_cache(curr_count: Array,
     )
     decay_factors = jnp.exp(decay_factor_exponents)
     decayed_count = calculate_decayed_counts(decay_factors, curr_count)
-    prev_decayed_count = jnp.roll(decayed_count, 1, axis=0) .at[0, :].set(0.0)
+    prev_decayed_count = jnp.roll(decayed_count, 1, axis=0).at[0, :].set(0.0)
 
     return PowerLawCache(
         decay_rates=decay_rates,
@@ -242,6 +243,7 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
                                       model_fn: ModelFn[Params],
                                       dataset: Dataset,
                                       show_hessian: bool,
+                                      force_plot: bool = False,
                                       verbose: bool = False) -> Params:
     timeout = datetime.timedelta(seconds=150)
     max_iter = 50
@@ -280,75 +282,93 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
     params = init_params
     state = opt.init(init_params)
 
-    stop_time = datetime.datetime.now() + timeout
+    start_time = datetime.datetime.now()
+    elapsed = datetime.timedelta()
+    n_iter = 0
     n_linesearch = 0
     params_hist = []
     losses_hist = []
     grads_hist = []
+    grad_norms = []
     converged = False
 
     # this loop may force syncs between GPU and CPU
-    for n_iter in range(max_iter):
+    while True:
         params, state, loss, grad = update((params, state), dataset=dataset)
         _, _, linesearch_state = state
+
         assert isinstance(linesearch_state, optax.ScaleByZoomLinesearchState), \
             f'{type(linesearch_state)=}'
         n_linesearch += int(linesearch_state.info.num_linesearch_steps)
+        grad_norm = optax.tree.norm(grad)
         params_hist.append(params)
         losses_hist.append(loss)
         grads_hist.append(grad)
+        grad_norms.append(grad_norm)
 
-        err = optax.tree.norm(grad)
-        if err <= tol:
+        if grad_norm <= tol:
             print(f'converged: {n_iter=}, {n_linesearch=}')
             converged = True
             break
 
-        if datetime.datetime.now() > stop_time:
-            print(f'timed out after {timeout}, {n_iter=}, {n_linesearch=}')
+        elapsed = datetime.datetime.now() - start_time
+        n_iter += 1
+        if n_iter == max_iter or elapsed > timeout:
+            print('did not converge')
             break
 
     labels = get_pytree_labels(params)
-    if not converged:
-        grad = optax.tree.get(state, 'grad')
-        err = optax.tree.norm(grad)
-        print(f'did not converge: {n_linesearch=}, {err=}')
+    if force_plot or not converged:
+        last_grad_norm = grad_norms[-1]
+        print(f'{converged=}, {n_iter=}, {n_linesearch=}, {elapsed=}')
+        print(f'{last_grad_norm=:.4f}')
 
         def _get_key(label):
             return re.sub(r'\[\d+\]', '[]', label)
 
+        metrics_df = pd.DataFrame(
+            dict(
+                loss=losses_hist,
+                grad_norm=grad_norms,
+            ),
+        )
         params_df = (
             pd.DataFrame(
                 list(ravel_pytree(p)[0] for p in params_hist),
                 columns=labels,
             )
             .rename(columns=lambda x: f'{x} values')
-            .astype(float)
         )
-
-        metrics_df = (
+        grads_df = (
             pd.DataFrame(
                 list(ravel_pytree(g)[0] for g in grads_hist),
                 columns=labels,
             )
             .rename(columns=lambda x: f'{x} grads')
-            .assign(loss=losses_hist)
-            .astype(float)
         )
-        optim_df = pd.concat([params_df, metrics_df], axis=1)
+        optim_df = (pd.concat([metrics_df, params_df, grads_df], axis=1)
+                    .astype(float))
 
-        col_keys = sorted({_get_key(col) for col in optim_df.columns})
-        n_rows = len(col_keys)
+        col_keys = {col: _get_key(col) for col in optim_df.columns}
+        unique_keys = sorted(set(col_keys.values()),
+                             key=lambda x: (x.startswith('.'), x.endswith('grads')))
+        n_rows = len(unique_keys)
         f, axes = plt.subplots(n_rows, 1, figsize=(8, n_rows*2))
-        key_to_ax = dict(zip(col_keys, axes))
+        key_to_ax = dict(zip(unique_keys, axes))
 
         f.suptitle('optimisation outputs')
         assert n_rows > 1
         for col in optim_df.columns:
+            if col.endswith('grads'):
+                color = 'C1'
+            elif col.endswith('values'):
+                color = 'C2'
+            else:
+                color = 'C0'
             key = _get_key(col)
             ax = key_to_ax[key]
-            ax.plot(optim_df[col], drawstyle='steps-post', label=col)
-            ax.set_title(key)
+            ax.set_title(key, color=color)
+            ax.plot(optim_df[col], drawstyle='steps-post')
             ax.grid(True, which="both", ls="--", alpha=0.2)
 
         plt.tight_layout()
@@ -403,61 +423,86 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
     return params
 
 
+def softplus_inverse(x: ArrayLike) -> Array:
+    if not isinstance(x, Array):
+        x = jnp.array(x)
+    # based on https://www.tensorflow.org/probability/api_docs/python/tfp/math/softplus_inverse
+    threshold = jnp.log(jnp.finfo(x.dtype).eps) + 2.0
+    is_too_small = x < np.exp(threshold)
+    is_too_large = x > -threshold
+    too_small_value = jnp.log(x)
+    too_large_value = x
+    x = jnp.where(is_too_small | is_too_large, jnp.ones_like(x), x)
+    y = x + jnp.log(-jnp.expm1(-x))
+    return jnp.where(is_too_small,
+                     too_small_value,
+                     jnp.where(is_too_large,
+                               too_large_value,
+                               y))
+
+
+assert jnp.allclose(
+    softplus_inverse(jax.nn.softplus(jnp.arange(10))),
+    jnp.arange(10),
+)
+
+
 class ConstantIntensityParams(NamedTuple):
-    log_base_intensity: Array
+    sp_inv_base_intensity: Array
 
 
 def calc_const(params: ConstantIntensityParams, dataset: Dataset) -> ModelOutput:
-    intensity = jnp.exp(params.log_base_intensity)
+    intensity = jax.nn.softplus(params.sp_inv_base_intensity)
+    log_intensity = jnp.log(intensity)
     return ModelOutput(
         forecast_intensity=intensity * jnp.ones_like(dataset.time_since_prev),
-        point_term=dataset.curr_count * params.log_base_intensity,
+        point_term=dataset.curr_count * log_intensity,
         compensator=intensity * dataset.time_since_prev,
     )
 
 
 fitted_constant_intensity_params = run_optim(
     init_params=ConstantIntensityParams(
-        log_base_intensity=jnp.log(closed_form_intensity + 1e-4),
+        sp_inv_base_intensity=softplus_inverse(
+            closed_form_intensity + 1e-4),
     ),
     model_fn=calc_const,
     dataset=DATASET,
     show_hessian=False,
 )
-assert jnp.allclose(fitted_constant_intensity_params.log_base_intensity,
-                    jnp.log(closed_form_intensity))
+assert jnp.allclose(fitted_constant_intensity_params.sp_inv_base_intensity,
+                    softplus_inverse(closed_form_intensity))
 
 
 # %%
 
 
 class RbfParams(NamedTuple):
-    log_base_intensity: Array
+    sp_inv_base_rate: Array
     weights: Array = jnp.zeros((N_RBF_CENTERS,),) + 0.1
 
 
 def calc_rbf(params: RbfParams, dataset: Dataset) -> ModelOutput:
-    log_intensity_factor = dataset.rbf_basis @ params.weights
-    log_intensity = params.log_base_intensity + log_intensity_factor
-    intensity = jnp.exp(log_intensity)
+    intensity = jax.nn.softplus(params.sp_inv_base_rate
+                                + dataset.rbf_basis @ params.weights)
     return ModelOutput(
-        point_term=dataset.curr_count * log_intensity,
+        point_term=dataset.curr_count * jnp.log(intensity),
         compensator=intensity * dataset.time_since_prev,
         forecast_intensity=intensity,
         reg_penalty=(
-            jnp.sum(jnp.square(params.weights)) * 1e6
+            jnp.zeros(())
+            + jnp.sum(jnp.square(params.weights)) * 1e5
+            + jnp.square(jnp.sum(params.weights)) * 1e5
         ),
     )
 
 
-def plot_rbf(log_base_intensity: Array, weights: Array) -> None:
+def plot_rbf(sp_inv_base_intensity: Array, weights: Array) -> None:
     # exceed [0, 24] to verify periodic boundary conditions
     time_of_day = jnp.linspace(-4, 28, 500, endpoint=False)
     bases = calc_rbf_basis(time_of_day)
-    log_factor = bases @ weights
-    base_intensity = jnp.exp(log_base_intensity).item()
-    intensity = jnp.exp(log_base_intensity + log_factor)
-    per_second = base_intensity * ONE_SECOND
+    intensity = jax.nn.softplus(sp_inv_base_intensity + bases @ weights)
+    per_second = jax.nn.softplus(sp_inv_base_intensity) * ONE_SECOND
     per_basis = bases * weights
 
     f, axes = plt.subplots(2, 1, sharex=True)
@@ -468,7 +513,8 @@ def plot_rbf(log_base_intensity: Array, weights: Array) -> None:
 
     ax1, ax2 = axes
     ax1.plot(time_of_day, intensity)
-    ax1.axhline(base_intensity, label=f'baseline $\\approx${per_second:.2f}/s',
+    ax1.axhline(jax.nn.softplus(sp_inv_base_intensity),
+                label=f'baseline $\\approx${per_second:.2f}/s',
                 c='g', alpha=0.4, linestyle='-')
     ax1.set_ylabel('intensity')
     ax1.legend(loc='upper left')
@@ -481,9 +527,10 @@ def plot_rbf(log_base_intensity: Array, weights: Array) -> None:
 
 
 init_rbf_params = RbfParams(
-    log_base_intensity=fitted_constant_intensity_params.log_base_intensity,
+    sp_inv_base_rate=fitted_constant_intensity_params.sp_inv_base_intensity,
 )
-plot_rbf(init_rbf_params.log_base_intensity, init_rbf_params.weights)
+plot_rbf(init_rbf_params.sp_inv_base_rate,
+         init_rbf_params.weights)
 
 
 # %%
@@ -494,8 +541,10 @@ fitted_rbf_params = run_optim(
     model_fn=calc_rbf,
     dataset=DATASET,
     show_hessian=True,
+    force_plot=True,
 )
-plot_rbf(fitted_rbf_params.log_base_intensity, fitted_rbf_params.weights)
+plot_rbf(fitted_rbf_params.sp_inv_base_rate,
+         fitted_rbf_params.weights)
 
 
 # %%
@@ -503,9 +552,10 @@ plot_rbf(fitted_rbf_params.log_base_intensity, fitted_rbf_params.weights)
 
 # exponential decay kernel
 class HawkesParams(NamedTuple):
-    log_base_intensity: Array
+    sp_inv_base_intensity: Array
     logit_branching_ratio: Array = logit(0.9)
-    log_decay_rate: Array = jnp.log(1 / ONE_MILLISECOND)  # log(1 / avg_life)
+    # 1 / avg_life
+    sp_inv_decay_rate: Array = softplus_inverse(1.0 / ONE_MILLISECOND)
 
 
 def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
@@ -517,9 +567,9 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     assert jnp.all(dataset.curr_count > 0.0)
     assert jnp.all(dataset.time_since_prev > 0.0)
 
-    base_intensity = jnp.exp(params.log_base_intensity)
+    base_intensity = jax.nn.softplus(params.sp_inv_base_intensity)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
-    decay_rate = jnp.exp(params.log_decay_rate)
+    decay_rate = jax.nn.softplus(params.sp_inv_decay_rate)
 
     def step(carry, x):
         decayed_count = carry
@@ -562,9 +612,9 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
 
 
 def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
-    base_intensity = jnp.exp(params.log_base_intensity)
+    base_intensity = jax.nn.softplus(params.sp_inv_base_intensity)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
-    decay_rate = jnp.exp(params.log_decay_rate)
+    decay_rate = jax.nn.softplus(params.sp_inv_decay_rate)
 
     chex.assert_tree_all_finite(base_intensity)
     chex.assert_tree_all_finite(branching_ratio)
@@ -590,6 +640,9 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     p2 = gammaln(a_over_d + dataset.curr_count)
     p3 = -gammaln(a_over_d)
     point_term = p1 + p2 + p3
+    chex.assert_tree_all_finite(p1)
+    chex.assert_tree_all_finite(p2)
+    chex.assert_tree_all_finite(p3)
     chex.assert_tree_all_finite(point_term)
 
     forecast_intensity = base_intensity \
@@ -599,9 +652,10 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
         compensator=compensator,
         forecast_intensity=forecast_intensity,
         reg_penalty=(
-            jnp.square(params.log_base_intensity) * 1e6
-            + jnp.square(params.logit_branching_ratio) * 1e6
-            + jnp.square(params.log_decay_rate) * 1e6
+            jnp.zeros(())
+            + jnp.square(params.sp_inv_base_intensity) * 1e5
+            + jnp.square(params.logit_branching_ratio) * 1e5
+            + jnp.square(params.sp_inv_decay_rate) * 1e5
         ),
     )
 
@@ -636,6 +690,7 @@ def print_params(params: Any) -> None:
     prefix_transforms = dict(
         log_=jnp.exp,
         logit_=jax.nn.sigmoid,
+        sp_inv_=jax.nn.softplus,
     )
     for k, v in prev.items():
         for prefix, transform in prefix_transforms.items():
@@ -651,11 +706,9 @@ def show_hawkes(params: HawkesParams,
 
     outputs = chex.chexify(calc_hawkes)(params, dataset)
     assert jnp.allclose(outputs.forecast_intensity,
-                        baseline_outputs.forecast_intensity,
-                        rtol=1e-4, atol=1e-4)
+                        baseline_outputs.forecast_intensity)
     assert jnp.allclose(outputs.compensator,
-                        baseline_outputs.compensator,
-                        rtol=1e-4, atol=1e-4)
+                        baseline_outputs.compensator)
     assert jnp.allclose(outputs.point_term,
                         baseline_outputs.point_term,
                         rtol=1e-3, atol=1e-2)
@@ -665,7 +718,7 @@ def show_hawkes(params: HawkesParams,
 
 
 init_hawkes_params = HawkesParams(
-    log_base_intensity=fitted_constant_intensity_params.log_base_intensity,
+    sp_inv_base_intensity=fitted_constant_intensity_params.sp_inv_base_intensity,
 )
 show_hawkes(init_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 
@@ -687,17 +740,17 @@ show_hawkes(fitted_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 
 
 class RbfHawkesParams(NamedTuple):
-    log_base_intensity: Array
+    sp_inv_base_intensity: Array
     logit_branching_ratio: Array
-    log_decay_rate: Array
+    sp_inv_decay_rate: Array
     weights: Array
 
 
 def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
-    log_factor = dataset.rbf_basis @ params.weights
-    base_intensity = jnp.exp(params.log_base_intensity + log_factor)
+    base_intensity = jax.nn.softplus(params.sp_inv_base_intensity
+                                     + dataset.rbf_basis @ params.weights)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
-    decay_rate = jnp.exp(params.log_decay_rate)
+    decay_rate = jax.nn.softplus(params.sp_inv_decay_rate)
     decay_factors = jnp.exp(-decay_rate * dataset.time_since_prev)
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
 
@@ -706,15 +759,15 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
     interval_term = \
         dataset.time_since_prev * base_intensity \
         + branching_ratio * prev_decayed_count * integral_over_interval
+    chex.assert_tree_all_finite(interval_term)
 
     # rising factorial / pochhammer
     curr_minus_count = prev_decayed_count * decay_factors
     d = branching_ratio * decay_rate
     a_over_d = (base_intensity / d) + curr_minus_count
-    p1 = dataset.curr_count * jnp.log(d)
-    p2 = gammaln(a_over_d + dataset.curr_count)
-    p3 = -gammaln(a_over_d)
-    point_term = p1 + p2 + p3
+    point_term = dataset.curr_count * jnp.log(d) \
+        + gammaln(a_over_d + dataset.curr_count) \
+        - gammaln(a_over_d)
     chex.assert_tree_all_finite(point_term)
 
     forecast_intensity = base_intensity \
@@ -724,10 +777,11 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
         compensator=interval_term,
         forecast_intensity=forecast_intensity,
         reg_penalty=(
-            jnp.square(params.log_base_intensity) * 1e6
-            + jnp.square(params.logit_branching_ratio) * 1e6
-            + jnp.square(params.log_decay_rate) * 1e6
-            + jnp.sum(jnp.square(params.weights)) * 1e6
+            jnp.square(params.sp_inv_base_intensity) * 1e5
+            + jnp.square(params.logit_branching_ratio) * 1e5
+            + jnp.square(params.sp_inv_decay_rate) * 1e5
+            + jnp.sum(jnp.square(params.weights)) * 1e5
+            + jnp.square(jnp.sum(params.weights)) * 1e5
         ),
     )
 
@@ -737,14 +791,14 @@ def show_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset,
     outputs = chex.chexify(calc_rbf_hawkes)(params, dataset)
     print_params(params)
     plot_model_output(outputs, input_df)
-    plot_rbf(log_base_intensity=params.log_base_intensity,
+    plot_rbf(sp_inv_base_intensity=params.sp_inv_base_intensity,
              weights=params.weights)
 
 
 init_rbf_hawkes = RbfHawkesParams(
-    log_base_intensity=fitted_hawkes_params.log_base_intensity,
+    sp_inv_base_intensity=fitted_hawkes_params.sp_inv_base_intensity,
     logit_branching_ratio=fitted_hawkes_params.logit_branching_ratio,
-    log_decay_rate=fitted_hawkes_params.log_decay_rate,
+    sp_inv_decay_rate=fitted_hawkes_params.sp_inv_decay_rate,
     weights=fitted_rbf_params.weights,
 )
 show_rbf_hawkes(init_rbf_hawkes, DATASET, INPUT_DF.filter('is_train'))
@@ -757,7 +811,7 @@ fitted_rbf_hawkes_params = run_optim(
     init_params=init_rbf_hawkes,
     model_fn=calc_rbf_hawkes,
     dataset=DATASET,
-    show_hessian=False,
+    show_hessian=True,
 )
 show_rbf_hawkes(fitted_rbf_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 
@@ -766,9 +820,9 @@ show_rbf_hawkes(fitted_rbf_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 
 
 class PowerLawHawkesParams(NamedTuple):
-    log_base_intensity: Array
+    sp_inv_base_intensity: Array
     logit_branching_ratio: Array
-    log_beta_raw: Array = jnp.log(0.2)
+    sp_inv_beta_raw: Array = softplus_inverse(0.2)
 
 
 def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> ModelOutput:
@@ -776,9 +830,9 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     # omega^{-1} roughly corresponds to where the plateau crosses over to
     # power-law tail
     omega = 1.0 / ONE_MILLISECOND
-    base_intensity = jnp.exp(params.log_base_intensity)
+    base_intensity = jax.nn.softplus(params.sp_inv_base_intensity)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
-    beta = jnp.exp(params.log_beta_raw * 0.1)
+    beta = jax.nn.softplus(params.sp_inv_beta_raw)
     chex.assert_tree_all_finite(base_intensity)
     chex.assert_tree_all_finite(branching_ratio)
     chex.assert_tree_all_finite(beta)
@@ -789,12 +843,16 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
         beta=beta,
         rates=cache.decay_rates,
     )
+    chex.assert_trees_all_close(jnp.sum(weights), jnp.array(1.0))
+
     kernel_integral = jnp.sum(weights / cache.decay_rates)
     kernel_factor = branching_ratio / kernel_integral
     compensator_integral = cache.decay_integral @ weights
     compensator = \
         dataset.time_since_prev * base_intensity \
         + kernel_factor * compensator_integral
+    chex.assert_tree_all_finite(kernel_integral)
+    chex.assert_tree_all_finite(kernel_factor)
     chex.assert_tree_all_finite(compensator)
 
     # rising factorial / pochhammer
@@ -806,6 +864,9 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
         dataset.curr_count * jnp.log(total_d) \
         + gammaln(a_over_d + dataset.curr_count) \
         - gammaln(a_over_d)
+    chex.assert_tree_all_finite(total_a)
+    chex.assert_tree_all_finite(total_d)
+    chex.assert_tree_all_finite(a_over_d)
     chex.assert_tree_all_finite(point_term)
 
     forecast_intensity = base_intensity \
@@ -816,9 +877,10 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
         compensator=compensator,
         forecast_intensity=forecast_intensity,
         reg_penalty=(
-            jnp.square(params.log_base_intensity) * 1e4
-            + jnp.square(params.logit_branching_ratio) * 1e4
-            + jnp.square(params.log_beta_raw) * 1e4
+            jnp.zeros(())
+            + jnp.square(params.sp_inv_base_intensity) * 1e5
+            + jnp.square(params.logit_branching_ratio) * 1e5
+            + jnp.square(params.sp_inv_beta_raw) * 1e5
         ),
     )
 
@@ -832,7 +894,7 @@ def show_power_law_hawkes(params: PowerLawHawkesParams,
 
 
 init_pl_hawkes_params = PowerLawHawkesParams(
-    log_base_intensity=fitted_hawkes_params.log_base_intensity,
+    sp_inv_base_intensity=fitted_hawkes_params.sp_inv_base_intensity,
     logit_branching_ratio=fitted_hawkes_params.logit_branching_ratio,
 )
 show_power_law_hawkes(init_pl_hawkes_params, DATASET,
