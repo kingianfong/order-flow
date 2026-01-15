@@ -251,19 +251,20 @@ def calc_robust_var[Params: chex.ArrayTree](params: Params,
 
     flat_params, unravel = ravel_pytree(params)
 
-    def flat_loss_fn_no_reg(p):
+    def flat_loss_with_reg(p, dataset):
         out = model_fn(unravel(p), dataset)
-        return -jnp.mean(out.loglik)
+        return -jnp.mean(out.loglik) + out.reg_penalty / dataset.n_samples
 
-    hess = chex.chexify(jax.hessian(flat_loss_fn_no_reg))(flat_params)
+    hess = chex.chexify(jax.hessian(flat_loss_with_reg))(flat_params, dataset)
     bread = jnp.linalg.pinv(hess)
 
-    def per_obs_grad(p):
+    def per_obs_loss_no_reg(p, dataset):
         out = model_fn(unravel(p), dataset)
         return out.loglik
 
     # (N_samples, N_params)
-    jacobian = chex.chexify(jax.jacfwd(per_obs_grad))(flat_params)
+    jacobian = chex.chexify(jax.jacfwd(
+        per_obs_loss_no_reg))(flat_params, dataset)
     # Outer product of gradients: (N_params, N_params)
     meat = (jacobian.T @ jacobian) / dataset.n_samples
     # Scale by 1/N because B is based on the mean loss
