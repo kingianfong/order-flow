@@ -32,8 +32,8 @@ import power_law_approx
 RAW_DATA_DIR = Path.cwd().parent / 'data/raw'
 SYM = 'BTCUSDT'
 DATA_START = datetime.datetime(2025, 9, 1)
-TRAIN_END = datetime.datetime(2025, 9, 30)
-VAL_END = datetime.datetime(2025, 10, 15)
+TRAIN_END = datetime.datetime(2025, 9, 10)
+VAL_END = datetime.datetime(2025, 9, 15)
 
 
 # %%
@@ -244,38 +244,93 @@ class ModelOutput(NamedTuple):
 type ModelFn[Params: chex.ArrayTree] = Callable[[Params, Dataset], ModelOutput]
 
 
-def calc_robust_var[Params: chex.ArrayTree](params: Params,
-                                            dataset: Dataset,
-                                            model_fn: ModelFn[Params]):
-    """Sandwich estimator: Var = B^-1 @ A @ B^-1"""
-
+def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
+                                                 dataset: Dataset,
+                                                 model_fn: ModelFn[Params]) -> None:
     flat_params, unravel = ravel_pytree(params)
+    n_params = len(flat_params)
+    assert n_params <= 1_000, \
+        f'{n_params=}, hessian is memory intensive'
+    labels = get_pytree_labels(params)
 
-    def flat_loss_with_reg(p, dataset):
-        out = model_fn(unravel(p), dataset)
-        return -jnp.mean(out.loglik) + out.reg_penalty / dataset.n_samples
+    def per_obs_loss(flat_p, dataset):
+        out = model_fn(unravel(flat_p), dataset)
+        return -out.loglik + out.reg_penalty / dataset.n_samples
 
-    hess = chex.chexify(jax.hessian(flat_loss_with_reg))(flat_params, dataset)
-    bread = jnp.linalg.pinv(hess)
+    def flat_loss(flat_p, dataset):
+        return jnp.mean(per_obs_loss(flat_p, dataset))
 
-    def per_obs_loss_no_reg(p, dataset):
-        out = model_fn(unravel(p), dataset)
-        return out.loglik
+    calc_hess = chex.chexify(jax.jit(jax.hessian(flat_loss)))
+    calc_jacobian = chex.chexify(jax.jit(jax.jacfwd(per_obs_loss)))
 
-    # (N_samples, N_params)
-    jacobian = chex.chexify(jax.jacfwd(
-        per_obs_loss_no_reg))(flat_params, dataset)
-    # Outer product of gradients: (N_params, N_params)
+    print('calculating hessian')
+    start_time = datetime.datetime.now()
+    hess_mat = calc_hess(flat_params, dataset=dataset)
+    hess_mat.block_until_ready()
+    print(f'hessian took {datetime.datetime.now() - start_time}')
+
+    eigvals = jnp.linalg.eigvalsh(hess_mat)
+    if jnp.any(eigvals <= 0):
+        print("Warning: Hessian not positive definite. Standard errors invalid.")
+
+    cond = jnp.linalg.cond(hess_mat).item()
+    inv_hess_mat = jnp.linalg.pinv(hess_mat)
+    diag_sqrt = jnp.sqrt(jnp.diag(inv_hess_mat))
+    hess_se = diag_sqrt / jnp.sqrt(dataset.n_samples)
+    hess_corr_mat = inv_hess_mat / jnp.outer(diag_sqrt, diag_sqrt)
+    mask = np.triu(np.ones_like(hess_corr_mat, dtype=bool))
+
+    print('plotting hessian')
+    start_time = datetime.datetime.now()
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(
+        data=pd.DataFrame(hess_corr_mat, index=labels, columns=labels),
+        mask=mask, center=0.0, robust=False,
+    )
+    plt.title(f"Inverse Hessian Matrix {cond=:.2f}")
+    plt.show()
+    print(f'plotting took {datetime.datetime.now() - start_time}')
+
+    print('calculating sandwich estimator errors')  # Var = B^-1 @ A @ B^-1
+    start_time = datetime.datetime.now()
+    jacobian = calc_jacobian(flat_params, dataset)
+    assert jacobian.shape == (dataset.n_samples, n_params), \
+        f'{jacobian.shape=}, {dataset.n_samples=}, {n_params=}'
     meat = (jacobian.T @ jacobian) / dataset.n_samples
-    # Scale by 1/N because B is based on the mean loss
+    bread = inv_hess_mat
     robust_var = (bread @ meat @ bread) / dataset.n_samples
-    return robust_var
+    robust_se = jnp.sqrt(jnp.diag(robust_var))
+    robust_se.block_until_ready()
+    print(f'errors took {datetime.datetime.now() - start_time}')
+
+    mean = flat_params
+    z_score = mean / robust_se
+    p_value = erfc(jnp.abs(z_score) / jnp.sqrt(2))
+    meff = robust_se / hess_se
+
+    display(
+        pd.DataFrame(
+            dict(
+                mean=mean,
+                hess_se=hess_se,
+                robust_se=robust_se,
+                z_score=z_score,
+                p_value=map(lambda x: f'{x:.4%}', p_value),
+                meff=meff,
+            ),
+            index=labels,
+        )
+        .style
+        .background_gradient(
+            subset=['hess_se', 'robust_se', 'meff'],
+        )
+    )
 
 
 def run_optim[Params: chex.ArrayTree](init_params: Params,
                                       model_fn: ModelFn[Params],
                                       dataset: Dataset,
-                                      show_hessian: bool,
+                                      plot_diagnostics: bool,
                                       force_plot: bool = False,
                                       verbose: bool = False) -> Params:
     timeout = datetime.timedelta(seconds=150)
@@ -408,68 +463,8 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
         plt.show()
         display(optim_df)
 
-    # assume -mean(loglik) insetad of -sum(loglik)
-    if show_hessian:
-        flat_params, unravel = ravel_pytree(params)
-
-        def flat_loss_fn(flat_p, dataset):
-            return loss_fn(unravel(flat_p), dataset)
-
-        print('calculating hessian')
-        start_time = datetime.datetime.now()
-        calc_hess = chex.chexify(jax.jit(jax.hessian(flat_loss_fn)))
-        hess_mat = calc_hess(flat_params, dataset=dataset)
-        print(f'hessian took {datetime.datetime.now() - start_time}')
-
-        eigvals = jnp.linalg.eigvalsh(hess_mat)
-        if jnp.any(eigvals <= 0):
-            print("Warning: Hessian not positive definite. Standard errors invalid.")
-
-        cond = jnp.linalg.cond(hess_mat).item()
-        inv_hess_mat = jnp.linalg.pinv(hess_mat)
-        diag_sqrt = jnp.sqrt(jnp.diag(inv_hess_mat))
-        hess_se = diag_sqrt / jnp.sqrt(dataset.n_samples)
-        corr_mat = inv_hess_mat / jnp.outer(diag_sqrt, diag_sqrt)
-        mask = np.triu(np.ones_like(corr_mat, dtype=bool))
-
-        print('plotting hessian')
-        start_time = datetime.datetime.now()
-        plt.figure(figsize=(8, 6))
-        sns.heatmap(
-            data=pd.DataFrame(corr_mat, index=labels, columns=labels),
-            mask=mask, center=0.0, robust=False,
-        )
-        plt.title(f"Inverse Hessian Matrix {cond=:.2f}")
-        plt.show()
-        print(f'plotting took {datetime.datetime.now() - start_time}')
-
-        print('calculating errors')
-        start_time = datetime.datetime.now()
-        robust_var = calc_robust_var(params, dataset, model_fn)
-        robust_se = jnp.sqrt(jnp.diag(robust_var))
-        print(f'errors took {datetime.datetime.now() - start_time}')
-
-        mean = flat_params
-        z_score = mean / robust_se
-        p_value = erfc(jnp.abs(z_score) / jnp.sqrt(2))
-        meff = robust_se / hess_se
-        display(
-            pd.DataFrame(
-                dict(
-                    mean=mean,
-                    hess_se=hess_se,
-                    robust_se=robust_se,
-                    z_score=z_score,
-                    p_value=map(lambda x: f'{x:.4%}', p_value),
-                    meff=meff,
-                ),
-                index=labels,
-            )
-            .style
-            .background_gradient(
-                subset=['hess_se', 'robust_se', 'meff'],
-            )
-        )
+    if plot_diagnostics:
+        plot_fit_diagnostics(params, dataset, model_fn)
 
     return params
 
@@ -519,7 +514,7 @@ fitted_constant_intensity_params = run_optim(
     ),
     model_fn=calc_const,
     dataset=DATASET,
-    show_hessian=False,
+    plot_diagnostics=False,
 )
 assert jnp.allclose(fitted_constant_intensity_params.sp_inv_base_intensity,
                     softplus_inverse(closed_form_intensity))
@@ -592,7 +587,7 @@ fitted_rbf_params = run_optim(
     init_params=init_rbf_params,
     model_fn=calc_rbf,
     dataset=DATASET,
-    show_hessian=True,
+    plot_diagnostics=True,
     force_plot=True,
 )
 plot_rbf(fitted_rbf_params.sp_inv_base_rate,
@@ -831,7 +826,7 @@ fitted_hawkes_params = run_optim(
     init_params=init_hawkes_params,
     model_fn=calc_hawkes,
     dataset=DATASET,
-    show_hessian=True,
+    plot_diagnostics=True,
 )
 hawkes_outputs = calc_hawkes(fitted_hawkes_params, DATASET)
 show_hawkes(fitted_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
@@ -912,7 +907,7 @@ fitted_rbf_hawkes_params = run_optim(
     init_params=init_rbf_hawkes,
     model_fn=calc_rbf_hawkes,
     dataset=DATASET,
-    show_hessian=True,
+    plot_diagnostics=True,
 )
 show_rbf_hawkes(fitted_rbf_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 
@@ -1009,7 +1004,7 @@ fitted_power_law_hawkes_params = run_optim(
     init_params=init_pl_hawkes_params,
     model_fn=calc_power_law_hawkes,
     dataset=DATASET,
-    show_hessian=True,
+    plot_diagnostics=True,
 )
 show_power_law_hawkes(fitted_power_law_hawkes_params,
                       DATASET, INPUT_DF.filter('is_train'))
