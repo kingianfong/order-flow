@@ -9,7 +9,7 @@ import re
 from IPython.display import display
 from jax import Array
 from jax.flatten_util import ravel_pytree
-from jax.scipy.special import logit, gammaln, erfc
+from jax.scipy.special import logit, gammaln
 from jax.typing import ArrayLike
 import chex
 import jax
@@ -298,6 +298,7 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
         f'{jacobian.shape=}, {dataset.n_samples=}, {n_params=}'
     meat = (jacobian.T @ jacobian) / dataset.n_samples
     bread = inv_hess_mat
+    # aka godambe information matrix
     robust_var = (bread @ meat @ bread) / dataset.n_samples
     robust_se = jnp.sqrt(jnp.diag(robust_var))
     robust_se.block_until_ready()
@@ -305,8 +306,8 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
 
     mean = flat_params
     z_score = mean / robust_se
-    p_value = erfc(jnp.abs(z_score) / jnp.sqrt(2))
-    meff = robust_se / hess_se
+    p_value = 2 * jax.scipy.stats.norm.sf(jnp.abs(z_score))
+    se_ratio = robust_se / hess_se
 
     display(
         pd.DataFrame(
@@ -315,14 +316,24 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
                 hess_se=hess_se,
                 robust_se=robust_se,
                 z_score=z_score,
-                p_value=map(lambda x: f'{x:.4%}', p_value),
-                meff=meff,
+                p_value=p_value,
+                se_ratio=se_ratio,
             ),
             index=labels,
         )
         .style
         .background_gradient(
-            subset=['hess_se', 'robust_se', 'meff'],
+            subset=['hess_se', 'robust_se', 'se_ratio'],
+        )
+        .format(
+            dict(
+                mean='{:.4f}',
+                hess_se='{:.4f}',
+                robust_se='{:.4f}',
+                z_score='{:.2f}',
+                p_value='{:.2%}',
+                se_ratio='{:.4f}',
+            )
         )
     )
 
