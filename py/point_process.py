@@ -669,6 +669,19 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
 # %%
 
 
+def point_loglik_for_batch(exog_intensity: Array,
+                           counts_decayed_until_batch: Array,
+                           jump_size: Array,
+                           batch_size: Array) -> Array:
+    # rising factorial / pochhammer:
+    # sum( log(a + i * d) ) = n log(d) + gammaln(a / d + n) - gammaln(a / d)
+    # a = exog_intensity + jump_size * counts_decayed_until_batch
+    d = jump_size
+    a_over_d = exog_intensity / jump_size + counts_decayed_until_batch
+    n = batch_size
+    return n * jnp.log(d) + gammaln(a_over_d + n) - gammaln(a_over_d)
+
+
 def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     base_intensity = jax.nn.softplus(params.sp_inv_base_intensity)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
@@ -690,17 +703,12 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
         + branching_ratio * prev_decayed_count * integral_over_interval
     chex.assert_tree_all_finite(compensator)
 
-    # rising factorial / pochhammer
-    curr_minus_count = prev_decayed_count * decay_factors
-    d = branching_ratio * decay_rate
-    a_over_d = (base_intensity / d) + curr_minus_count
-    p1 = dataset.curr_count * jnp.log(d)
-    p2 = gammaln(a_over_d + dataset.curr_count)
-    p3 = -gammaln(a_over_d)
-    point_term = p1 + p2 + p3
-    chex.assert_tree_all_finite(p1)
-    chex.assert_tree_all_finite(p2)
-    chex.assert_tree_all_finite(p3)
+    point_term = point_loglik_for_batch(
+        exog_intensity=base_intensity,
+        counts_decayed_until_batch=prev_decayed_count * decay_factors,
+        jump_size=branching_ratio * decay_rate,
+        batch_size=dataset.curr_count,
+    )
     chex.assert_tree_all_finite(point_term)
 
     forecast_intensity = base_intensity \
@@ -721,7 +729,8 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
 def plot_model_output(outputs: ModelOutput,
                       input_df: pl.DataFrame,
                       *,
-                      duration: str = '1s') -> None:
+                      bucket_len: str = '1s',
+                      duration: str = '5m') -> None:
     df = (
         input_df
         .with_columns(
@@ -730,9 +739,9 @@ def plot_model_output(outputs: ModelOutput,
             expected_count=np.asarray(outputs.compensator),
         )
         .filter(
-            pl.col('time') < pl.col('time').min().dt.offset_by('5m'),
+            pl.col('time') < pl.col('time').min().dt.offset_by(duration),
         )
-        .group_by(pl.col('time').dt.truncate(duration), maintain_order=True)
+        .group_by(pl.col('time').dt.truncate(bucket_len), maintain_order=True)
         .agg(
             pl.col('hi_price').max(),
             pl.col('lo_price').min(),
@@ -752,7 +761,7 @@ def plot_model_output(outputs: ModelOutput,
     f, axes = plt.subplots(2, 1, sharex=True, sharey=False, figsize=(8, 6))
     title = '\n'.join(
         (
-            f'counts over {duration} buckets',
+            f'counts over {bucket_len} buckets in the first {duration}',
             f'[ {start} , {end} ]',
         )
     )
@@ -868,13 +877,12 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
         + branching_ratio * prev_decayed_count * integral_over_interval
     chex.assert_tree_all_finite(interval_term)
 
-    # rising factorial / pochhammer
-    curr_minus_count = prev_decayed_count * decay_factors
-    d = branching_ratio * decay_rate
-    a_over_d = (base_intensity / d) + curr_minus_count
-    point_term = dataset.curr_count * jnp.log(d) \
-        + gammaln(a_over_d + dataset.curr_count) \
-        - gammaln(a_over_d)
+    point_term = point_loglik_for_batch(
+        exog_intensity=base_intensity,
+        counts_decayed_until_batch=prev_decayed_count * decay_factors,
+        jump_size=branching_ratio * decay_rate,
+        batch_size=dataset.curr_count,
+    )
     chex.assert_tree_all_finite(point_term)
 
     forecast_intensity = base_intensity \
@@ -929,7 +937,7 @@ show_rbf_hawkes(fitted_rbf_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 class PowerLawHawkesParams(NamedTuple):
     sp_inv_base_intensity: Array
     logit_branching_ratio: Array
-    sp_inv_beta_raw: Array = softplus_inverse(0.2)
+    sp_inv_beta: Array = softplus_inverse(0.2)
 
 
 def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> ModelOutput:
@@ -939,45 +947,39 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     omega = 1.0 / ONE_MILLISECOND
     base_intensity = jax.nn.softplus(params.sp_inv_base_intensity)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
-    beta = jax.nn.softplus(params.sp_inv_beta_raw)
+    beta = jax.nn.softplus(params.sp_inv_beta)
     chex.assert_tree_all_finite(base_intensity)
     chex.assert_tree_all_finite(branching_ratio)
     chex.assert_tree_all_finite(beta)
 
     cache = dataset.power_law_cache
-    weights = power_law_approx.calc_weights(
+    raw_weights = power_law_approx.calc_weights(
         omega=omega,
         beta=beta,
         rates=cache.decay_rates,
     )
-    chex.assert_trees_all_close(jnp.sum(weights), jnp.array(1.0))
+    chex.assert_trees_all_close(jnp.sum(raw_weights), jnp.array(1.0))
 
-    kernel_integral = jnp.sum(weights / cache.decay_rates)
-    kernel_factor = branching_ratio / kernel_integral
-    compensator_integral = cache.decay_integral @ weights
+    # each of the individual exponential decays sum to 1 / decay_rate
+    actual_basis_integral = jnp.sum(raw_weights / cache.decay_rates)
+    jump_size = branching_ratio / actual_basis_integral
+
+    compensator_integral = cache.decay_integral @ raw_weights
     compensator = \
         dataset.time_since_prev * base_intensity \
-        + kernel_factor * compensator_integral
-    chex.assert_tree_all_finite(kernel_integral)
-    chex.assert_tree_all_finite(kernel_factor)
+        + jump_size * compensator_integral
     chex.assert_tree_all_finite(compensator)
 
-    # rising factorial / pochhammer
-    total_a = base_intensity \
-        + kernel_factor * (cache.curr_minus_count @ weights)
-    total_d = kernel_factor  # weights sum to 1
-    a_over_d = total_a / total_d
-    point_term = \
-        dataset.curr_count * jnp.log(total_d) \
-        + gammaln(a_over_d + dataset.curr_count) \
-        - gammaln(a_over_d)
-    chex.assert_tree_all_finite(total_a)
-    chex.assert_tree_all_finite(total_d)
-    chex.assert_tree_all_finite(a_over_d)
+    point_term = point_loglik_for_batch(
+        exog_intensity=base_intensity,
+        counts_decayed_until_batch=cache.curr_minus_count @ raw_weights,
+        jump_size=jump_size,
+        batch_size=dataset.curr_count,
+    )
     chex.assert_tree_all_finite(point_term)
 
     forecast_intensity = base_intensity \
-        + kernel_factor * cache.decayed_count @ weights
+        + jump_size * cache.decayed_count @ raw_weights
 
     return ModelOutput(
         point_term=point_term,
