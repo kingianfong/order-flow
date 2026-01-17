@@ -32,8 +32,8 @@ import power_law_approx
 RAW_DATA_DIR = Path.cwd().parent / 'data/raw'
 SYM = 'BTCUSDT'
 DATA_START = datetime.datetime(2025, 9, 1)
-TRAIN_END = datetime.datetime(2025, 9, 10)
-VAL_END = datetime.datetime(2025, 9, 15)
+TRAIN_END = datetime.datetime(2025, 9, 30)
+VAL_END = datetime.datetime(2025, 10, 15)
 
 
 # %%
@@ -127,9 +127,9 @@ class PowerLawCache(NamedTuple):
 def calc_power_law_cache(curr_count: Array,
                          time_since_prev: Array) -> PowerLawCache:
     decay_rates = power_law_approx.calc_decay_rates(
-        min_history=ONE_MILLISECOND,
-        max_history=ONE_HOUR,
-        n_exponentials=14,  # 3.6e6 ms in an hour, 2x orders of magnitude
+        min_history=ONE_MILLISECOND / 10,
+        max_history=10 * ONE_MIN,
+        n_exponentials=10,  # 60e4 ms in 10min, > 2x orders of magnitude
     )
 
     def step(carry, xs):
@@ -954,19 +954,20 @@ show_rbf_hawkes(fitted_rbf_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
 class PowerLawHawkesParams(NamedTuple):
     sp_inv_base_intensity: Array
     logit_branching_ratio: Array
-    sp_inv_beta: Array = softplus_inverse(0.2)
+    # omega^{-1} roughly corresponds to where the plateau crosses over to
+    # power-law tail
+    sp_inv_inv_omega: Array = softplus_inverse(ONE_MILLISECOND)
+    logit_beta: Array = logit(0.5)
 
 
 def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> ModelOutput:
-    # KNOWN_LIMITATION: omega is fixed to avoid identifiability with beta
-    # omega^{-1} roughly corresponds to where the plateau crosses over to
-    # power-law tail
-    omega = 1.0 / ONE_MILLISECOND
     base_intensity = jax.nn.softplus(params.sp_inv_base_intensity)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
-    beta = jax.nn.softplus(params.sp_inv_beta)
+    omega = 1.0 / jax.nn.softplus(params.sp_inv_inv_omega)
+    beta = jax.nn.sigmoid(params.logit_beta)
     chex.assert_tree_all_finite(base_intensity)
     chex.assert_tree_all_finite(branching_ratio)
+    chex.assert_tree_all_finite(omega)
     chex.assert_tree_all_finite(beta)
 
     cache = dataset.power_law_cache
@@ -1004,9 +1005,10 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
         forecast_intensity=forecast_intensity,
         reg_penalty=(
             jnp.zeros(())
-            # + jnp.square(params.sp_inv_base_intensity) * 1e5
-            # + jnp.square(params.logit_branching_ratio) * 1e5
-            # + jnp.square(params.sp_inv_beta_raw) * 1e5
+            + jnp.square(params.sp_inv_base_intensity) * 1e3
+            + jnp.square(params.logit_branching_ratio) * 1e6
+            + jnp.square(params.sp_inv_inv_omega) * 1e6
+            + jnp.square(params.logit_beta) * 1e6
         ),
     )
 

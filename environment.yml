@@ -4,6 +4,7 @@ channels:
 dependencies:
   - python=3.14
   - chex=0.1.91
+  - hypothesis=6.150.1
   - jax=0.7.2
   - Jinja2
   - jupyter

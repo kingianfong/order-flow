@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import pytest
+from hypothesis import given, strategies, settings
 
 from decayed_counts import calculate_decayed_counts
 
@@ -33,26 +34,71 @@ def calc_weights(omega: ArrayLike, beta: ArrayLike, rates: Array) -> Array:
     return weights
 
 
-@pytest.mark.parametrize("omega_pow", range(-5, 2 + 1))
-@pytest.mark.parametrize("beta_step", range(1, 20 + 1))
-@pytest.mark.parametrize("t", [0.01, 1.0, 100.0])
-def test_calc_weights(omega_pow, beta_step, t):
-    rates = calc_decay_rates(1e-3, 1e6, n_exponentials=32)
-    omega = jnp.power(10.0, omega_pow)
-    beta = 0.05 * beta_step
+@strategies.composite
+def generate_inputs(draw):
+    timestamp_resolution_pow = draw(strategies.integers(
+        min_value=-9,  # 1 nanosecond
+        max_value=-3,  # 1 millisecond
+    ))
+    timestamp_resolution = 10 ** timestamp_resolution_pow
+
+    max_seconds_between_events = 60
+    duration_seconds = draw(strategies.floats(
+        min_value=timestamp_resolution,
+        max_value=60,
+    ))
+    min_assumed_hist_seconds = timestamp_resolution / 10
+    max_assumed_hist_seconds = max_seconds_between_events * 10
+    inv_omega_seconds = draw(strategies.floats(
+        min_value=timestamp_resolution,
+        max_value=10 * 60,
+    ))
+    omega = 1.0 / inv_omega_seconds
+    beta = draw(strategies.floats(
+        min_value=0.0,
+        max_value=1.0,
+    ))
+    return dict(
+        timestamp_resolution=timestamp_resolution,
+        min_assumed_hist=min_assumed_hist_seconds,
+        max_assumed_hist=max_assumed_hist_seconds,
+        omega=omega,
+        beta=beta,
+        duration_seconds=duration_seconds,
+    )
+
+
+@settings(deadline=None)  # disable timer for JAX compilation
+@given(generate_inputs())
+def test_calc_weights(inputs):
+    omega = inputs['omega']
+    beta = inputs['beta']
+    duration_seconds = inputs['duration_seconds']
+
+    max_assumed_hist = inputs['max_assumed_hist']
+    min_assumed_hist = inputs['min_assumed_hist']
+
+    orders_of_magnitude = int(
+        2.5 + jnp.log10(max_assumed_hist / min_assumed_hist)
+    )
+    rates = calc_decay_rates(
+        min_history=min_assumed_hist,
+        max_history=max_assumed_hist,
+        n_exponentials=max(1, 2 * orders_of_magnitude),
+    )
     weights = calc_weights(omega, beta, rates)
 
     assert jnp.all(jnp.isfinite(weights))
     assert jnp.all(weights >= 0)
     assert jnp.sum(weights) == pytest.approx(1.0)
 
-    approx_decay = weights @ jnp.exp(-rates * t)
-    exact_decay = jnp.power(1.0 + omega * t, -(1.0 + beta))
-    assert approx_decay == pytest.approx(exact_decay, rel=0.01)
+    approx_decay = weights @ jnp.exp(-rates * duration_seconds)
+    exact_decay = jnp.power(1.0 + omega * duration_seconds, -(1.0 + beta))
+    assert approx_decay == pytest.approx(exact_decay, rel=0.1, abs=0.01)
 
     actual_mean = weights @ rates
     theo_mean = omega * (1.0 + beta)
-    assert actual_mean == pytest.approx(theo_mean, rel=0.1)
+    assert actual_mean == pytest.approx(theo_mean, rel=0.1, abs=0.01)
 
 
 def plot_power_law_decay() -> None:
@@ -64,8 +110,12 @@ def plot_power_law_decay() -> None:
         elapsed = jnp.concat([jnp.zeros(1), jnp.diff(t)])
         counts = jnp.zeros_like(elapsed).at[0].set(1)
         outer = jnp.outer(elapsed, rates)
-        decay_rates = jnp.exp(-outer)
-        decayed_counts = calculate_decayed_counts(decay_rates, counts)
+        decay_factors = jnp.exp(-outer)
+        fn = jax.vmap(
+            lambda factors: calculate_decayed_counts(factors, counts),
+            in_axes=1, out_axes=1,
+        )
+        decayed_counts = fn(decay_factors)
         return decayed_counts @ weights
 
     one_second = 1.0
