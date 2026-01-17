@@ -19,13 +19,13 @@ This project models high-frequency BTCUSDT trade arrivals using parametric point
 
 ### Engineering
 1. `Computational complexity reduction`
-    1. of power-law (Lomax) decay calculation from $O(n^2)$ time to $O(n)$ using sum-of-exponentials approximation
-    1. of exponential decay calculation from $O(n)$ span to $O(\log n)$ using parallel prefix scan on a linear recurrence (`jax.lax.associatve_scan`)
+    1. $O(n^2)$ time to $O(n)$ for power-law decay calculation using sum-of-exponentials approximation
+    1. $O(n)$ parallel span to $O(\log n)$ for exponential decay calculation  using parallel prefix scan on a linear recurrence (`jax.lax.associative_scan`)
 1. `Property-based testing` ensures power-law approximation remains accurate over valid inputs (`hypothesis` library)
 
 ## Non-Objectives
-1. `Alpha generation`: This is a statistical modelling exercise, not a production trading strategy.
-1. `Price prediction`: This project only models the occurrence of trades, not price direction.
+1. `Alpha generation`: This is a statistical modelling exercise, not a production trading strategy
+1. `Price prediction`: This project only models the occurrence of trades, not price direction
 
 
 ## Results
@@ -52,9 +52,7 @@ $$
 where
 * $\lambda_\theta(t)$ is the conditional intensity given the event history up to time $t$.
 
-`Multiple events per timestamp` are assumed to self-excite for Hawkes process models. This is included in the log likelihood using the Rising Factorial (Pochhammer) polynomial.
-
-If $n$ events occur in the same timestamp, and the intensity jumps by $J$ after each event, their total contribution is
+Timestamps have `1ms` resolution and each timestamp may have multiple events. For Hawkes models, these events are assumed to self-excite. This is included in the log likelihood using the Rising Factorial (Pochhammer) polynomial:
 
 $$
 \begin{align}
@@ -72,24 +70,34 @@ where
 * $\lambda_0(t) = \phi_0 + D_t J$
 * $\lambda_1(t) = \phi_0 + D_t J + J$
 * $\lambda_k(t) = \phi_0 + D_t J + k J$
+* $a := \phi_0 + D_t J$
+* $d := J$
 
 This formulation allows the likelihood to be calculated exactly even when multiple events arrive at the same timestamp, and avoids discarding information or artificially jittering timestamps to increase the data size.
 
 ## Project Structure
 * `point_process.py`: Data loading, model defintions, optimisation, diagnostic plots.
-* `download_trades.py`: Multithreaded logic for downloading Binance UM Futures tick data and saving them to compressed parquet files with delta encoding.
-* `decayed_counts.py`: Parallel prefix-scan implementation of exponential Hawkes state recursion.
-* `power_law_approx.py`: Approximates Power-Law (Lomax) kernel decay using sum of exponential decays to reduce computation from $O(n^2)$ time to $O(n)$. Includes property-based testing with `hypothesis`
-
-## Known Limitations
-1. `Data Granularity`: It is unclear whether each record corresponds to a single aggressive trade or a passive fill. The dataset is not explicitly documented. From the documentation of a [similar dataset](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#trade-streams) and visualisations, it seems that each sample in the dataset corresponds to a single passive order getting filled, rather than a single aggressive order.
-1. `Regularisation Tuning`: Penalties were chosen heuristically by observing the convergence, identifiability and misspecficiation diagnostics.
-1. `Optimisation`: The L-BFGS training loop forces device-host synchronisation and may be problematic if number of parameters increase.
+* `download_trades.py`: Multithreaded logic for downloading Binance UM Futures tick data and saving them to compressed parquet files with delta encoding
+* `decayed_counts.py`: Implementation and tests for exponential Hawkes state recursion
+* `power_law_approx.py`: Implementation and tests for power-law kernel approximation
 
 ## Future Work
-1. Apply model to a trading use case
-1. Tune regularisation via cross-validation or empirical Bayes
-1. Extend to
-    1. multivariate Hawkes (buy, sell)
-    1. marked processes (volume, notional)
-    1. nonlinear impact kernels
+1. `Trading Applications`
+    * As mentioned before, this project's scope excludes direct applications to alpha and execution.
+    * By integrating the models into a trading system and observing their commercial impact, it becomes clear which parts of the model to prioritise.
+1. `Data Granularity`
+    * It is unclear whether each record corresponds to a single aggressive trade or a passive fill as the dataset is not explicitly documented
+    * From the documentation of a [similar dataset](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#trade-streams) and visualisations, it seems that each sample in the dataset corresponds to a single passive order getting filled, rather than a single aggressive order
+1. `Regularisation`
+    * Penalties were chosen heuristically by observing the convergence, identifiability and misspecficiation diagnostics
+    * They can instead be systematically tuned using cross-validation
+1. `Bayesian Statistics`
+    * The aforementioned regularsation parameters can be replaced with prior distributions to allow a Bayesian interpretation
+    * Given that the parameters are continuous and the models are differentiable, efficient gradient-aware MCMC samplers such as HMC and NUTS can be used
+1. `Computational Efficiency`
+    * The L-BFGS training loop forces device-host synchronisation and may be problematic if number of parameters increase
+    * Some steps of the pipeline create $O(n)$ data (e.g., gradient outer products for Godambe Information Matrix, caches for rbf and power-law), and may require refactoring or batching when working with larger datasets
+1. `Hawkes Process Extensions`
+    * Multivariate Hawkes (buy, sell)
+    * Marked processes (volume, notional)
+    * Nonlinear impact kernels
