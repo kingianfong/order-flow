@@ -1069,6 +1069,11 @@ WITH_MODEL_OUTPUTS = (
         **_calc_model_outputs('rbf_hawkes', fitted_rbf_hawkes_params, calc_rbf_hawkes),
         **_calc_model_outputs('pl_hawkes', fitted_power_law_hawkes_params, calc_power_law_hawkes),
     )
+    .with_columns(
+        pl.col('curr_count').alias('actual_count'),
+        pl.selectors.ends_with('_compensator')
+        .name.replace('_compensator', '_expected_count')
+    )
 )
 
 
@@ -1103,12 +1108,7 @@ def plot_results(start: datetime.datetime,
             pl.col('time') <= end,
         )
         .with_columns(
-            pl.col('curr_count').alias('actual_count'),
             pl.col('time_since_prev').cast(float),
-            (
-                pl.selectors.ends_with('_compensator')
-                .name.replace('_compensator', '_expected_count')
-            ),
         )
         .group_by(pl.col('time').dt.truncate(duration), maintain_order=True)
         .agg(
@@ -1213,5 +1213,69 @@ plot_results(datetime.datetime(2025, 10, 10, hour=21, minute=12, second=45),
              datetime.datetime(2025, 10, 10, hour=21, minute=13, second=45),
              duration='100ms', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'])
 
+# %%
+
+
+def plot_qq(subset: pl.DataFrame, duration: str = '100ms'):
+    assert (subset['curr_count'] > 0).all(), \
+        'need to sum compensators by event'
+
+    subset = (
+        subset
+        .group_by(pl.col('time').dt.truncate(duration), maintain_order=True)
+        .agg(
+            pl.col('curr_count').sum(),
+            (
+                pl.selectors.ends_with('_compensator')
+                .name.replace('_compensator', '_expected_count').sum()
+            ),
+        )
+        .with_columns(
+            (
+                -pl.selectors.ends_with('_expected_count')
+                .name.replace('_expected_count', '_resid')
+                + pl.col('curr_count')
+            )
+            / pl.selectors.ends_with('_expected_count').sqrt(),
+        )
+    )
+
+    max_subsamples = 1_000_000
+    if subset.height > max_subsamples:
+        subset = subset.sample(n=max_subsamples, seed=0)
+
+    prefixes = [
+        'constant',
+        'rbf',
+        'hawkes',
+        'rbf_hawkes',
+        'pl_hawkes',
+    ]
+    f, axes = plt.subplots(3, 2, sharex=True, sharey=False, figsize=(6, 8))
+    f.suptitle('Pearson Residual QQ (Normal Approx)'
+               f'\n{subset.height:,} {duration} buckets'
+               f'\n[ {subset['time'].min()} , {subset['time'].max()}]')
+
+    for i, prefix in enumerate(prefixes):
+        resid = subset[f'{prefix}_resid'].to_numpy()
+        ax = axes[i // 2, i % 2]
+        scipy.stats.probplot(resid, dist='norm', plot=ax, rvalue=True)
+        ax.set_title(f'{prefix}')
+        ax.grid(True, alpha=0.3)
+
+    for j in range(len(prefixes), len(axes.flatten())):
+        axes.flatten()[j].axis('off')
+
+    plt.tight_layout()
+    plt.show()
+    display(subset.select(pl.col('^.*_resid$').std()))
+
+
+plot_qq(WITH_MODEL_OUTPUTS.filter(pl.col('is_train')))
+plot_qq(WITH_MODEL_OUTPUTS.filter(~pl.col('is_train')))
+plot_qq(WITH_MODEL_OUTPUTS.filter(
+    pl.col('time').dt.date() >= datetime.date(2025, 10, 10),
+    pl.col('time').dt.date() <= datetime.date(2025, 10, 11),
+))
 
 # %%
