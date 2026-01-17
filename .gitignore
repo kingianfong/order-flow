@@ -5,7 +5,7 @@
 !LICENSE
 !environment.yml
 
-!py
-!py/**
+!src
+!src/**
 
 __pycache__
