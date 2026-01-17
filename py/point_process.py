@@ -669,6 +669,17 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
 # %%
 
 
+def compensator_loglik_for_interval(base_intensity: Array,
+                                    branching_ratio: Array,
+                                    initial_decayed_count: Array,
+                                    decay_rate: Array,
+                                    interval_duration: Array) -> Array:
+    constant_term = interval_duration * base_intensity
+    integral = -jnp.expm1(-decay_rate * interval_duration)
+    variable_term = branching_ratio * initial_decayed_count * integral
+    return constant_term + variable_term
+
+
 def point_loglik_for_batch(exog_intensity: Array,
                            counts_decayed_until_batch: Array,
                            jump_size: Array,
@@ -697,10 +708,13 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     chex.assert_tree_all_finite(decayed_count)
 
     prev_decayed_count = jnp.roll(decayed_count, 1).at[0].set(0.0)
-    integral_over_interval = -jnp.expm1(-decay_rate * dataset.time_since_prev)
-    compensator = \
-        dataset.time_since_prev * base_intensity \
-        + branching_ratio * prev_decayed_count * integral_over_interval
+    compensator = compensator_loglik_for_interval(
+        base_intensity=base_intensity,
+        branching_ratio=branching_ratio,
+        initial_decayed_count=prev_decayed_count,
+        decay_rate=decay_rate,
+        interval_duration=dataset.time_since_prev,
+    )
     chex.assert_tree_all_finite(compensator)
 
     point_term = point_loglik_for_batch(
@@ -871,11 +885,14 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
     decayed_count = calculate_decayed_counts(decay_factors, dataset.curr_count)
 
     prev_decayed_count = jnp.roll(decayed_count, 1).at[0].set(0.0)
-    integral_over_interval = -jnp.expm1(-decay_rate * dataset.time_since_prev)
-    interval_term = \
-        dataset.time_since_prev * base_intensity \
-        + branching_ratio * prev_decayed_count * integral_over_interval
-    chex.assert_tree_all_finite(interval_term)
+    compensator = compensator_loglik_for_interval(
+        base_intensity=base_intensity,
+        branching_ratio=branching_ratio,
+        initial_decayed_count=prev_decayed_count,
+        decay_rate=decay_rate,
+        interval_duration=dataset.time_since_prev,
+    )
+    chex.assert_tree_all_finite(compensator)
 
     point_term = point_loglik_for_batch(
         exog_intensity=base_intensity,
@@ -889,7 +906,7 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
         + branching_ratio * decay_rate * decayed_count
     return ModelOutput(
         point_term=point_term,
-        compensator=interval_term,
+        compensator=compensator,
         forecast_intensity=forecast_intensity,
         reg_penalty=(
             jnp.square(params.sp_inv_base_intensity) * 1e3
