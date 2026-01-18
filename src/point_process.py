@@ -263,7 +263,7 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
                                                  dataset: Dataset,
                                                  model_fn: ModelFn[Params],
                                                  *,
-                                                 out_dir: Path | None = None) -> None:
+                                                 out_dir: Path) -> None:
     flat_params, unravel = ravel_pytree(params)
     n_params = len(flat_params)
     assert n_params <= 1_000, \
@@ -306,8 +306,7 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
     )
     plt.title(f"Inverse Hessian Matrix {cond=:.2f}")
     plt.tight_layout()
-    if out_dir is not None:
-        plt.savefig(out_dir / 'inv_hessian.png')
+    plt.savefig(out_dir / 'inv_hessian.png')
     plt.show()
     print(f'plotting took {datetime.datetime.now() - start_time}')
 
@@ -340,9 +339,9 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
         ),
         index=labels,
     )
-    if out_dir is not None:
-        results_df.to_csv(out_dir / f'diagnostics.csv')
-    styled = (
+    results_df.to_csv(out_dir / f'diagnostics.csv')
+
+    display(
         results_df
         .style
         .background_gradient(
@@ -359,17 +358,14 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
             )
         )
     )
-    display(styled)
 
 
 def run_optim[Params: chex.ArrayTree](init_params: Params,
                                       model_fn: ModelFn[Params],
                                       dataset: Dataset,
-                                      plot_diagnostics: bool,
-                                      force_plot: bool = False,
                                       verbose: bool = False,
                                       *,
-                                      out_dir: Path | None = None) -> Params:
+                                      out_dir: Path) -> Params:
     timeout = datetime.timedelta(seconds=150)
     max_iter = 50
     tol = 1e-3
@@ -433,7 +429,6 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
 
         elapsed = datetime.datetime.now() - start_time
         if grad_norm <= tol:
-            print(f'converged: {n_iter=}, {n_linesearch=}, {elapsed=}')
             converged = True
             break
         n_iter += 1
@@ -442,9 +437,22 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
             break
 
     labels = get_pytree_labels(params)
-    if force_plot or not converged:
+    convergence_stats = pd.Series(
+        dict(
+            converged=converged,
+            n_iter=n_iter,
+            n_linesearch=n_linesearch,
+            n_params=len(labels),
+            elapsed_seconds=elapsed.total_seconds(),
+        ),
+    )
+    display(convergence_stats.to_frame())
+
+    if out_dir is not None:
+        convergence_stats.to_json(out_dir / 'convergence_stats.json', indent=2)
+
+    if out_dir is not None or not converged:
         last_grad_norm = grad_norms[-1]
-        print(f'{converged=}, {n_iter=}, {n_linesearch=}, {elapsed=}')
         print(f'{last_grad_norm=:.4f}')
 
         def _get_key(label):
@@ -501,8 +509,7 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
         plt.show()
         display(optim_df)
 
-    if plot_diagnostics:
-        plot_fit_diagnostics(params, dataset, model_fn, out_dir=out_dir)
+    plot_fit_diagnostics(params, dataset, model_fn, out_dir=out_dir)
 
     return params
 
@@ -653,7 +660,6 @@ fitted_constant_intensity_params = run_optim(
     ),
     model_fn=calc_const,
     dataset=DATASET,
-    plot_diagnostics=True,
     out_dir=RESULTS_DIRS['constant'],
 )
 assert jnp.allclose(fitted_constant_intensity_params.sp_inv_base_intensity,
@@ -737,8 +743,6 @@ fitted_rbf_params = run_optim(
     init_params=init_rbf_params,
     model_fn=calc_rbf,
     dataset=DATASET,
-    plot_diagnostics=True,
-    force_plot=True,
     out_dir=RESULTS_DIRS['rbf'],
 )
 print_params(fitted_rbf_params, out_dir=RESULTS_DIRS['rbf'])
@@ -916,7 +920,6 @@ fitted_hawkes_params = run_optim(
     init_params=init_hawkes_params,
     model_fn=calc_hawkes,
     dataset=DATASET,
-    plot_diagnostics=True,
     out_dir=RESULTS_DIRS['hawkes'],
 )
 hawkes_outputs = calc_hawkes(fitted_hawkes_params, DATASET)
@@ -1003,7 +1006,6 @@ fitted_rbf_hawkes_params = run_optim(
     init_params=init_rbf_hawkes,
     model_fn=calc_rbf_hawkes,
     dataset=DATASET,
-    plot_diagnostics=True,
     out_dir=RESULTS_DIRS['rbf_hawkes'],
 )
 show_rbf_hawkes(fitted_rbf_hawkes_params, DATASET, INPUT_DF.filter('is_train'),
@@ -1100,7 +1102,6 @@ fitted_power_law_hawkes_params = run_optim(
     init_params=init_pl_hawkes_params,
     model_fn=calc_power_law_hawkes,
     dataset=DATASET,
-    plot_diagnostics=True,
     out_dir=RESULTS_DIRS['pl_hawkes'],
 )
 show_power_law_hawkes(fitted_power_law_hawkes_params, DATASET,

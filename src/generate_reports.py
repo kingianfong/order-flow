@@ -1,10 +1,10 @@
 # %%
 
+import json
 from pathlib import Path
 import datetime
 
 from jinja2 import Template
-from pandas.io.formats.style import Styler
 import pandas as pd
 import polars as pl
 
@@ -82,42 +82,47 @@ def convert_formats(df: pd.DataFrame, formatter: str | dict[str, str]) -> pd.Dat
 def per_model_results(prefix: str) -> str:
     template = Template(
         """\
-#### {{ prefix }}
+#### {{ prefix }}: {{ n_params }} param(s), training duration: {{ elapsed }}s ({{ seconds_per_eval }}s/eval)
 <details>
-<summary>\tParameters</summary>
+<summary>Parameters</summary>
 {{ params }}
 </details>
 <details>
-<summary>\tDiagnostics</summary>
+<summary>Diagnostics</summary>
 {{ diagnostics }}
 </details>
 {% if prefix != "constant" %}
 <details>
-<summary>\tInverse Hessian</summary>
+<summary>Inverse Hessian</summary>
 {{ inv_hessian }}
 </details>
 {% endif %}
 {% if prefix in ["rbf", "rbf_hawkes"] %}
 <details>
-<summary>\tSeasonality bases</summary>
+<summary>Seasonal Basis Functions</summary>
 {{ bases }}
 </details>
 {% endif %}
 <details>
-<summary>\tPredictions</summary>
+<summary>Predictions</summary>
 {{ predictions }}
 </details>
-""",
-        trim_blocks=True,
-        lstrip_blocks=True,
-    )
+""")
+    with open(RESULTS_DIR / f'{prefix}/convergence_stats.json') as f:
+        conv_stats = json.load(f)
+    n_evals = conv_stats['n_iter'] + conv_stats['n_linesearch']
+    elapsed = conv_stats['elapsed_seconds']
+    seconds_per_eval = elapsed / n_evals
+
     render_kwargs = dict(
         prefix=prefix,
+        n_params=conv_stats['n_params'],
+        elapsed='{:.2f}'.format(elapsed),
+        seconds_per_eval='{:.2f}'.format(seconds_per_eval),
         params=table(
             df=(
                 pd.read_csv(RESULTS_DIR / f'{prefix}/params.csv',
                             index_col=0)
-                # .style
             ),
             caption=f'{prefix} parameters'
         ),
