@@ -1,6 +1,10 @@
 # Order Flow
 This project models high-frequency BTCUSDT trade arrivals using parametric point-processes (Poisson and Hawkes), with intraday seasonality and long-memory kernels, and evaluates them via statistical diagnostics.
 
+**Languages/Libaries**: Python, JAX, NumPy, Pandas, Polars, PyArrow, Hypothesis
+
+**Concepts**: Vectorization, Automatic Differentiation (AD), Maximum Likelihood Estimation (MLE), Robust Statistics, Identifiability, Numerical Stability, Market Microstructure
+
 ## Highlights
 {{ intro }}
 
@@ -22,6 +26,9 @@ This project models high-frequency BTCUSDT trade arrivals using parametric point
 1. `Computational complexity reduction`
     1. $O(n^2) \to O(n)$ time for power-law decay calculation using sum-of-exponentials approximation
     1. $O(n) \to O(\log n)$ parallel span for exponential decay calculation, $h_i = e^{-\lambda \Delta t} h_{i-1} + 1$, using parallel prefix scan on a linear recurrence  (`jax.lax.associative_scan` in `decayed_counts.py`)
+1. `JAX Automatic Differentiation (AD)`
+    1. Eliminated manual derivation of log-likelihood gradients for kernels
+    1. Compute the exact Hessian for diagnostics, avoiding the numerical instability of finite-difference methods
 1. `Property-based testing` ensures power-law approximation remains accurate over valid inputs (`hypothesis` library in `power_law_approx.py`)
 1. `Automated report generation` reduces room for human error when producing reports such as this file (`Jinja2` library in `generate_reports.py`)
 
@@ -115,6 +122,8 @@ All the models have heavy right tails, meaning they underestimate the rate of tr
 
 The residuals seem to follow the same pattern as the expected counts at higher aggregation levels, but that behaviour disappears after zooming in.
 
+### Estimated Parameters (Click to Expand)
+{{ all_model_results }}
 
 ## Known Limitations and Future Work
 1. `Trading Applications`

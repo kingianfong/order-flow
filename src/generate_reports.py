@@ -72,6 +72,82 @@ def table(styler: Styler, caption: str) -> str:
     )
 
 
+def per_model_results(prefix: str) -> str:
+    template = Template(
+        """\
+<details>
+  <summary><b>Model: {{ prefix }}</b></summary>
+  <details style="margin-left: 20px;">
+    <summary>Parameters</summary>
+    {{ params }}
+  </details>
+  <details style="margin-left: 20px;">
+    <summary>Diagnostics</summary>
+    {{ diagnostics }}
+  </details>
+{% if prefix != "constant" %}
+  <details style="margin-left: 20px;">
+    <summary>Inverse Hessian</summary>
+    {{ inv_hessian }}
+  </details>
+{% endif %}
+{% if prefix in ["rbf", "rbf_hawkes"] %}
+  <details style="margin-left: 20px;">
+    <summary>Seasonality bases</summary>
+    {{ bases }}
+  </details>
+{% endif %}
+  <details style="margin-left: 20px;">
+    <summary>Predictions</summary>
+    {{ predictions }}
+  </details>
+</details>
+""",
+        trim_blocks=True,
+        lstrip_blocks=False,
+    )
+    render_kwargs = dict(
+        prefix=prefix,
+        params=table(
+            styler=(
+                pd.read_csv(
+                    RESULTS_DIR / f'{prefix}/params.csv', index_col=0)
+                .style
+            ),
+            caption=f'{prefix} parameters'
+        ),
+        diagnostics=table(
+            styler=(
+                pd.read_csv(
+                    RESULTS_DIR / f'{prefix}/diagnostics.csv', index_col=0)
+                .style
+                .background_gradient(
+                    subset=['hess_se', 'robust_se', 'se_ratio'],
+                )
+                .format(
+                    dict(
+                        mean='{:.4f}',
+                        hess_se='{:.4f}',
+                        robust_se='{:.4f}',
+                        z_score='{:.2f}',
+                        p_value='{:.2%}',
+                        se_ratio='{:.4f}',
+                    )
+                )
+            ),
+            caption=f'{prefix} diagnostics'
+        ),
+        inv_hessian=image(f'{prefix}/inv_hessian.png',
+                          f'{prefix} inverse Hessian'),
+        predictions=image(f'{prefix}/counts.png',
+                          f'{prefix} predictions'),
+    )
+    if prefix.startswith('rbf'):
+        render_kwargs['bases'] = image(f'{prefix}/bases.png',
+                                       f'{prefix} bases')
+    return template.render(**render_kwargs)
+
+
 def generate_readme():
     template = Template(TEMPLATE_PATH.read_text())
     rendered = template.render(
@@ -142,6 +218,13 @@ def generate_readme():
             'overall/val3.png',
             '2025-10-10 zoomed in',
         ),
+        all_model_results='\n\n'.join(map(per_model_results, [
+            'constant',
+            'rbf',
+            'hawkes',
+            'rbf_hawkes',
+            'pl_hawkes',
+        ])),
     )
 
     with open(README_PATH, 'w') as f:

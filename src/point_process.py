@@ -32,8 +32,8 @@ PROJ_ROOT_DIR = Path(__file__).parent.parent
 RAW_DATA_DIR = PROJ_ROOT_DIR / 'data/raw'
 SYM = 'BTCUSDT'
 DATA_START = datetime.datetime(2025, 9, 1)
-TRAIN_END = datetime.datetime(2025, 9, 30)
-VAL_END = datetime.datetime(2025, 10, 15)
+TRAIN_END = datetime.datetime(2025, 9, 10)
+VAL_END = datetime.datetime(2025, 9, 15)
 
 
 ALL_PREFIXES = [
@@ -340,6 +340,8 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
         ),
         index=labels,
     )
+    if out_dir is not None:
+        results_df.to_csv(out_dir / f'diagnostics.csv')
     styled = (
         results_df
         .style
@@ -358,8 +360,6 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
         )
     )
     display(styled)
-    if out_dir is not None:
-        styled.to_html(out_dir / f'diagnostics.html')
 
 
 def run_optim[Params: chex.ArrayTree](init_params: Params,
@@ -629,7 +629,7 @@ def print_params(params, *, out_dir: Path | None = None) -> None:
                 series[k.replace(prefix, '')] = transform(v)
     display(series.to_frame())
     if out_dir is not None:
-        series.to_frame().to_html(out_dir / 'params.html')
+        series.to_frame().to_csv(out_dir / 'params.csv')
 
 
 class ConstantIntensityParams(NamedTuple):
@@ -653,7 +653,8 @@ fitted_constant_intensity_params = run_optim(
     ),
     model_fn=calc_const,
     dataset=DATASET,
-    plot_diagnostics=False,
+    plot_diagnostics=True,
+    out_dir=RESULTS_DIRS['constant'],
 )
 assert jnp.allclose(fitted_constant_intensity_params.sp_inv_base_intensity,
                     softplus_inverse(closed_form_intensity))
@@ -738,6 +739,7 @@ fitted_rbf_params = run_optim(
     dataset=DATASET,
     plot_diagnostics=True,
     force_plot=True,
+    out_dir=RESULTS_DIRS['rbf'],
 )
 print_params(fitted_rbf_params, out_dir=RESULTS_DIRS['rbf'])
 plot_model_output(calc_rbf(fitted_rbf_params, DATASET),
@@ -915,6 +917,7 @@ fitted_hawkes_params = run_optim(
     model_fn=calc_hawkes,
     dataset=DATASET,
     plot_diagnostics=True,
+    out_dir=RESULTS_DIRS['hawkes'],
 )
 hawkes_outputs = calc_hawkes(fitted_hawkes_params, DATASET)
 show_hawkes(fitted_hawkes_params, DATASET, INPUT_DF.filter('is_train'),
@@ -1098,6 +1101,7 @@ fitted_power_law_hawkes_params = run_optim(
     model_fn=calc_power_law_hawkes,
     dataset=DATASET,
     plot_diagnostics=True,
+    out_dir=RESULTS_DIRS['pl_hawkes'],
 )
 show_power_law_hawkes(fitted_power_law_hawkes_params, DATASET,
                       INPUT_DF.filter('is_train'),
@@ -1150,6 +1154,7 @@ LOGLIK_MEAN = (
     .agg(pl.selectors.ends_with('_loglik').mean())
     .sort('is_train', descending=True)
 )
+LOGLIK_MEAN.write_csv(RESULTS_DIRS['overall'] / 'loglik_mean.csv')
 (
     LOGLIK_MEAN
     .to_pandas()
@@ -1158,7 +1163,6 @@ LOGLIK_MEAN = (
     .style
     .background_gradient(axis=1)
     .format('{:.2f}')
-    .to_html(RESULTS_DIRS['overall'] / 'loglik_mean.html')
 )
 
 
@@ -1172,6 +1176,7 @@ LOGLIK_RELATIVE = (
         / pl.col('constant_loglik')
     )
 )
+LOGLIK_RELATIVE.write_csv(RESULTS_DIRS['overall'] / 'loglik_relative.csv')
 (
     LOGLIK_RELATIVE
     .to_pandas()
@@ -1180,7 +1185,6 @@ LOGLIK_RELATIVE = (
     .style
     .background_gradient(axis=1)
     .format('{:.2%}')
-    .to_html(RESULTS_DIRS['overall'] / 'loglik_relative.html')
 )
 
 
