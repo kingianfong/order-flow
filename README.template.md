@@ -60,6 +60,8 @@ This project uses [Binance UM futures trade data](https://data.binance.vision/da
 
 {{ data_head }}
 
+{{ data_stats }}
+
 It is unclear whether each record corresponds to a single aggressive order or a single passive fill. From the documentation of a [similar dataset](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#trade-streams) and visualisations, it seems that (2) is more likely. This implies that we could be modelling `arrival of distinct passive order fills`, rather than `arrival of distinct decisions to cross the spread`.
 
 ## Modelling Assumptions

@@ -1,6 +1,7 @@
 # %%
 
 from pathlib import Path
+import datetime
 
 from jinja2 import Template
 from pandas.io.formats.style import Styler
@@ -12,6 +13,8 @@ PROJ_ROOT_DIR = Path(__file__).parent.parent
 RESULTS_DIR = PROJ_ROOT_DIR / 'results'
 TEMPLATE_PATH = PROJ_ROOT_DIR / 'README.template.md'
 README_PATH = PROJ_ROOT_DIR / 'README.md'
+
+VAL_START_DATE = datetime.date(2025, 10, 1)
 
 
 # %%
@@ -52,24 +55,24 @@ def table(styler: Styler, caption: str) -> str:
         .set_table_styles(
             [
                 {
-                    'selector': 'caption',
-                    'props': [
-                        ('caption-side', 'bottom'),
-                    ],
-                },
-                {
                     'selector': '',
                     'props': [
+                        ('caption-side', 'bottom'),
                         ('margin-left', 'auto'),
                         ('margin-right', 'auto'),
                     ],
                 },
             ],
-            overwrite=False,
         )
         # set uuid to ensure determinism for version control
-        .to_html(table_uuid=str(count))
+        .to_html(
+            table_uuid=str(count),
+            doctype_html=False,
+        )
     )
+
+
+# %%
 
 
 def per_model_results(prefix: str) -> str:
@@ -118,12 +121,9 @@ def per_model_results(prefix: str) -> str:
         ),
         diagnostics=table(
             styler=(
-                pd.read_csv(
-                    RESULTS_DIR / f'{prefix}/diagnostics.csv', index_col=0)
+                pd.read_csv(RESULTS_DIR / f'{prefix}/diagnostics.csv',
+                            index_col=0)
                 .style
-                .background_gradient(
-                    subset=['hess_se', 'robust_se', 'se_ratio'],
-                )
                 .format(
                     dict(
                         mean='{:.4f}',
@@ -166,8 +166,8 @@ def generate_readme():
         data_head=table(
             (
                 pl.scan_parquet(PROJ_ROOT_DIR / 'data/raw')
-                .drop('date')
                 .filter(pl.col('sym') == 'BTCUSDT')
+                .drop('date', 'sym')
                 .head()
                 .collect()
                 .to_pandas()
@@ -175,6 +175,25 @@ def generate_readme():
                 .style
             ),
             caption='Raw data',
+        ),
+        data_stats=table(
+            styler=(
+                pl.scan_parquet(PROJ_ROOT_DIR / 'data/raw')
+                .with_columns(pl.col('time').cast(pl.Datetime('ms')))
+                .group_by(
+                    subset=(pl.when(pl.col('date') < VAL_START_DATE)
+                            .then(pl.lit('train'))
+                            .otherwise(pl.lit('validation'))),
+                )
+                .agg(
+                    n_events=pl.len(),
+                    n_unique_timestamps=pl.col('time').n_unique(),
+                )
+                .collect()
+                .to_pandas().set_index('subset').sort_index()
+                .style.format('{:,}')
+            ),
+            caption='Sample counts'
         ),
         loglik_mean=table(
             styler=(
@@ -186,7 +205,6 @@ def generate_readme():
                 .set_index('subset')
                 .rename(columns=lambda x: x.replace('_loglik', ''))
                 .style
-                .background_gradient(axis=1)
                 .format('{:.2f}')
             ),
             caption='Mean log likelihood per event',
@@ -201,7 +219,6 @@ def generate_readme():
                 .set_index('subset')
                 .rename(columns=lambda x: x.replace('_loglik', ''))
                 .style
-                .background_gradient(axis=1)
                 .format('{:.2%}')
             ),
             caption='Mean log likelihood per event relative to constant baseline',
