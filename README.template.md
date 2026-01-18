@@ -1,7 +1,7 @@
 # Order Flow
 This project models high-frequency BTCUSDT trade arrivals using parametric point-processes (Poisson and Hawkes), with intraday seasonality and long-memory kernels, and evaluates them via statistical diagnostics.
 
-**Languages/Libaries**: Python, JAX, NumPy, Pandas, Polars, PyArrow, Hypothesis
+**Libaries**: JAX, NumPy, Pandas, Polars, PyArrow, Hypothesis
 
 **Concepts**: Vectorization, Automatic Differentiation (AD), Maximum Likelihood Estimation (MLE), Robust Statistics, Identifiability, Numerical Stability, Market Microstructure
 
