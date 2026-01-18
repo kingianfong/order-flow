@@ -431,12 +431,11 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
         grads_hist.append(grad)
         grad_norms.append(grad_norm)
 
+        elapsed = datetime.datetime.now() - start_time
         if grad_norm <= tol:
-            print(f'converged: {n_iter=}, {n_linesearch=}')
+            print(f'converged: {n_iter=}, {n_linesearch=}, {elapsed=}')
             converged = True
             break
-
-        elapsed = datetime.datetime.now() - start_time
         n_iter += 1
         if n_iter == max_iter or elapsed > timeout:
             print('did not converge')
@@ -526,10 +525,111 @@ def softplus_inverse(x: ArrayLike) -> Array:
                                y))
 
 
-assert jnp.allclose(
-    softplus_inverse(jax.nn.softplus(jnp.arange(10))),
-    jnp.arange(10),
-)
+def test_sp_inv():
+    x_expected = jnp.linspace(1e-3, 1e6, 50)
+    x_actual = softplus_inverse(jax.nn.softplus(x_expected))
+    assert jnp.allclose(x_actual, x_expected)
+
+
+test_sp_inv()
+
+
+# %%
+
+
+def plot_model_output(outputs: ModelOutput,
+                      input_df: pl.DataFrame,
+                      *,
+                      out_dir: Path | None = None) -> None:
+    bucket_len = '1s'
+    duration = '5m'
+    df = (
+        input_df
+        .with_columns(
+            pl.col('curr_count').alias('actual_count'),
+            pl.col('time_since_prev').cast(float),
+            expected_count=np.asarray(outputs.compensator),
+        )
+        .filter(
+            pl.col('time') < pl.col('time').min().dt.offset_by(duration),
+        )
+        .group_by(pl.col('time').dt.truncate(bucket_len), maintain_order=True)
+        .agg(
+            pl.col('hi_price').max(),
+            pl.col('lo_price').min(),
+            pl.col('actual_count').sum(),
+            pl.col('expected_count').sum(),
+        )
+        .with_columns(
+            err=(pl.col('actual_count') - pl.col('expected_count'))
+            / pl.col('expected_count').sqrt(),
+        )
+        .to_pandas()
+        .set_index('time')
+    )
+    start = df.index.min()
+    end = df.index.max()
+
+    f, axes = plt.subplots(2, 1, sharex=True, sharey=False, figsize=(8, 6))
+    title = '\n'.join(
+        (
+            f'counts over {bucket_len} buckets in the first {duration}',
+            f'[ {start} , {end} ]',
+        )
+    )
+    f.suptitle(title)
+
+    count_ax = axes[0]
+    count_ax.set_title('actual')
+    count_ax.set_yscale('log')
+    count_ax.scatter(df.index, df['actual_count'],
+                     alpha=0.4, marker='+', c='C0')
+    count_ax.set_ylabel('actual count $y$', c='C0')
+
+    price_ax = count_ax.twinx()
+    price_ax.plot(df.index, df[['hi_price', 'lo_price']],
+                  alpha=0.6, drawstyle='steps-post', c='C1')
+    price_ax.set_ylabel('price (hi, lo)', c='C1')
+
+    expected_count_ax = axes[1]
+    expected_count_ax.set_yscale('log')
+    expected_count_ax.scatter(df.index, df['expected_count'],
+                              alpha=0.6, marker='+', c='C0')
+    expected_count_ax.set_ylabel('expected count $\\hat y$', c='C0')
+
+    err_ax = expected_count_ax.twinx()
+    err_ax.scatter(df.index, df['err'],
+                   alpha=0.4, marker='x', c='C2')
+    err_ax.set_ylabel(r'$(y - \hat y) / \sqrt{\hat y}$', c='C2')
+    err_ax.axhline(0.0, linestyle='--', c='C2', alpha=0.6)
+
+    for ax in axes:
+        ax.grid(True, which="both", ls="--", alpha=0.4)
+        ax.tick_params(axis='x', labelrotation=30)
+
+    plt.tight_layout()
+    if out_dir is not None:
+        plt.savefig(out_dir / 'counts.png')
+    plt.show()
+
+
+def print_params(params, *, out_dir: Path | None = None) -> None:
+    prev = params._asdict()
+    series = pd.Series(prev, name='value')
+    series.index.name = 'param'
+
+    prefix_transforms = dict(
+        log_=jnp.exp,
+        logit_=jax.nn.sigmoid,
+        sp_inv_=jax.nn.softplus,
+    )
+    for k, v in prev.items():
+        for prefix, transform in prefix_transforms.items():
+            if k.startswith(prefix):
+                series[k.replace(prefix, '')] = transform(v)
+    display(series.to_frame())
+    if out_dir is not None:
+        series.to_frame().to_html(out_dir / 'params.html')
 
 
 class ConstantIntensityParams(NamedTuple):
@@ -557,6 +657,11 @@ fitted_constant_intensity_params = run_optim(
 )
 assert jnp.allclose(fitted_constant_intensity_params.sp_inv_base_intensity,
                     softplus_inverse(closed_form_intensity))
+print_params(fitted_constant_intensity_params,
+             out_dir=RESULTS_DIRS['constant'])
+plot_model_output(calc_const(fitted_constant_intensity_params, DATASET),
+                  INPUT_DF.filter('is_train'),
+                  out_dir=RESULTS_DIRS['constant'])
 
 
 # %%
@@ -586,7 +691,7 @@ def calc_rbf(params: RbfParams, dataset: Dataset) -> ModelOutput:
 def plot_rbf(sp_inv_base_intensity: Array,
              weights: Array,
              *,
-             out_path: Path | None = None) -> None:
+             out_dir: Path | None = None) -> None:
     # exceed [0, 24] to verify periodic boundary conditions
     time_of_day = jnp.linspace(-4, 28, 500, endpoint=False)
     bases = calc_rbf_basis(time_of_day)
@@ -612,8 +717,8 @@ def plot_rbf(sp_inv_base_intensity: Array,
     ax2.set_ylabel('weighted bases')
     ax2.set_xlabel('hour')
     plt.tight_layout()
-    if out_path is not None:
-        plt.savefig(out_path)
+    if out_dir is not None:
+        plt.savefig(out_dir / 'bases.png')
     plt.show()
 
 
@@ -634,8 +739,12 @@ fitted_rbf_params = run_optim(
     plot_diagnostics=True,
     force_plot=True,
 )
-plot_rbf(fitted_rbf_params.sp_inv_base_rate,
-         fitted_rbf_params.weights)
+print_params(fitted_rbf_params, out_dir=RESULTS_DIRS['rbf'])
+plot_model_output(calc_rbf(fitted_rbf_params, DATASET),
+                  INPUT_DF.filter('is_train'),
+                  out_dir=RESULTS_DIRS['rbf'])
+plot_rbf(fitted_rbf_params.sp_inv_base_rate, fitted_rbf_params.weights,
+         out_dir=RESULTS_DIRS['rbf'])
 
 
 # %%
@@ -773,103 +882,11 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     )
 
 
-def plot_model_output(outputs: ModelOutput,
-                      input_df: pl.DataFrame,
-                      *,
-                      bucket_len: str = '1s',
-                      duration: str = '5m',
-                      out_path: Path | None = None) -> None:
-    df = (
-        input_df
-        .with_columns(
-            pl.col('curr_count').alias('actual_count'),
-            pl.col('time_since_prev').cast(float),
-            expected_count=np.asarray(outputs.compensator),
-        )
-        .filter(
-            pl.col('time') < pl.col('time').min().dt.offset_by(duration),
-        )
-        .group_by(pl.col('time').dt.truncate(bucket_len), maintain_order=True)
-        .agg(
-            pl.col('hi_price').max(),
-            pl.col('lo_price').min(),
-            pl.col('actual_count').sum(),
-            pl.col('expected_count').sum(),
-        )
-        .with_columns(
-            err=(pl.col('actual_count') - pl.col('expected_count'))
-            / pl.col('expected_count').sqrt(),
-        )
-        .to_pandas()
-        .set_index('time')
-    )
-    start = df.index.min()
-    end = df.index.max()
-
-    f, axes = plt.subplots(2, 1, sharex=True, sharey=False, figsize=(8, 6))
-    title = '\n'.join(
-        (
-            f'counts over {bucket_len} buckets in the first {duration}',
-            f'[ {start} , {end} ]',
-        )
-    )
-    f.suptitle(title)
-
-    count_ax = axes[0]
-    count_ax.set_title('actual')
-    count_ax.set_yscale('log')
-    count_ax.scatter(df.index, df['actual_count'],
-                     alpha=0.4, marker='+', c='C0')
-    count_ax.set_ylabel('actual count $y$', c='C0')
-
-    price_ax = count_ax.twinx()
-    price_ax.plot(df.index, df[['hi_price', 'lo_price']],
-                  alpha=0.6, drawstyle='steps-post', c='C1')
-    price_ax.set_ylabel('price (hi, lo)', c='C1')
-
-    expected_count_ax = axes[1]
-    expected_count_ax.set_yscale('log')
-    expected_count_ax.scatter(df.index, df['expected_count'],
-                              alpha=0.6, marker='+', c='C0')
-    expected_count_ax.set_ylabel('expected count $\\hat y$', c='C0')
-
-    err_ax = expected_count_ax.twinx()
-    err_ax.scatter(df.index, df['err'],
-                   alpha=0.4, marker='x', c='C2')
-    err_ax.set_ylabel(r'$(y - \hat y) / \sqrt{\hat y}$', c='C2')
-    err_ax.axhline(0.0, linestyle='--', c='C2', alpha=0.6)
-
-    for ax in axes:
-        ax.grid(True, which="both", ls="--", alpha=0.4)
-        ax.tick_params(axis='x', labelrotation=30)
-
-    plt.tight_layout()
-    if out_path is not None:
-        plt.savefig(out_path)
-    plt.show()
-
-
-def print_params(params, *, out_path: Path | None = None) -> None:
-    prev = params._asdict()
-    series = pd.Series(prev, name='param')
-
-    prefix_transforms = dict(
-        log_=jnp.exp,
-        logit_=jax.nn.sigmoid,
-        sp_inv_=jax.nn.softplus,
-    )
-    for k, v in prev.items():
-        for prefix, transform in prefix_transforms.items():
-            if k.startswith(prefix):
-                series[k.replace(prefix, '')] = transform(v)
-    display(series.to_frame())
-    if out_path is not None:
-        series.to_frame().to_html(out_path)
-
-
 def show_hawkes(params: HawkesParams,
                 dataset: Dataset,
-                input_df: pl.DataFrame) -> None:
+                input_df: pl.DataFrame,
+                *,
+                out_dir: Path | None = None) -> None:
     baseline_outputs = calc_hawkes_baseline(params, dataset)
 
     outputs = chex.chexify(calc_hawkes)(params, dataset)
@@ -880,9 +897,8 @@ def show_hawkes(params: HawkesParams,
     assert jnp.allclose(outputs.point_term,
                         baseline_outputs.point_term,
                         rtol=1e-3, atol=1e-2)
-
-    print_params(params)
-    plot_model_output(outputs, input_df)
+    print_params(params, out_dir=out_dir)
+    plot_model_output(outputs, input_df, out_dir=out_dir)
 
 
 init_hawkes_params = HawkesParams(
@@ -901,7 +917,8 @@ fitted_hawkes_params = run_optim(
     plot_diagnostics=True,
 )
 hawkes_outputs = calc_hawkes(fitted_hawkes_params, DATASET)
-show_hawkes(fitted_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
+show_hawkes(fitted_hawkes_params, DATASET, INPUT_DF.filter('is_train'),
+            out_dir=RESULTS_DIRS['hawkes'])
 
 
 # %%
@@ -958,23 +975,13 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
 
 def show_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset,
                     input_df: pl.DataFrame,
+                    *,
                     out_dir: Path | None = None) -> None:
     outputs = chex.chexify(calc_rbf_hawkes)(params, dataset)
-    if out_dir is not None:
-        params_path = out_dir / 'params.html'
-        counts_path = out_dir / 'counts.png'
-        bases_path = out_dir / 'bases.png'
-    else:
-        params_path = None
-        counts_path = None
-        bases_path = None
-
-    print_params(params, out_path=params_path)
-    plot_model_output(outputs, input_df,
-                      out_path=counts_path)
+    print_params(params, out_dir=out_dir)
+    plot_model_output(outputs, input_df, out_dir=out_dir)
     plot_rbf(sp_inv_base_intensity=params.sp_inv_base_intensity,
-             weights=params.weights,
-             out_path=bases_path)
+             weights=params.weights, out_dir=out_dir)
 
 
 init_rbf_hawkes = RbfHawkesParams(
@@ -1067,10 +1074,12 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
 
 def show_power_law_hawkes(params: PowerLawHawkesParams,
                           dataset: Dataset,
-                          input_df: pl.DataFrame) -> None:
+                          input_df: pl.DataFrame,
+                          *,
+                          out_dir: Path | None = None) -> None:
     outputs = calc_power_law_hawkes(params, dataset)
-    print_params(params)
-    plot_model_output(outputs=outputs, input_df=input_df)
+    print_params(params, out_dir=out_dir)
+    plot_model_output(outputs=outputs, input_df=input_df, out_dir=out_dir)
 
 
 init_pl_hawkes_params = PowerLawHawkesParams(
@@ -1090,8 +1099,9 @@ fitted_power_law_hawkes_params = run_optim(
     dataset=DATASET,
     plot_diagnostics=True,
 )
-show_power_law_hawkes(fitted_power_law_hawkes_params,
-                      DATASET, INPUT_DF.filter('is_train'))
+show_power_law_hawkes(fitted_power_law_hawkes_params, DATASET,
+                      INPUT_DF.filter('is_train'),
+                      out_dir=RESULTS_DIRS['pl_hawkes'])
 
 
 # %%
