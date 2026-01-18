@@ -96,6 +96,10 @@ def per_model_results(prefix: str) -> str:
 <summary>Inverse Hessian</summary>
 {{ inv_hessian }}
 </details>
+<details>
+<summary>Convergence</summary>
+{{ convergence }}
+</details>
 {% endif %}
 {% if prefix in ["rbf", "rbf_hawkes"] %}
 <details>
@@ -146,6 +150,8 @@ def per_model_results(prefix: str) -> str:
         ),
         inv_hessian=image(f'{prefix}/inv_hessian.png',
                           f'{prefix} inverse Hessian'),
+        convergence=image(f'{prefix}/optim_outputs.png',
+                          f'{prefix} convergence'),
         predictions=image(f'{prefix}/counts.png',
                           f'{prefix} predictions'),
     )
@@ -168,7 +174,8 @@ def generate_readme():
         ),
         rbf_hawkes_inv_hess=image(
             'rbf_hawkes/inv_hessian.png',
-            'Inverse Hessian to identify potential identifiability issues',
+            'Inverse Hessian: high absolute values suggest potential'
+            + ' identifiability issues',
         ),
         data_head=table(
             (
@@ -223,7 +230,7 @@ def generate_readme():
                 .to_pandas()
                 .set_index('subset')
                 .rename(columns=lambda x: x.replace('_loglik', ''))
-                .pipe(convert_formats, '{:.2f}')
+                .pipe(convert_formats, '{:.2%}')
             ),
             caption='Mean log likelihood per timestamp relative to constant baseline',
         ),

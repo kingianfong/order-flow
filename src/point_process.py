@@ -32,8 +32,8 @@ PROJ_ROOT_DIR = Path(__file__).parent.parent
 RAW_DATA_DIR = PROJ_ROOT_DIR / 'data/raw'
 SYM = 'BTCUSDT'
 DATA_START = datetime.datetime(2025, 9, 1)
-TRAIN_END = datetime.datetime(2025, 9, 10)
-VAL_END = datetime.datetime(2025, 9, 15)
+TRAIN_END = datetime.datetime(2025, 9, 30)
+VAL_END = datetime.datetime(2025, 10, 15)
 
 
 ALL_PREFIXES = [
@@ -485,7 +485,8 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
         unique_keys = sorted(set(col_keys.values()),
                              key=lambda x: (x.startswith('.'), x.endswith('grads')))
         n_rows = len(unique_keys)
-        f, axes = plt.subplots(n_rows, 1, figsize=(8, n_rows*2))
+        f, axes = plt.subplots(n_rows, 1, sharex=True,
+                               figsize=(8, 1 + n_rows*2))
         key_to_ax = dict(zip(unique_keys, axes))
 
         f.suptitle('optimisation outputs')

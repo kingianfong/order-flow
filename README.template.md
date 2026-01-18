@@ -1,9 +1,15 @@
 # Order Flow
-This project models high-frequency BTCUSDT trade arrivals using parametric point-processes (Poisson and Hawkes), with intraday seasonality and long-memory kernels, and evaluates them via statistical diagnostics.
+This project models BTCUSDT trade-arrival times (Binance UM futures) with Poisson and Hawkes point processes, focusing on intraday seasonality and self-exciting/long-memory clustering.
 
-**Libaries**: JAX, NumPy, Pandas, Polars, PyArrow, Hypothesis
+Results show large likelihood gains from self-excitation, with power-law kernels outperforming exponential Hawkes, while robust-vs-Hessian SE gaps indicate remaining misspecification.
 
-**Concepts**: Vectorization, Automatic Differentiation (AD), Maximum Likelihood Estimation (MLE), Robust Statistics, Identifiability, Numerical Stability, Market Microstructure
+**Concepts**: Maximum Likelihood Estimation (MLE), Hawkes, Numerical Stability, Identifiability, Robust Statistics, Automatic Differentiation (AD, JAX), Market Microstructure
+
+## Key Contributions
+* Exact likelihood for 1ms timestamp collisions (no jittering)
+* JAX MLE with exact gradients + Hessians
+* Robust SE via Godambe + identifiability diagnostics via inverse Hessian
+* O(n) power-law approximation; parallel scan for exponential kernel
 
 ## Highlights
 {{ intro }}
@@ -22,34 +28,23 @@ This project models high-frequency BTCUSDT trade arrivals using parametric point
 1. `Inverse Hessian Matrix` helps detect weak identifiability and local collinearity between parameters
 1. `Godambe Information Matrix` provides standard errors which are robust to model misspecification
 
-### Engineering
+### Efficiency
 1. `Computational complexity reduction`
     1. $O(n^2) \to O(n)$ time for power-law decay calculation using sum-of-exponentials approximation
     1. $O(n) \to O(\log n)$ parallel span for exponential decay calculation, $h_i = e^{-\lambda \Delta t} h_{i-1} + 1$, using parallel prefix scan on a linear recurrence  (`jax.lax.associative_scan` in `decayed_counts.py`)
-1. `JAX Automatic Differentiation (AD)`
-    1. Eliminated manual derivation of log-likelihood gradients for kernels
+1. `Gradient-based optimization`
+    1. Used Automatic Differentiation (AD) to eliminate manual derivation of log-likelihood gradients for kernels
     1. Compute the exact Hessian for diagnostics, avoiding the numerical instability of finite-difference methods
 1. `Property-based testing` ensures power-law approximation remains accurate over valid inputs (`hypothesis` library in `power_law_approx.py`)
 1. `Automated report generation` reduces room for human error when producing reports such as this file (`Jinja2` library in `generate_reports.py`)
 
 ## Scope
-This project is a statistical modelling and engineering exercise for the arrival of trades. This is limited to parameter estimation and diagnostic testing and does not include trading applications such as alpha generation, backtesting, or execution.
+The scope is restricted to conditional intensity estimation for point processes.
 
-## Project Structure
-* `environment.yml` Dependencies
-* `point_process.py` Data loading, model definitions, optimisation, diagnostic plots.
-* `download_trades.py` Multithreaded logic for downloading Binance UM Futures tick data and saving them to compressed parquet files with delta encoding
-* `decayed_counts.py` Implementation and tests for exponential Hawkes state recursion
-* `power_law_approx.py` Implementation and tests for power-law kernel approximation
-* `generate_reports.py` Generates `README.md`
+Although the implementation handles tens of millions of events, the emphasis is on statistical fit and model diagnostics rather than system performance.
 
-## Usage
-```
-conda env create -f environment.yml
-conda activate order-flow
-python src/download_trades.py
-python src/point_process.py
-```
+The analysis does not cover price dynamics, alpha generation, or backtesting.
+
 
 ## Data
 This project uses [Binance UM futures trade data](https://data.binance.vision/data/futures/um/daily).
@@ -80,7 +75,7 @@ $$
 where
 * $\lambda_\theta(t)$ is the conditional intensity given the event history up to time $t$.
 
-Timestamps have `1ms` resolution and each timestamp may have multiple events. For Hawkes models, these events are assumed to be conditionally iid and therefore arrive sequentially and self-excite. This is included in the log likelihood using the Rising Factorial (Pochhammer) polynomial:
+Timestamps have `1ms` resolution and each timestamp may have multiple events. For Hawkes models, these events are assumed to be conditionally iid and therefore arrive "instantaneously" but sequentially. This is included in the log likelihood using the Rising Factorial (Pochhammer) polynomial:
 
 $$
 \begin{align}
@@ -92,13 +87,14 @@ $$
 $$
 
 where
+* $n$ is the number of events with timestamp $t$
 * $\phi_0$ is the base intensity
 * $D_t$ is the decayed sum of events right before $t$
 * $J$ is the jump size
 * $\lambda_0(t) = \phi_0 + D_t J$
 * $\lambda_1(t) = \phi_0 + D_t J + J$
 * $\lambda_k(t) = \phi_0 + D_t J + k J$
-* $a := \phi_0 + D_t J$ is the intensity right before the events
+* $a := \phi_0 + D_t J$ is the pre-computed intensity contribution from history
 * $d := J$
 
 This formulation allows the likelihood to be calculated exactly even when multiple events arrive at the same timestamp, and avoids discarding information or artificially jittering timestamps to increase the data size.
@@ -125,6 +121,8 @@ All the models have heavy right tails, meaning they underestimate the rate of tr
 The residuals seem to follow the same pattern as the expected counts at higher aggregation levels, but that behaviour disappears after zooming in.
 
 ### Estimated Parameters (Click to Expand)
+Timings are taken on an M1 Max MacBook Pro.
+
 {{ all_model_results }}
 
 ## Known Limitations and Future Work
@@ -139,7 +137,8 @@ The residuals seem to follow the same pattern as the expected counts at higher a
         * This can be addressed by using a marked Hawkes process, where the mark could be the count, volume or notional value of orders filled at a timestamp, or by using a nonlinear impact kernel
 1. `Regularisation`
     * Penalties were chosen heuristically by observing the convergence, identifiability and misspecification diagnostics
-    * They can instead be systematically tuned using cross-validation
+    * Consequently, inverse Hessian matrices may be overly optimistic about  identifiability
+    * Regularisation parameters can instead be systematically tuned using cross-validation
 1. `Bayesian Statistics`
     * The aforementioned regularisation parameters can be replaced with prior distributions to allow a Bayesian interpretation
     * Given that the parameters are continuous and the models are differentiable, efficient gradient-aware MCMC samplers such as HMC and NUTS can be used
@@ -149,4 +148,30 @@ The residuals seem to follow the same pattern as the expected counts at higher a
 
 
 ## Conclusion
-TODO
+The relative performance of the Power-Law Hawkes kernel is consistent with apparent long-term memory.
+
+However, the high SE-ratio (Robust SE / Hessian SE) suggests remaining misspecification, likely from exogenous events, non-linear feedback loops (e.g., stop losses, liquidation, automatic deleveraging) or regime shifts.
+
+This work provides a baseline for future research into multivariate (buy, sell) or marked (count, volume) Hawkes models or other non-linear or covariate-driven intensities.
+
+
+## Appendix
+
+### Project Structure
+* `environment.yml` Dependencies
+* `point_process.py` Data loading, model definitions, optimisation, diagnostic plots.
+* `download_trades.py` Multithreaded logic for downloading Binance UM Futures tick data and saving them to compressed parquet files with delta encoding
+* `decayed_counts.py` Implementation and tests for exponential Hawkes state recursion
+* `power_law_approx.py` Implementation and tests for power-law kernel approximation
+* `generate_reports.py` Generates `README.md`
+
+### Usage
+```
+conda env create -f environment.yml
+conda activate order-flow
+python src/download_trades.py
+python src/point_process.py
+```
+
+### Notable Libraries
+JAX, NumPy, Pandas, Polars, PyArrow, Hypothesis
