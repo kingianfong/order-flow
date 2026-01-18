@@ -28,12 +28,27 @@ import power_law_approx
 
 # %%
 
-
-RAW_DATA_DIR = Path.cwd().parent / 'data/raw'
+PROJ_ROOT_DIR = Path.cwd().parent
+RAW_DATA_DIR = PROJ_ROOT_DIR / 'data/raw'
 SYM = 'BTCUSDT'
 DATA_START = datetime.datetime(2025, 9, 1)
 TRAIN_END = datetime.datetime(2025, 9, 30)
 VAL_END = datetime.datetime(2025, 10, 15)
+
+
+ALL_PREFIXES = [
+    'constant',
+    'rbf',
+    'hawkes',
+    'rbf_hawkes',
+    'pl_hawkes',
+]
+RESULTS_DIRS = {
+    **{prefix: PROJ_ROOT_DIR / f'results/{prefix}' for prefix in ALL_PREFIXES},
+    'overall': PROJ_ROOT_DIR / 'results/overall',
+}
+for subdir in RESULTS_DIRS.values():
+    subdir.mkdir(parents=True, exist_ok=True)
 
 
 # %%
@@ -197,7 +212,7 @@ DATASET = create_dataset(INPUT_DF.filter(pl.col('is_train')))
 
 closed_form_intensity = (DATASET.curr_count.sum() /
                          DATASET.time_since_prev.sum()).item()
-print(f'{closed_form_intensity=}, around {closed_form_intensity*ONE_SECOND:.2f}/second')
+print(f'{closed_form_intensity=:.2f}, around {closed_form_intensity*ONE_SECOND:.2f}/second')
 print(f'{jnp.log(closed_form_intensity)=:.4f}')
 
 
@@ -246,7 +261,9 @@ type ModelFn[Params: chex.ArrayTree] = Callable[[Params, Dataset], ModelOutput]
 
 def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
                                                  dataset: Dataset,
-                                                 model_fn: ModelFn[Params]) -> None:
+                                                 model_fn: ModelFn[Params],
+                                                 *,
+                                                 out_dir: Path | None = None) -> None:
     flat_params, unravel = ravel_pytree(params)
     n_params = len(flat_params)
     assert n_params <= 1_000, \
@@ -288,6 +305,9 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
         mask=mask, center=0.0, robust=False,
     )
     plt.title(f"Inverse Hessian Matrix {cond=:.2f}")
+    plt.tight_layout()
+    if out_dir is not None:
+        plt.savefig(out_dir / 'inv_hessian.png')
     plt.show()
     print(f'plotting took {datetime.datetime.now() - start_time}')
 
@@ -309,18 +329,19 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
     p_value = 2 * jax.scipy.stats.norm.sf(jnp.abs(z_score))
     se_ratio = robust_se / hess_se
 
-    display(
-        pd.DataFrame(
-            dict(
-                mean=mean,
-                hess_se=hess_se,
-                robust_se=robust_se,
-                z_score=z_score,
-                p_value=p_value,
-                se_ratio=se_ratio,
-            ),
-            index=labels,
-        )
+    results_df = pd.DataFrame(
+        dict(
+            mean=mean,
+            hess_se=hess_se,
+            robust_se=robust_se,
+            z_score=z_score,
+            p_value=p_value,
+            se_ratio=se_ratio,
+        ),
+        index=labels,
+    )
+    styled = (
+        results_df
         .style
         .background_gradient(
             subset=['hess_se', 'robust_se', 'se_ratio'],
@@ -336,6 +357,9 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
             )
         )
     )
+    display(styled)
+    if out_dir is not None:
+        styled.to_html(out_dir / f'diagnostics.html')
 
 
 def run_optim[Params: chex.ArrayTree](init_params: Params,
@@ -343,7 +367,9 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
                                       dataset: Dataset,
                                       plot_diagnostics: bool,
                                       force_plot: bool = False,
-                                      verbose: bool = False) -> Params:
+                                      verbose: bool = False,
+                                      *,
+                                      out_dir: Path | None = None) -> Params:
     timeout = datetime.timedelta(seconds=150)
     max_iter = 50
     tol = 1e-3
@@ -471,11 +497,13 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
             ax.grid(True, which="both", ls="--", alpha=0.2)
 
         plt.tight_layout()
+        if out_dir is not None:
+            plt.savefig(out_dir / 'optim_outputs.png')
         plt.show()
         display(optim_df)
 
     if plot_diagnostics:
-        plot_fit_diagnostics(params, dataset, model_fn)
+        plot_fit_diagnostics(params, dataset, model_fn, out_dir=out_dir)
 
     return params
 
@@ -555,7 +583,10 @@ def calc_rbf(params: RbfParams, dataset: Dataset) -> ModelOutput:
     )
 
 
-def plot_rbf(sp_inv_base_intensity: Array, weights: Array) -> None:
+def plot_rbf(sp_inv_base_intensity: Array,
+             weights: Array,
+             *,
+             out_path: Path | None = None) -> None:
     # exceed [0, 24] to verify periodic boundary conditions
     time_of_day = jnp.linspace(-4, 28, 500, endpoint=False)
     bases = calc_rbf_basis(time_of_day)
@@ -581,6 +612,8 @@ def plot_rbf(sp_inv_base_intensity: Array, weights: Array) -> None:
     ax2.set_ylabel('weighted bases')
     ax2.set_xlabel('hour')
     plt.tight_layout()
+    if out_path is not None:
+        plt.savefig(out_path)
     plt.show()
 
 
@@ -744,7 +777,8 @@ def plot_model_output(outputs: ModelOutput,
                       input_df: pl.DataFrame,
                       *,
                       bucket_len: str = '1s',
-                      duration: str = '5m') -> None:
+                      duration: str = '5m',
+                      out_path: Path | None = None) -> None:
     df = (
         input_df
         .with_columns(
@@ -810,10 +844,12 @@ def plot_model_output(outputs: ModelOutput,
         ax.tick_params(axis='x', labelrotation=30)
 
     plt.tight_layout()
+    if out_path is not None:
+        plt.savefig(out_path)
     plt.show()
 
 
-def print_params(params) -> None:
+def print_params(params, *, out_path: Path | None = None) -> None:
     prev = params._asdict()
     series = pd.Series(prev, name='param')
 
@@ -827,6 +863,8 @@ def print_params(params) -> None:
             if k.startswith(prefix):
                 series[k.replace(prefix, '')] = transform(v)
     display(series.to_frame())
+    if out_path is not None:
+        series.to_frame().to_html(out_path)
 
 
 def show_hawkes(params: HawkesParams,
@@ -919,12 +957,24 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
 
 
 def show_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset,
-                    input_df: pl.DataFrame) -> None:
+                    input_df: pl.DataFrame,
+                    out_dir: Path | None = None) -> None:
     outputs = chex.chexify(calc_rbf_hawkes)(params, dataset)
-    print_params(params)
-    plot_model_output(outputs, input_df)
+    if out_dir is not None:
+        params_path = out_dir / 'params.html'
+        counts_path = out_dir / 'counts.png'
+        bases_path = out_dir / 'bases.png'
+    else:
+        params_path = None
+        counts_path = None
+        bases_path = None
+
+    print_params(params, out_path=params_path)
+    plot_model_output(outputs, input_df,
+                      out_path=counts_path)
     plot_rbf(sp_inv_base_intensity=params.sp_inv_base_intensity,
-             weights=params.weights)
+             weights=params.weights,
+             out_path=bases_path)
 
 
 init_rbf_hawkes = RbfHawkesParams(
@@ -944,8 +994,10 @@ fitted_rbf_hawkes_params = run_optim(
     model_fn=calc_rbf_hawkes,
     dataset=DATASET,
     plot_diagnostics=True,
+    out_dir=RESULTS_DIRS['rbf_hawkes'],
 )
-show_rbf_hawkes(fitted_rbf_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
+show_rbf_hawkes(fitted_rbf_hawkes_params, DATASET, INPUT_DF.filter('is_train'),
+                out_dir=RESULTS_DIRS['rbf_hawkes'])
 
 
 # %%
@@ -1082,14 +1134,43 @@ display(WITH_MODEL_OUTPUTS)
 # %%
 
 
-display(
+LOGLIK_MEAN = (
     WITH_MODEL_OUTPUTS
     .group_by('is_train')
     .agg(pl.selectors.ends_with('_loglik').mean())
     .sort('is_train', descending=True)
+)
+(
+    LOGLIK_MEAN
     .to_pandas()
+    .set_index('is_train')
     .rename(columns=lambda x: x.replace('_loglik', ''))
-    .style.background_gradient(axis=1)
+    .style
+    .background_gradient(axis=1)
+    .format('{:.2f}')
+    .to_html(RESULTS_DIRS['overall'] / 'loglik_mean.html')
+)
+
+
+# %%
+
+
+LOGLIK_RELATIVE = (
+    LOGLIK_MEAN
+    .with_columns(
+        (pl.selectors.ends_with('_loglik') - pl.col('constant_loglik'))
+        / pl.col('constant_loglik')
+    )
+)
+(
+    LOGLIK_RELATIVE
+    .to_pandas()
+    .set_index('is_train')
+    .rename(columns=lambda x: x.replace('_loglik', ''))
+    .style
+    .background_gradient(axis=1)
+    .format('{:.2%}')
+    .to_html(RESULTS_DIRS['overall'] / 'loglik_relative.html')
 )
 
 
@@ -1100,7 +1181,8 @@ def plot_results(start: datetime.datetime,
                  end: datetime.datetime,
                  *,
                  duration: str,
-                 prefixes: list[str] | None = None) -> None:
+                 prefixes: list[str] | None = None,
+                 plot_path: Path | None = None) -> None:
     df = (
         WITH_MODEL_OUTPUTS
         .filter(
@@ -1129,13 +1211,7 @@ def plot_results(start: datetime.datetime,
         .set_index('time')
     )
 
-    prefixes = prefixes or [
-        'constant',
-        'rbf',
-        'hawkes',
-        'rbf_hawkes',
-        'pl_hawkes',
-    ]
+    prefixes = prefixes or ALL_PREFIXES
     f, axes = plt.subplots(1 + len(prefixes), 1,
                            sharex=True, sharey=False, figsize=(8, 12))
     title = '\n'.join(
@@ -1178,45 +1254,57 @@ def plot_results(start: datetime.datetime,
             ax.axvline(TRAIN_END, linestyle='--', c='k', alpha=0.4)
 
     plt.tight_layout()
+    if plot_path is not None:
+        plt.savefig(plot_path)
     plt.show()
 
 
-plot_results(DATA_START, VAL_END, duration='2h')
+plot_results(DATA_START, VAL_END, duration='2h',
+             plot_path=RESULTS_DIRS['overall'] / 'train_val.png')
 
 
 # %%
 # arbitrary training date
 plot_results(datetime.datetime(2025, 9, 17, hour=9),
              datetime.datetime(2025, 9, 18, hour=6),
-             duration='2m')
+             duration='2m',
+             plot_path=RESULTS_DIRS['overall'] / 'train1.png')
 plot_results(datetime.datetime(2025, 9, 17, hour=17),
              datetime.datetime(2025, 9, 17, hour=20),
-             duration='20s', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'])
+             duration='20s', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'],
+             plot_path=RESULTS_DIRS['overall'] / 'train2.png')
 # %%
 plot_results(datetime.datetime(2025, 9, 17, hour=17, minute=59, second=45,
                                microsecond=0),
              datetime.datetime(2025, 9, 17, hour=18, minute=0, second=15,
                                microsecond=0),
-             duration='100ms', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'])
+             duration='100ms', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'],
+             plot_path=RESULTS_DIRS['overall'] / 'train3.png')
 
 
 # %%
 # 2025/10/10 volatility event
 plot_results(datetime.datetime(2025, 10, 10, hour=9),
              datetime.datetime(2025, 10, 11, hour=6),
-             duration='90s')
+             duration='90s',
+             plot_path=RESULTS_DIRS['overall'] / 'val1.png')
 plot_results(datetime.datetime(2025, 10, 10, hour=19),
              datetime.datetime(2025, 10, 11, hour=1),
-             duration='30s', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'])
+             duration='30s', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'],
+             plot_path=RESULTS_DIRS['overall'] / 'val2.png')
 # %%
 plot_results(datetime.datetime(2025, 10, 10, hour=21, minute=12, second=45),
              datetime.datetime(2025, 10, 10, hour=21, minute=13, second=45),
-             duration='100ms', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'])
+             duration='100ms', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'],
+             plot_path=RESULTS_DIRS['overall'] / 'val3.png')
 
 # %%
 
 
-def plot_qq(subset: pl.DataFrame, duration: str = '100ms'):
+def plot_qq(subset: pl.DataFrame,
+            duration: str = '100ms',
+            *,
+            out_path: Path | None = None):
     assert (subset['curr_count'] > 0).all(), \
         'need to sum compensators by event'
 
@@ -1241,41 +1329,41 @@ def plot_qq(subset: pl.DataFrame, duration: str = '100ms'):
     )
 
     max_subsamples = 1_000_000
-    if subset.height > max_subsamples:
+    full_size = subset.height
+    if full_size > max_subsamples:
         subset = subset.sample(n=max_subsamples, seed=0)
 
-    prefixes = [
-        'constant',
-        'rbf',
-        'hawkes',
-        'rbf_hawkes',
-        'pl_hawkes',
-    ]
     f, axes = plt.subplots(3, 2, sharex=True, sharey=False, figsize=(6, 8))
     f.suptitle('Pearson Residual QQ (Normal Approx)'
-               f'\n{subset.height:,} {duration} buckets'
+               f'\n{duration} buckets, n={subset.height:,}/{full_size:,}'
                f'\n[ {subset['time'].min()} , {subset['time'].max()}]')
 
-    for i, prefix in enumerate(prefixes):
+    for i, prefix in enumerate(ALL_PREFIXES):
         resid = subset[f'{prefix}_resid'].to_numpy()
+        std = np.std(resid)
+
         ax = axes[i // 2, i % 2]
         scipy.stats.probplot(resid, dist='norm', plot=ax, rvalue=True)
-        ax.set_title(f'{prefix}')
+        ax.set_title(f'{prefix}, {std=:.2f}')
+        ax.set_ylabel(r'$(y - \hat y) / \sqrt{ \hat y} $')
+        ax.set_xlabel('Z ~ Normal(0, 1)')
         ax.grid(True, alpha=0.3)
 
-    for j in range(len(prefixes), len(axes.flatten())):
+    for j in range(len(ALL_PREFIXES), len(axes.flatten())):
         axes.flatten()[j].axis('off')
 
     plt.tight_layout()
+    if out_path is not None:
+        plt.savefig(out_path)
     plt.show()
-    display(subset.select(pl.col('^.*_resid$').std()))
 
 
-plot_qq(WITH_MODEL_OUTPUTS.filter(pl.col('is_train')))
-plot_qq(WITH_MODEL_OUTPUTS.filter(~pl.col('is_train')))
-plot_qq(WITH_MODEL_OUTPUTS.filter(
-    pl.col('time').dt.date() >= datetime.date(2025, 10, 10),
-    pl.col('time').dt.date() <= datetime.date(2025, 10, 11),
-))
+plot_qq(WITH_MODEL_OUTPUTS.filter(pl.col('is_train')),
+        out_path=RESULTS_DIRS['overall'] / 'qq_train.png')
+plot_qq(WITH_MODEL_OUTPUTS.filter(~pl.col('is_train')),
+        out_path=RESULTS_DIRS['overall'] / 'qq_test.png')
+plot_qq(WITH_MODEL_OUTPUTS.filter(pl.col('time').dt.date() == datetime.date(2025, 10, 10)),
+        out_path=RESULTS_DIRS['overall'] / 'qq_10-10.png')
+
 
 # %%
