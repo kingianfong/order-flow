@@ -44,87 +44,89 @@ def image(rel_path: str, caption: str) -> str:
 _table_counter = 1
 
 
-def table(styler: Styler, caption: str) -> str:
+def table(df: pd.DataFrame, caption: str) -> str:
     global _table_counter
     count = str(_table_counter)
     _table_counter += 1
 
-    return (
-        styler
-        .set_caption(f'Table {count}: {caption}')
-        .set_table_styles(
-            [
-                {
-                    'selector': '',
-                    'props': [
-                        ('caption-side', 'bottom'),
-                        ('margin-left', 'auto'),
-                        ('margin-right', 'auto'),
-                    ],
-                },
-            ],
-        )
-        # set uuid to ensure determinism for version control
-        .to_html(
-            table_uuid=str(count),
-            doctype_html=False,
-        )
+    template = Template("""\
+<div align="center">
+
+{{ md_table }}
+
+Table {{ count }}: {{ caption }}
+</div>
+""")
+
+    return template.render(
+        count=count,
+        md_table=df.to_markdown(tablefmt='github'),
+        caption=caption,
     )
 
 
 # %%
 
+def convert_formats(df: pd.DataFrame, formatter: str | dict[str, str]) -> pd.DataFrame:
+    if isinstance(formatter, dict):
+        for col, fmt in formatter.items():
+            df[col] = df[col].map(fmt.format)
+        return df
+    if isinstance(formatter, str):
+        for col in df.columns:
+            df[col] = df[col].map(formatter.format)
+        return df
+    assert False, type(formatter)
+
 
 def per_model_results(prefix: str) -> str:
     template = Template(
         """\
+#### {{ prefix }}
 <details>
-  <summary><b>Model: {{ prefix }}</b></summary>
-  <details style="margin-left: 20px;">
-    <summary>Parameters</summary>
-    {{ params }}
-  </details>
-  <details style="margin-left: 20px;">
-    <summary>Diagnostics</summary>
-    {{ diagnostics }}
-  </details>
+<summary>\tParameters</summary>
+{{ params }}
+</details>
+<details>
+<summary>\tDiagnostics</summary>
+{{ diagnostics }}
+</details>
 {% if prefix != "constant" %}
-  <details style="margin-left: 20px;">
-    <summary>Inverse Hessian</summary>
-    {{ inv_hessian }}
-  </details>
+<details>
+<summary>\tInverse Hessian</summary>
+{{ inv_hessian }}
+</details>
 {% endif %}
 {% if prefix in ["rbf", "rbf_hawkes"] %}
-  <details style="margin-left: 20px;">
-    <summary>Seasonality bases</summary>
-    {{ bases }}
-  </details>
+<details>
+<summary>\tSeasonality bases</summary>
+{{ bases }}
+</details>
 {% endif %}
-  <details style="margin-left: 20px;">
-    <summary>Predictions</summary>
-    {{ predictions }}
-  </details>
+<details>
+<summary>\tPredictions</summary>
+{{ predictions }}
 </details>
 """,
         trim_blocks=True,
-        lstrip_blocks=False,
+        lstrip_blocks=True,
     )
     render_kwargs = dict(
         prefix=prefix,
         params=table(
-            styler=(
-                pd.read_csv(
-                    RESULTS_DIR / f'{prefix}/params.csv', index_col=0)
-                .style
+            df=(
+                pd.read_csv(RESULTS_DIR / f'{prefix}/params.csv',
+                            index_col=0)
+                # .style
             ),
             caption=f'{prefix} parameters'
         ),
         diagnostics=table(
-            styler=(
+            df=(
                 pd.read_csv(RESULTS_DIR / f'{prefix}/diagnostics.csv',
                             index_col=0)
-                .style
-                .format(
+                .pipe(
+                    convert_formats,
                     dict(
                         mean='{:.4f}',
                         hess_se='{:.4f}',
@@ -132,7 +134,7 @@ def per_model_results(prefix: str) -> str:
                         z_score='{:.2f}',
                         p_value='{:.2%}',
                         se_ratio='{:.4f}',
-                    )
+                    ),
                 )
             ),
             caption=f'{prefix} diagnostics'
@@ -172,12 +174,11 @@ def generate_readme():
                 .collect()
                 .to_pandas()
                 .set_index('id')
-                .style
             ),
             caption='Raw data',
         ),
         data_stats=table(
-            styler=(
+            df=(
                 pl.scan_parquet(PROJ_ROOT_DIR / 'data/raw')
                 .with_columns(pl.col('time').cast(pl.Datetime('ms')))
                 .group_by(
@@ -191,12 +192,12 @@ def generate_readme():
                 )
                 .collect()
                 .to_pandas().set_index('subset').sort_index()
-                .style.format('{:,}')
+                .pipe(convert_formats, '{:,}')
             ),
             caption='Sample counts'
         ),
         loglik_mean=table(
-            styler=(
+            df=(
                 pl.read_csv(RESULTS_DIR / 'overall/loglik_mean.csv')
                 .with_columns(subset=pl.when(pl.col('is_train'))
                               .then(pl.lit('train')).otherwise(pl.lit('validation')))
@@ -204,13 +205,12 @@ def generate_readme():
                 .to_pandas()
                 .set_index('subset')
                 .rename(columns=lambda x: x.replace('_loglik', ''))
-                .style
-                .format('{:.2f}')
+                .pipe(convert_formats, '{:.2f}')
             ),
-            caption='Mean log likelihood per event',
+            caption='Mean log likelihood per timestamp',
         ),
         loglik_relative=table(
-            styler=(
+            df=(
                 pl.read_csv(RESULTS_DIR / 'overall/loglik_relative.csv')
                 .with_columns(subset=pl.when(pl.col('is_train'))
                               .then(pl.lit('train')).otherwise(pl.lit('validation')))
@@ -218,10 +218,9 @@ def generate_readme():
                 .to_pandas()
                 .set_index('subset')
                 .rename(columns=lambda x: x.replace('_loglik', ''))
-                .style
-                .format('{:.2%}')
+                .pipe(convert_formats, '{:.2f}')
             ),
-            caption='Mean log likelihood per event relative to constant baseline',
+            caption='Mean log likelihood per timestamp relative to constant baseline',
         ),
         qq_val=image(
             'overall/qq_val.png',
