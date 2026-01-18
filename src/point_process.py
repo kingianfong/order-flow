@@ -1371,7 +1371,7 @@ def plot_qq(subset: pl.DataFrame,
 plot_qq(WITH_MODEL_OUTPUTS.filter(pl.col('is_train')),
         out_path=RESULTS_DIRS['overall'] / 'qq_train.png')
 plot_qq(WITH_MODEL_OUTPUTS.filter(~pl.col('is_train')),
-        out_path=RESULTS_DIRS['overall'] / 'qq_test.png')
+        out_path=RESULTS_DIRS['overall'] / 'qq_val.png')
 plot_qq(WITH_MODEL_OUTPUTS.filter(pl.col('time').dt.date() == datetime.date(2025, 10, 10)),
         out_path=RESULTS_DIRS['overall'] / 'qq_10-10.png')
 
