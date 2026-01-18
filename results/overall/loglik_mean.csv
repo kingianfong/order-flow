@@ -1,0 +1,3 @@
+is_train,constant_loglik,rbf_loglik,hawkes_loglik,rbf_hawkes_loglik,pl_hawkes_loglik
+true,8.968854,9.167577,16.649485,21.312183,30.123102
+false,11.964042,12.037487,20.13856,24.979988,34.747772

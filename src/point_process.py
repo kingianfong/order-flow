@@ -489,7 +489,6 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
                                figsize=(8, 1 + n_rows*2))
         key_to_ax = dict(zip(unique_keys, axes))
 
-        f.suptitle('optimisation outputs')
         assert n_rows > 1
         for col in optim_df.columns:
             if col.endswith('grads'):

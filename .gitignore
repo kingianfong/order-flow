@@ -1,5 +1,7 @@
 *
 
+!README.md
+
 !README.template.md
 !.gitignore
 !LICENSE
@@ -7,5 +9,7 @@
 
 !src
 !src/**
+!results
+!results/**
 
 __pycache__
