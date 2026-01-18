@@ -28,7 +28,7 @@ import power_law_approx
 
 # %%
 
-PROJ_ROOT_DIR = Path.cwd().parent
+PROJ_ROOT_DIR = Path(__file__).parent.parent
 RAW_DATA_DIR = PROJ_ROOT_DIR / 'data/raw'
 SYM = 'BTCUSDT'
 DATA_START = datetime.datetime(2025, 9, 1)

@@ -87,6 +87,19 @@ def generate_readme():
             'rbf_hawkes/inv_hessian.png',
             'Inverse Hessian to identify potential identifiability issues',
         ),
+        data_head=table(
+            (
+                pl.scan_parquet(PROJ_ROOT_DIR / 'data/raw')
+                .drop('date')
+                .filter(pl.col('sym') == 'BTCUSDT')
+                .head()
+                .collect()
+                .to_pandas()
+                .set_index('id')
+                .style
+            ),
+            caption='Raw data',
+        ),
         loglik_mean=table(
             styler=(
                 pl.read_csv(RESULTS_DIR / 'overall/loglik_mean.csv')
@@ -100,7 +113,7 @@ def generate_readme():
                 .background_gradient(axis=1)
                 .format('{:.2f}')
             ),
-            caption='Mean log likelihood per sample',
+            caption='Mean log likelihood per event',
         ),
         loglik_relative=table(
             styler=(
@@ -115,7 +128,7 @@ def generate_readme():
                 .background_gradient(axis=1)
                 .format('{:.2%}')
             ),
-            caption='Mean log likelihood per sample relative to constant baseline',
+            caption='Mean log likelihood per event relative to constant baseline',
         ),
         qq_val=image(
             'overall/qq_val.png',
