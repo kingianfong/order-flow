@@ -19,9 +19,9 @@ This project models high-frequency BTCUSDT trade arrivals using parametric point
 
 ### Engineering
 1. `Computational complexity reduction`
-    1. $O(n^2)$ time to $O(n)$ for power-law decay calculation using sum-of-exponentials approximation
-    1. $O(n)$ parallel span to $O(\log n)$ for exponential decay calculation  using parallel prefix scan on a linear recurrence (`jax.lax.associative_scan`)
-1. `Property-based testing` ensures power-law approximation remains accurate over valid inputs (`hypothesis` library)
+    1. $O(n^2) \to O(n)$ time for power-law decay calculation using sum-of-exponentials approximation
+    1. $O(n) \to O(\log n)$ parallel span for exponential decay calculation using parallel prefix scan on a linear recurrence (`jax.lax.associative_scan` in `decayed_counts.py`)
+1. `Property-based testing` ensures power-law approximation remains accurate over valid inputs (`hypothesis` library in `power_law_approx.py`)
 
 ## Non-Objectives
 1. `Alpha generation`: This is a statistical modelling exercise, not a production trading strategy
@@ -70,7 +70,7 @@ where
 * $\lambda_0(t) = \phi_0 + D_t J$
 * $\lambda_1(t) = \phi_0 + D_t J + J$
 * $\lambda_k(t) = \phi_0 + D_t J + k J$
-* $a := \phi_0 + D_t J$
+* $a := \phi_0 + D_t J$ is the intensity right before the events
 * $d := J$
 
 This formulation allows the likelihood to be calculated exactly even when multiple events arrive at the same timestamp, and avoids discarding information or artificially jittering timestamps to increase the data size.
@@ -86,8 +86,9 @@ This formulation allows the likelihood to be calculated exactly even when multip
     * As mentioned before, this project's scope excludes direct applications to alpha and execution.
     * By integrating the models into a trading system and observing their commercial impact, it becomes clear which parts of the model to prioritise.
 1. `Data Granularity`
-    * It is unclear whether each record corresponds to a single aggressive trade or a passive fill as the dataset is not explicitly documented
+    * The data indicates the aggressor side, but it is unclear whether each record corresponds to a single aggressive order or a single passive fill
     * From the documentation of a [similar dataset](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#trade-streams) and visualisations, it seems that each sample in the dataset corresponds to a single passive order getting filled, rather than a single aggressive order
+    * This implies that we could be modelling `arrival of distinct passive order fills`, rather than `arrival of distinct decisions to cross the spread`
 1. `Regularisation`
     * Penalties were chosen heuristically by observing the convergence, identifiability and misspecficiation diagnostics
     * They can instead be systematically tuned using cross-validation
