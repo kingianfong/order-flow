@@ -76,7 +76,7 @@ where
 This formulation allows the likelihood to be calculated exactly even when multiple events arrive at the same timestamp, and avoids discarding information or artificially jittering timestamps to increase the data size.
 
 ## Project Structure
-* `point_process.py`: Data loading, model defintions, optimisation, diagnostic plots.
+* `point_process.py`: Data loading, model definitions, optimisation, diagnostic plots.
 * `download_trades.py`: Multithreaded logic for downloading Binance UM Futures tick data and saving them to compressed parquet files with delta encoding
 * `decayed_counts.py`: Implementation and tests for exponential Hawkes state recursion
 * `power_law_approx.py`: Implementation and tests for power-law kernel approximation
@@ -92,7 +92,7 @@ This formulation allows the likelihood to be calculated exactly even when multip
     * Penalties were chosen heuristically by observing the convergence, identifiability and misspecficiation diagnostics
     * They can instead be systematically tuned using cross-validation
 1. `Bayesian Statistics`
-    * The aforementioned regularsation parameters can be replaced with prior distributions to allow a Bayesian interpretation
+    * The aforementioned regularisation parameters can be replaced with prior distributions to allow a Bayesian interpretation
     * Given that the parameters are continuous and the models are differentiable, efficient gradient-aware MCMC samplers such as HMC and NUTS can be used
 1. `Computational Efficiency`
     * The L-BFGS training loop forces device-host synchronisation and may be problematic if number of parameters increase
