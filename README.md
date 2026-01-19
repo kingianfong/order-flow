@@ -175,7 +175,7 @@ The residuals seem to follow the same pattern as the expected counts at higher a
 ### Estimated Parameters (Click to Expand)
 Timings are taken on an M1 Max MacBook Pro.
 
-#### constant: 1 param(s), training duration: 0.57s (0.03s/eval)
+#### constant: 1 param(s), training duration: 0.55s (0.03s/eval)
 <details>
 <summary>Parameters</summary>
 <div align="center">
@@ -209,7 +209,7 @@ Table 6: constant diagnostics
 </p>
 </details>
 
-#### rbf: 25 param(s), training duration: 3.37s (0.15s/eval)
+#### rbf: 25 param(s), training duration: 3.34s (0.15s/eval)
 <details>
 <summary>Parameters</summary>
 <div align="center">
@@ -294,7 +294,7 @@ Table 8: rbf diagnostics
 </p>
 </details>
 
-#### hawkes: 3 param(s), training duration: 16.21s (0.51s/eval)
+#### hawkes: 3 param(s), training duration: 16.10s (0.50s/eval)
 <details>
 <summary>Parameters</summary>
 <div align="center">
@@ -349,7 +349,7 @@ Table 10: hawkes diagnostics
 </p>
 </details>
 
-#### rbf_hawkes: 27 param(s), training duration: 26.13s (0.39s/eval)
+#### rbf_hawkes: 27 param(s), training duration: 25.17s (0.38s/eval)
 <details>
 <summary>Parameters</summary>
 <div align="center">
@@ -440,7 +440,7 @@ Table 12: rbf_hawkes diagnostics
 </p>
 </details>
 
-#### pl_hawkes: 4 param(s), training duration: 17.34s (0.35s/eval)
+#### pl_hawkes: 4 param(s), training duration: 17.07s (0.35s/eval)
 <details>
 <summary>Parameters</summary>
 <div align="center">
