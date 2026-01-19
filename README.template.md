@@ -1,14 +1,23 @@
 # Order Flow
-This project models BTCUSDT trade-arrival times (Binance UM futures) with Poisson and Hawkes point processes, focusing on intraday seasonality and self-exciting/long-memory clustering.
+This project models the arrival process of Binance UM BTCUSDT trade messages with Poisson and Hawkes point processes, focusing on intraday seasonality and self-exciting clustering (including a heavy-tailed excitation kernel), with exact handling of timestamp collisions.
 
-Results show large likelihood gains from self-excitation, with power-law kernels outperforming exponential Hawkes, while robust-vs-Hessian SE gaps indicate remaining misspecification.
+**Potential use case**: real-time intensity forecasts for queueing/liquidity regime detection or adaptive quoting.
 
-**Concepts**: Maximum Likelihood Estimation (MLE), Hawkes, Numerical Stability, Identifiability, Robust Statistics, Automatic Differentiation (AD, JAX), Market Microstructure
+**Concepts**: Maximum Likelihood Estimation (MLE), Hawkes Process, Numerical Stability, Identifiability, Robust Statistics, Automatic Differentiation (AD, JAX), Market Microstructure
+
+## Findings
+* Power-law Hawkes has higher validation log likelihood than exponential Hawkes
+* QQ residuals show remaining underestimation during bursts
+* Gap between robust and Hessian standard errors indicates model misspecification
 
 ## Key Contributions
-* Exact likelihood for 1ms timestamp collisions (no jittering)
-* Robust SE via Godambe + identifiability diagnostics via inverse Hessian
-* JAX MLE with exact gradients + Hessians
+* Built end-to-end pipeline point-process modelling BTCUSDT trade arrivals (JAX, Polars, 68m trades, 17m unique timestamps)
+* Derived closed-form solution for exact collision-aware likelihood during timestamp collisions while avoiding jittering,
+reduced effective data size by 74% without bias or information loss (unique timestamp aggregation)
+* Performed inference and diagnostics using exact gradients/Hessians (autodiff);
+assessed identifiability with inverse-Hessian structure;
+quantified misspecification with Godambe (sandwich) robust SEs and robust/Hessian SE ratios
+* Optimised full likelihood and gradient evaluation to run under 1 second (10 CPU M1 Max laptop, excluding IO, 17m timestamps), enabled iterative MLE (L-BFGS)
 
 ## Highlights
 {{ intro }}
@@ -18,7 +27,7 @@ Results show large likelihood gains from self-excitation, with power-law kernels
 {{ rbf_hawkes_inv_hess }}
 
 ### Iterative Model Development
-1. `Constant intensity` with Poisson baseline
+1. `Homogeneous Poisson process` with constant intensity
 1. `Daily seasonality` with periodic radial basis functions
 1. `Self-excitation` with Hawkes process
 1. `Long-memory` with power-law decay kernel
@@ -28,9 +37,10 @@ Results show large likelihood gains from self-excitation, with power-law kernels
 1. `Godambe Information Matrix` provides standard errors which are robust to model misspecification
 
 ### Efficiency
+1. `Closed form solution` for log likelihood when there are [multiple events per timestamp](#multiple-events-per-timestamp)
 1. `Computational complexity reduction`
     1. $O(n^2) \to O(n)$ time for power-law decay calculation using sum-of-exponentials approximation
-    1. $O(n) \to O(\log n)$ parallel span for exponential decay calculation, $h_i = e^{-\lambda \Delta t} h_{i-1} + 1$, using parallel prefix scan on a linear recurrence  (`jax.lax.associative_scan` in `decayed_counts.py`)
+    1. $O(n) \to O(\log n)$ parallel span for exponential decay calculation, $h_i = e^{-\omega \Delta t} h_{i-1} + 1$, using parallel prefix scan on a linear recurrence  (`jax.lax.associative_scan` in `decayed_counts.py`)
 1. `Gradient-based optimization`
     1. Used Automatic Differentiation (AD) to eliminate manual derivation of log-likelihood gradients for kernels
     1. Compute the exact Hessian for diagnostics, avoiding the numerical instability of finite-difference methods
@@ -68,25 +78,28 @@ The estimated parameters are assumed to remain constant.
 This project assumes order arrivals follow a point process with the following log likelihood:
 
 $$
-\log L(\theta) = \sum_i \log \lambda_\theta( t_i ) - \int_0^T \lambda_\theta(s) ds
+\log L(\theta) = \sum_i^n \log \lambda_\theta( t_i ) - \int_0^T \lambda_\theta(s) ds
 $$
 
 where
 * $\lambda_\theta(t)$ is the conditional intensity given the event history up to time $t$.
 
-Timestamps have `1ms` resolution and each timestamp may have multiple events. For Hawkes models, these events are assumed to be conditionally iid and therefore arrive "instantaneously" but sequentially. This is included in the log likelihood using the Rising Factorial (Pochhammer) polynomial:
+Timestamps have `1ms` resolution and each timestamp may have multiple events. For Hawkes models, these events are assumed to arrive instantaneously ($\Delta t = 0$) and sequentially, so each event's likelihood includes the previous event with no decay.
+
+The log likelihood for sequential instantaneous arrivals at the same timestamp uses the Rising Factorial (Pochhammer) polynomial:
 
 $$
 \begin{align}
-\log \lambda (t) &= \sum_{j=0}^{n-1} \log \lambda_j(t) \\
-    &= \sum_{j=0}^{n-1} \log( \phi_0 + D_t J + j J) \\
-    &= \sum_{j=0}^{n-1} \log( a + j d) \\
-    &= n \log d  + \log\Gamma(\frac a d + n) - \log\Gamma(\frac a d)
+\ell_t(\theta)
+    &= \sum_{j = 0}^{c_t - 1} \log \lambda_j(t) \\
+    &= \sum_{j = 0}^{c_t - 1} \log( \phi_0 + D_t J + j J ) \\
+    &= \sum_{j = 0}^{c_t - 1} \log( a + j d ) \\
+    &= c_t \log d  + \log\Gamma(\frac a d + c_t) - \log\Gamma(\frac a d)
 \end{align}
 $$
 
 where
-* $n$ is the number of events with timestamp $t$
+* $c_t$ is the number of events with timestamp $t$
 * $\phi_0$ is the base intensity
 * $D_t$ is the decayed sum of events right before $t$
 * $J$ is the jump size
@@ -101,11 +114,19 @@ This formulation allows the likelihood to be calculated exactly even when multip
 ## Results
 
 ### Log Likelihood
+These tables report final log likelihood divided by total number of unique timestamps, $m$:
+
+$$
+\frac 1 m \left( \sum_i^m \log \lambda_\theta( t_i ) - \int_0^T \lambda_\theta(s) ds \right)
+$$
+
+We report log-likelihood per unique timestamp (not per event) because timestamps are aggregated.
+
 {{ loglik_mean }}
 
-{{ loglik_relative }}
+{{ loglik_diff }}
 
-Validation log likelihood is consistently higher than training log likelihood. This is expected as the validation dataset includes `2025-10-10`, when the market was particularly active.
+Because market activity differs across days, absolute log likelihood values are not directly comparable across train/validation and comparisons are only meaningful for within each segment.
 
 ### Validation QQ Plots
 {{ qq_val }}
@@ -127,6 +148,7 @@ Timings are taken on an M1 Max MacBook Pro.
 ## Known Limitations and Future Work
 1. `Trading Applications`
     * By integrating the models into a trading system and observing their commercial impact, it becomes clear which parts of the model to prioritise
+    * This would also give us a wider range of metrics for comparing models (e.g., PnL, Sharpe, max drawdown)
 1. [`Modelling Assumptions`](#modelling-assumptions)
     * Stationarity
         * Regimes can change very quickly as this is crypto
@@ -134,9 +156,13 @@ Timings are taken on an M1 Max MacBook Pro.
     * Multiple Events per Timestamp
         * Because multiple events may correspond to the aggressive order, the conditional iid assumption is suspect
         * This can be addressed by using a marked Hawkes process, where the mark could be the count, volume or notional value of orders filled at a timestamp, or by using a nonlinear impact kernel
+        * Care must be taken to apply impact kernels before aggregation to ensure consistency with production, where trades arrive sequentially and we cannot easily guarantee that there are no more events with the same timestamp
+1. `Time-rescaling Theorem QQ Plot`
+    * The plot was not used as, in its default form, it assumes separate events
+    * Possible adjustments include inserting (zero or jittered) timestamps which introduces bias, or dropping timestamps where more than one event happens, which would correspond to the most important times during trading
 1. `Regularisation`
     * Penalties were chosen heuristically by observing the convergence, identifiability and misspecification diagnostics
-    * Consequently, inverse Hessian matrices may be overly optimistic about  identifiability
+    * Consequently, inverse Hessian matrices may be overly optimistic about identifiability
     * Regularisation parameters can instead be systematically tuned using cross-validation
 1. `Bayesian Statistics`
     * The aforementioned regularisation parameters can be replaced with prior distributions to allow a Bayesian interpretation
@@ -147,7 +173,7 @@ Timings are taken on an M1 Max MacBook Pro.
 
 
 ## Conclusion
-The relative performance of the Power-Law Hawkes kernel is consistent with apparent long-term memory.
+The relative performance of the power-law Hawkes kernel is consistent with apparent long-term memory.
 
 However, the high SE-ratio (Robust SE / Hessian SE) suggests remaining misspecification, likely from exogenous events, non-linear feedback loops (e.g., stop losses, liquidation, automatic deleveraging) or regime shifts.
 
@@ -164,12 +190,15 @@ This work provides a baseline for future research into multivariate (buy, sell) 
 * `power_law_approx.py` Implementation and tests for power-law kernel approximation
 * `generate_reports.py` Generates `README.md`
 
-### Usage
+### Reproduction
 ```
 conda env create -f environment.yml
 conda activate order-flow
 python src/download_trades.py
 python src/point_process.py
+
+# optional: regenerate README.md
+python src/generate_reports.py
 ```
 
 ### Notable Libraries
