@@ -79,10 +79,17 @@ def convert_formats(df: pd.DataFrame, formatter: str | dict[str, str]) -> pd.Dat
     assert False, type(formatter)
 
 
-def per_model_results(prefix: str) -> str:
+def per_model_results(prefix: str, formula: str) -> str:
     template = Template(
         """\
 #### {{ prefix }}: {{ n_params }} param(s), training duration: {{ elapsed }}s ({{ seconds_per_eval }}s/eval)
+
+$$
+\\begin{align}
+{{ formula }}
+\\end{align}
+$$
+
 <details>
 <summary>Parameters</summary>
 {{ params }}
@@ -123,6 +130,8 @@ def per_model_results(prefix: str) -> str:
         n_params=conv_stats['n_params'],
         elapsed='{:.2f}'.format(elapsed),
         seconds_per_eval='{:.2f}'.format(seconds_per_eval),
+        formula=formula,
+
         params=table(
             df=(
                 pd.read_csv(RESULTS_DIR / f'{prefix}/params.csv',
@@ -148,21 +157,61 @@ def per_model_results(prefix: str) -> str:
             ),
             caption=f'{prefix} diagnostics'
         ),
-        inv_hessian=image(f'{prefix}/inv_hessian.png',
-                          f'{prefix} inverse Hessian'),
-        convergence=image(f'{prefix}/optim_outputs.png',
-                          f'{prefix} convergence'),
-        predictions=image(f'{prefix}/counts.png',
-                          f'{prefix} predictions'),
     )
+    if prefix != 'constant':
+        render_kwargs['inv_hessian'] = image(f'{prefix}/inv_hessian.png',
+                                             f'{prefix} inverse Hessian')
+        render_kwargs['convergence'] = image(f'{prefix}/optim_outputs.png',
+                                             f'{prefix} convergence')
     if prefix.startswith('rbf'):
         render_kwargs['bases'] = image(f'{prefix}/bases.png',
                                        f'{prefix} bases')
+    render_kwargs['predictions'] = image(f'{prefix}/counts.png',
+                                         f'{prefix} predictions')
     return template.render(**render_kwargs)
+
+
+def generate_all_model_results() -> str:
+    per_model: list[str] = []
+    formulae = dict(
+        constant='\\lambda(t) = \\mu',
+        rbf='\\lambda(t) = \\text{softplus}( a + \\sum_k w_k \\phi_k(t) )',
+        hawkes=(
+            '& \\lambda(t) = \\mu + \\sum_{t_i < t} \\Phi(t - t_i) \\\\'
+            '\n& \\Phi(t) = g \\omega e^{-\\omega t}'
+        ),
+        rbf_hawkes=(
+            '& \\lambda(t) = \\text{softplus}( a + \\sum_k w_k \\phi_k(t) ) + \\sum_{t_i < t} \\Phi(t - t_i) \\\\'
+            '\n& \\Phi(t) = g \\omega e^{-\\omega t}'
+        ),
+        pl_hawkes=(
+            '& \\lambda(t) = \\mu + \\sum_{t_i < t} \\Phi(t - t_i) \\\\'
+            '\n& \\Phi(t) = \\frac {g \\omega \\beta} {( 1 + \\omega t) ^ {1 + \\beta}}'
+        ),
+    )
+    for prefix, formula in formulae.items():
+        result = per_model_results(prefix=prefix, formula=formula)
+        per_model.append(result)
+    return '\n\n'.join(per_model)
 
 
 def generate_readme():
     template = Template(TEMPLATE_PATH.read_text())
+
+    loglik_mean = (
+        pl.read_csv(RESULTS_DIR / 'overall/loglik_mean.csv')
+        .with_columns(subset=pl.when(pl.col('is_train'))
+                      .then(pl.lit('train')).otherwise(pl.lit('validation')))
+        .drop('is_train')
+    )
+    loglik_diff = (
+        loglik_mean
+        .with_columns(
+            (pl.selectors.ends_with('_loglik') - pl.col('constant_loglik'))
+            / pl.col('constant_loglik')
+        )
+    )
+
     rendered = template.render(
         intro=image(
             'overall/val1.png',
@@ -210,10 +259,7 @@ def generate_readme():
         ),
         loglik_mean=table(
             df=(
-                pl.read_csv(RESULTS_DIR / 'overall/loglik_mean.csv')
-                .with_columns(subset=pl.when(pl.col('is_train'))
-                              .then(pl.lit('train')).otherwise(pl.lit('validation')))
-                .drop('is_train')
+                loglik_mean
                 .to_pandas()
                 .set_index('subset')
                 .rename(columns=lambda x: x.replace('_loglik', ''))
@@ -221,22 +267,19 @@ def generate_readme():
             ),
             caption='Mean log likelihood per timestamp',
         ),
-        loglik_relative=table(
+        loglik_diff=table(
             df=(
-                pl.read_csv(RESULTS_DIR / 'overall/loglik_relative.csv')
-                .with_columns(subset=pl.when(pl.col('is_train'))
-                              .then(pl.lit('train')).otherwise(pl.lit('validation')))
-                .drop('is_train')
+                loglik_diff
                 .to_pandas()
                 .set_index('subset')
                 .rename(columns=lambda x: x.replace('_loglik', ''))
-                .pipe(convert_formats, '{:.2%}')
+                .pipe(convert_formats, '{:.2f}')
             ),
-            caption='Mean log likelihood per timestamp relative to constant baseline',
+            caption='Mean log likelihood per timestamp minus constant baseline',
         ),
         qq_val=image(
             'overall/qq_val.png',
-            'QQ plots of normalised residuals',
+            'QQ plots of Pearson residuals of binned counts',
         ),
         ts_val2=image(
             'overall/val2.png',
@@ -246,13 +289,7 @@ def generate_readme():
             'overall/val3.png',
             '2025-10-10 zoomed in',
         ),
-        all_model_results='\n\n'.join(map(per_model_results, [
-            'constant',
-            'rbf',
-            'hawkes',
-            'rbf_hawkes',
-            'pl_hawkes',
-        ])),
+        all_model_results=generate_all_model_results(),
     )
 
     with open(README_PATH, 'w') as f:

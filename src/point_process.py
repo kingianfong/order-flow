@@ -436,6 +436,8 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
             print('did not converge')
             break
 
+    jax.block_until_ready((losses_hist, grads_hist))
+    elapsed = datetime.datetime.now() - start_time
     labels = get_pytree_labels(params)
     convergence_stats = pd.Series(
         dict(
@@ -470,6 +472,7 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
                 columns=labels,
             )
             .rename(columns=lambda x: f'{x} values')
+            .sort_index(axis=1)
         )
         grads_df = (
             pd.DataFrame(
@@ -477,13 +480,14 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
                 columns=labels,
             )
             .rename(columns=lambda x: f'{x} grads')
+            .sort_index(axis=1)
         )
         optim_df = (pd.concat([metrics_df, params_df, grads_df], axis=1)
                     .astype(float))
 
         col_keys = {col: _get_key(col) for col in optim_df.columns}
         unique_keys = sorted(set(col_keys.values()),
-                             key=lambda x: (x.startswith('.'), x.endswith('grads')))
+                             key=lambda x: (x.startswith('.'), x))
         n_rows = len(unique_keys)
         f, axes = plt.subplots(n_rows, 1, sharex=True,
                                figsize=(8, 1 + n_rows*2))
@@ -675,12 +679,12 @@ plot_model_output(calc_const(fitted_constant_intensity_params, DATASET),
 
 
 class RbfParams(NamedTuple):
-    sp_inv_base_rate: Array
+    sp_inv_base_intensity: Array
     weights: Array = jnp.zeros((N_RBF_CENTERS,),) + 0.1
 
 
 def calc_rbf(params: RbfParams, dataset: Dataset) -> ModelOutput:
-    intensity = jax.nn.softplus(params.sp_inv_base_rate
+    intensity = jax.nn.softplus(params.sp_inv_base_intensity
                                 + dataset.rbf_basis @ params.weights)
     return ModelOutput(
         point_term=dataset.curr_count * jnp.log(intensity),
@@ -688,7 +692,7 @@ def calc_rbf(params: RbfParams, dataset: Dataset) -> ModelOutput:
         forecast_intensity=intensity,
         reg_penalty=(
             jnp.zeros(())
-            + jnp.square(params.sp_inv_base_rate) * 1e2
+            + jnp.square(params.sp_inv_base_intensity) * 1e2
             + jnp.sum(jnp.square(params.weights)) * 1e2
             + jnp.square(jnp.sum(params.weights)) * 1e2
         ),
@@ -730,9 +734,9 @@ def plot_rbf(sp_inv_base_intensity: Array,
 
 
 init_rbf_params = RbfParams(
-    sp_inv_base_rate=fitted_constant_intensity_params.sp_inv_base_intensity,
+    sp_inv_base_intensity=fitted_constant_intensity_params.sp_inv_base_intensity,
 )
-plot_rbf(init_rbf_params.sp_inv_base_rate,
+plot_rbf(init_rbf_params.sp_inv_base_intensity,
          init_rbf_params.weights)
 
 
@@ -749,7 +753,7 @@ print_params(fitted_rbf_params, out_dir=RESULTS_DIRS['rbf'])
 plot_model_output(calc_rbf(fitted_rbf_params, DATASET),
                   INPUT_DF.filter('is_train'),
                   out_dir=RESULTS_DIRS['rbf'])
-plot_rbf(fitted_rbf_params.sp_inv_base_rate, fitted_rbf_params.weights,
+plot_rbf(fitted_rbf_params.sp_inv_base_intensity, fitted_rbf_params.weights,
          out_dir=RESULTS_DIRS['rbf'])
 
 
@@ -1164,28 +1168,6 @@ LOGLIK_MEAN.write_csv(RESULTS_DIRS['overall'] / 'loglik_mean.csv')
     .style
     .background_gradient(axis=1)
     .format('{:.2f}')
-)
-
-
-# %%
-
-
-LOGLIK_RELATIVE = (
-    LOGLIK_MEAN
-    .with_columns(
-        (pl.selectors.ends_with('_loglik') - pl.col('constant_loglik'))
-        / pl.col('constant_loglik')
-    )
-)
-LOGLIK_RELATIVE.write_csv(RESULTS_DIRS['overall'] / 'loglik_relative.csv')
-(
-    LOGLIK_RELATIVE
-    .to_pandas()
-    .set_index('is_train')
-    .rename(columns=lambda x: x.replace('_loglik', ''))
-    .style
-    .background_gradient(axis=1)
-    .format('{:.2%}')
 )
 
 

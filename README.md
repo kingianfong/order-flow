@@ -1,14 +1,23 @@
 # Order Flow
-This project models BTCUSDT trade-arrival times (Binance UM futures) with Poisson and Hawkes point processes, focusing on intraday seasonality and self-exciting/long-memory clustering.
+This project models the arrival process of Binance UM BTCUSDT trade messages with Poisson and Hawkes point processes, focusing on intraday seasonality and self-exciting clustering (including a heavy-tailed excitation kernel), with exact handling of timestamp collisions.
 
-Results show large likelihood gains from self-excitation, with power-law kernels outperforming exponential Hawkes, while robust-vs-Hessian SE gaps indicate remaining misspecification.
+**Potential use case**: real-time intensity forecasts for queueing/liquidity regime detection or adaptive quoting.
 
-**Concepts**: Maximum Likelihood Estimation (MLE), Hawkes, Numerical Stability, Identifiability, Robust Statistics, Automatic Differentiation (AD, JAX), Market Microstructure
+**Concepts**: Maximum Likelihood Estimation (MLE), Hawkes Process, Numerical Stability, Identifiability, Robust Statistics, Automatic Differentiation (AD, JAX), Market Microstructure
+
+## Findings
+* Power-law Hawkes has higher validation log likelihood than exponential Hawkes
+* QQ residuals show remaining underestimation during bursts
+* Gap between robust and Hessian standard errors indicates model misspecification
 
 ## Key Contributions
-* Exact likelihood for 1ms timestamp collisions (no jittering)
-* Robust SE via Godambe + identifiability diagnostics via inverse Hessian
-* JAX MLE with exact gradients + Hessians
+* Built end-to-end pipeline point-process modelling BTCUSDT trade arrivals (JAX, Polars, 68m trades, 17m unique timestamps)
+* Derived closed-form solution for exact collision-aware likelihood during timestamp collisions while avoiding jittering,
+reduced effective data size by 74% without bias or information loss (unique timestamp aggregation)
+* Performed inference and diagnostics using exact gradients/Hessians (autodiff);
+assessed identifiability with inverse-Hessian structure;
+quantified misspecification with Godambe (sandwich) robust SEs and robust/Hessian SE ratios
+* Optimised full likelihood and gradient evaluation to run under 1 second (10 CPU M1 Max laptop, excluding IO, 17m timestamps), enabled iterative MLE (L-BFGS)
 
 ## Highlights
 <p align="center">
@@ -27,7 +36,7 @@ Results show large likelihood gains from self-excitation, with power-law kernels
 </p>
 
 ### Iterative Model Development
-1. `Constant intensity` with Poisson baseline
+1. `Homogeneous Poisson process` with constant intensity
 1. `Daily seasonality` with periodic radial basis functions
 1. `Self-excitation` with Hawkes process
 1. `Long-memory` with power-law decay kernel
@@ -37,9 +46,10 @@ Results show large likelihood gains from self-excitation, with power-law kernels
 1. `Godambe Information Matrix` provides standard errors which are robust to model misspecification
 
 ### Efficiency
+1. `Closed form solution` for log likelihood when there are [multiple events per timestamp](#multiple-events-per-timestamp)
 1. `Computational complexity reduction`
     1. $O(n^2) \to O(n)$ time for power-law decay calculation using sum-of-exponentials approximation
-    1. $O(n) \to O(\log n)$ parallel span for exponential decay calculation, $h_i = e^{-\lambda \Delta t} h_{i-1} + 1$, using parallel prefix scan on a linear recurrence  (`jax.lax.associative_scan` in `decayed_counts.py`)
+    1. $O(n) \to O(\log n)$ parallel span for exponential decay calculation, $h_i = e^{-\omega \Delta t} h_{i-1} + 1$, using parallel prefix scan on a linear recurrence  (`jax.lax.associative_scan` in `decayed_counts.py`)
 1. `Gradient-based optimization`
     1. Used Automatic Differentiation (AD) to eliminate manual derivation of log-likelihood gradients for kernels
     1. Compute the exact Hessian for diagnostics, avoiding the numerical instability of finite-difference methods
@@ -96,25 +106,28 @@ The estimated parameters are assumed to remain constant.
 This project assumes order arrivals follow a point process with the following log likelihood:
 
 $$
-\log L(\theta) = \sum_i \log \lambda_\theta( t_i ) - \int_0^T \lambda_\theta(s) ds
+\log L(\theta) = \sum_i^n \log \lambda_\theta( t_i ) - \int_0^T \lambda_\theta(s) ds
 $$
 
 where
 * $\lambda_\theta(t)$ is the conditional intensity given the event history up to time $t$.
 
-Timestamps have `1ms` resolution and each timestamp may have multiple events. For Hawkes models, these events are assumed to be conditionally iid and therefore arrive "instantaneously" but sequentially. This is included in the log likelihood using the Rising Factorial (Pochhammer) polynomial:
+Timestamps have `1ms` resolution and each timestamp may have multiple events. For Hawkes models, these events are assumed to arrive instantaneously ($\Delta t = 0$) and sequentially, so each event's likelihood includes the previous event with no decay.
+
+The log likelihood for sequential instantaneous arrivals at the same timestamp uses the Rising Factorial (Pochhammer) polynomial:
 
 $$
 \begin{align}
-\log \lambda (t) &= \sum_{j=0}^{n-1} \log \lambda_j(t) \\
-    &= \sum_{j=0}^{n-1} \log( \phi_0 + D_t J + j J) \\
-    &= \sum_{j=0}^{n-1} \log( a + j d) \\
-    &= n \log d  + \log\Gamma(\frac a d + n) - \log\Gamma(\frac a d)
+\ell_t(\theta)
+    &= \sum_{j = 0}^{c_t - 1} \log \lambda_j(t) \\
+    &= \sum_{j = 0}^{c_t - 1} \log( \phi_0 + D_t J + j J ) \\
+    &= \sum_{j = 0}^{c_t - 1} \log( a + j d ) \\
+    &= c_t \log d  + \log\Gamma(\frac a d + c_t) - \log\Gamma(\frac a d)
 \end{align}
 $$
 
 where
-* $n$ is the number of events with timestamp $t$
+* $c_t$ is the number of events with timestamp $t$
 * $\phi_0$ is the base intensity
 * $D_t$ is the decayed sum of events right before $t$
 * $J$ is the jump size
@@ -129,6 +142,14 @@ This formulation allows the likelihood to be calculated exactly even when multip
 ## Results
 
 ### Log Likelihood
+These tables report final log likelihood divided by total number of unique timestamps, $m$:
+
+$$
+\frac 1 m \left( \sum_i^m \log \lambda_\theta( t_i ) - \int_0^T \lambda_\theta(s) ds \right)
+$$
+
+We report log-likelihood per unique timestamp (not per event) because timestamps are aggregated.
+
 <div align="center">
 
 | subset     |   constant |   rbf |   hawkes |   rbf_hawkes |   pl_hawkes |
@@ -141,20 +162,20 @@ Table 3: Mean log likelihood per timestamp
 
 <div align="center">
 
-| subset     | constant   | rbf   | hawkes   | rbf_hawkes   | pl_hawkes   |
+| subset     |   constant |   rbf |   hawkes |   rbf_hawkes |   pl_hawkes |
 |------------|------------|-------|----------|--------------|-------------|
-| train      | 0.00%      | 2.22% | 85.64%   | 137.62%      | 235.86%     |
-| validation | 0.00%      | 0.61% | 68.33%   | 108.79%      | 190.44%     |
+| train      |          0 |  0.02 |     0.86 |         1.38 |        2.36 |
+| validation |          0 |  0.01 |     0.68 |         1.09 |        1.9  |
 
-Table 4: Mean log likelihood per timestamp relative to constant baseline
+Table 4: Mean log likelihood per timestamp minus constant baseline
 </div>
 
-Validation log likelihood is consistently higher than training log likelihood. This is expected as the validation dataset includes `2025-10-10`, when the market was particularly active.
+Because market activity differs across days, absolute log likelihood values are not directly comparable across train/validation and comparisons are only meaningful for within each segment.
 
 ### Validation QQ Plots
 <p align="center">
   <img src="results/overall/qq_val.png" width="90%">
-  <br>Fig 4: QQ plots of normalised residuals
+  <br>Fig 4: QQ plots of Pearson residuals of binned counts
 </p>
 
 All the models have heavy right tails, meaning they underestimate the rate of trades. The self-exciting models perform better.
@@ -176,6 +197,13 @@ The residuals seem to follow the same pattern as the expected counts at higher a
 Timings are taken on an M1 Max MacBook Pro.
 
 #### constant: 1 param(s), training duration: 0.55s (0.03s/eval)
+
+$$
+\begin{align}
+\lambda(t) = \mu
+\end{align}
+$$
+
 <details>
 <summary>Parameters</summary>
 <div align="center">
@@ -205,23 +233,30 @@ Table 6: constant diagnostics
 <summary>Predictions</summary>
 <p align="center">
   <img src="results/constant/counts.png" width="90%">
-  <br>Fig 9: constant predictions
+  <br>Fig 7: constant predictions
 </p>
 </details>
 
-#### rbf: 25 param(s), training duration: 3.34s (0.15s/eval)
+#### rbf: 25 param(s), training duration: 3.27s (0.14s/eval)
+
+$$
+\begin{align}
+\lambda(t) = \text{softplus}( a + \sum_k w_k \phi_k(t) )
+\end{align}
+$$
+
 <details>
 <summary>Parameters</summary>
 <div align="center">
 
-| param            | value     |
-|------------------|-----------|
-| sp_inv_base_rate | 26.227629 |
-| weights          | [-3.7549973   2.5041997  -3.0253346  -1.0833539  -2.164065   -6.323172
+| param                 | value     |
+|-----------------------|-----------|
+| sp_inv_base_intensity | 26.227629 |
+| weights               | [-3.7549973   2.5041997  -3.0253346  -1.0833539  -2.164065   -6.323172
   0.42495412 -3.5103512   1.8282052  -4.2133617  -4.0384836  -7.328086
  -3.9071794   9.726168   27.495842   12.9098015   2.2567353   0.5450706
   6.8609242  -2.1034384  -1.9483695  -8.141842   -6.910304   -4.7565765 ]           |
-| base_rate        | 26.227629 |
+| base_intensity        | 26.227629 |
 
 Table 7: rbf parameters
 </div>
@@ -230,33 +265,33 @@ Table 7: rbf parameters
 <summary>Diagnostics</summary>
 <div align="center">
 
-|                   |    mean |   hess_se |   robust_se |   z_score | p_value   |   se_ratio |
-|-------------------|---------|-----------|-------------|-----------|-----------|------------|
-| .sp_inv_base_rate | 26.2276 |    0.0048 |      0.0219 |   1195.69 | 0.00%     |     4.5687 |
-| .weights[0]       | -3.755  |    0.0179 |      0.1165 |    -32.25 | 0.00%     |     6.5063 |
-| .weights[1]       |  2.5042 |    0.0189 |      0.1223 |     20.48 | 0.00%     |     6.4628 |
-| .weights[2]       | -3.0253 |    0.018  |      0.1187 |    -25.49 | 0.00%     |     6.5999 |
-| .weights[3]       | -1.0834 |    0.018  |      0.1208 |     -8.97 | 0.00%     |     6.7188 |
-| .weights[4]       | -2.1641 |    0.0179 |      0.1194 |    -18.12 | 0.00%     |     6.6702 |
-| .weights[5]       | -6.3232 |    0.0172 |      0.1106 |    -57.19 | 0.00%     |     6.4435 |
-| .weights[6]       |  0.425  |    0.0178 |      0.1208 |      3.52 | 0.04%     |     6.7919 |
-| .weights[7]       | -3.5104 |    0.0183 |      0.1207 |    -29.09 | 0.00%     |     6.6008 |
-| .weights[8]       |  1.8282 |    0.0185 |      0.1204 |     15.19 | 0.00%     |     6.5039 |
-| .weights[9]       | -4.2134 |    0.0176 |      0.1145 |    -36.8  | 0.00%     |     6.5127 |
-| .weights[10]      | -4.0385 |    0.017  |      0.1068 |    -37.81 | 0.00%     |     6.2857 |
-| .weights[11]      | -7.3281 |    0.0163 |      0.1005 |    -72.95 | 0.00%     |     6.1681 |
-| .weights[12]      | -3.9072 |    0.0189 |      0.1187 |    -32.92 | 0.00%     |     6.2748 |
-| .weights[13]      |  9.7262 |    0.0226 |      0.1523 |     63.86 | 0.00%     |     6.7425 |
-| .weights[14]      | 27.4958 |    0.0242 |      0.1595 |    172.43 | 0.00%     |     6.5966 |
-| .weights[15]      | 12.9098 |    0.0231 |      0.1465 |     88.12 | 0.00%     |     6.3353 |
-| .weights[16]      |  2.2567 |    0.02   |      0.1217 |     18.55 | 0.00%     |     6.0963 |
-| .weights[17]      |  0.5451 |    0.0196 |      0.1248 |      4.37 | 0.00%     |     6.3641 |
-| .weights[18]      |  6.8609 |    0.0201 |      0.1322 |     51.89 | 0.00%     |     6.5812 |
-| .weights[19]      | -2.1034 |    0.0186 |      0.1222 |    -17.21 | 0.00%     |     6.5559 |
-| .weights[20]      | -1.9484 |    0.0172 |      0.1146 |    -17.01 | 0.00%     |     6.653  |
-| .weights[21]      | -8.1418 |    0.0155 |      0.0993 |    -82.02 | 0.00%     |     6.3979 |
-| .weights[22]      | -6.9103 |    0.0158 |      0.1039 |    -66.54 | 0.00%     |     6.5881 |
-| .weights[23]      | -4.7566 |    0.0166 |      0.1132 |    -42.03 | 0.00%     |     6.8163 |
+|                        |    mean |   hess_se |   robust_se |   z_score | p_value   |   se_ratio |
+|------------------------|---------|-----------|-------------|-----------|-----------|------------|
+| .sp_inv_base_intensity | 26.2276 |    0.0048 |      0.0219 |   1195.69 | 0.00%     |     4.5687 |
+| .weights[0]            | -3.755  |    0.0179 |      0.1165 |    -32.25 | 0.00%     |     6.5063 |
+| .weights[1]            |  2.5042 |    0.0189 |      0.1223 |     20.48 | 0.00%     |     6.4628 |
+| .weights[2]            | -3.0253 |    0.018  |      0.1187 |    -25.49 | 0.00%     |     6.5999 |
+| .weights[3]            | -1.0834 |    0.018  |      0.1208 |     -8.97 | 0.00%     |     6.7188 |
+| .weights[4]            | -2.1641 |    0.0179 |      0.1194 |    -18.12 | 0.00%     |     6.6702 |
+| .weights[5]            | -6.3232 |    0.0172 |      0.1106 |    -57.19 | 0.00%     |     6.4435 |
+| .weights[6]            |  0.425  |    0.0178 |      0.1208 |      3.52 | 0.04%     |     6.7919 |
+| .weights[7]            | -3.5104 |    0.0183 |      0.1207 |    -29.09 | 0.00%     |     6.6008 |
+| .weights[8]            |  1.8282 |    0.0185 |      0.1204 |     15.19 | 0.00%     |     6.5039 |
+| .weights[9]            | -4.2134 |    0.0176 |      0.1145 |    -36.8  | 0.00%     |     6.5127 |
+| .weights[10]           | -4.0385 |    0.017  |      0.1068 |    -37.81 | 0.00%     |     6.2857 |
+| .weights[11]           | -7.3281 |    0.0163 |      0.1005 |    -72.95 | 0.00%     |     6.1681 |
+| .weights[12]           | -3.9072 |    0.0189 |      0.1187 |    -32.92 | 0.00%     |     6.2748 |
+| .weights[13]           |  9.7262 |    0.0226 |      0.1523 |     63.86 | 0.00%     |     6.7425 |
+| .weights[14]           | 27.4958 |    0.0242 |      0.1595 |    172.43 | 0.00%     |     6.5966 |
+| .weights[15]           | 12.9098 |    0.0231 |      0.1465 |     88.12 | 0.00%     |     6.3353 |
+| .weights[16]           |  2.2567 |    0.02   |      0.1217 |     18.55 | 0.00%     |     6.0963 |
+| .weights[17]           |  0.5451 |    0.0196 |      0.1248 |      4.37 | 0.00%     |     6.3641 |
+| .weights[18]           |  6.8609 |    0.0201 |      0.1322 |     51.89 | 0.00%     |     6.5812 |
+| .weights[19]           | -2.1034 |    0.0186 |      0.1222 |    -17.21 | 0.00%     |     6.5559 |
+| .weights[20]           | -1.9484 |    0.0172 |      0.1146 |    -17.01 | 0.00%     |     6.653  |
+| .weights[21]           | -8.1418 |    0.0155 |      0.0993 |    -82.02 | 0.00%     |     6.3979 |
+| .weights[22]           | -6.9103 |    0.0158 |      0.1039 |    -66.54 | 0.00%     |     6.5881 |
+| .weights[23]           | -4.7566 |    0.0166 |      0.1132 |    -42.03 | 0.00%     |     6.8163 |
 
 Table 8: rbf diagnostics
 </div>
@@ -266,14 +301,14 @@ Table 8: rbf diagnostics
 <summary>Inverse Hessian</summary>
 <p align="center">
   <img src="results/rbf/inv_hessian.png" width="90%">
-  <br>Fig 10: rbf inverse Hessian
+  <br>Fig 8: rbf inverse Hessian
 </p>
 </details>
 <details>
 <summary>Convergence</summary>
 <p align="center">
   <img src="results/rbf/optim_outputs.png" width="90%">
-  <br>Fig 11: rbf convergence
+  <br>Fig 9: rbf convergence
 </p>
 </details>
 
@@ -282,7 +317,7 @@ Table 8: rbf diagnostics
 <summary>Seasonal Basis Functions</summary>
 <p align="center">
   <img src="results/rbf/bases.png" width="90%">
-  <br>Fig 13: rbf bases
+  <br>Fig 10: rbf bases
 </p>
 </details>
 
@@ -290,11 +325,19 @@ Table 8: rbf diagnostics
 <summary>Predictions</summary>
 <p align="center">
   <img src="results/rbf/counts.png" width="90%">
-  <br>Fig 12: rbf predictions
+  <br>Fig 11: rbf predictions
 </p>
 </details>
 
-#### hawkes: 3 param(s), training duration: 16.10s (0.50s/eval)
+#### hawkes: 3 param(s), training duration: 16.21s (0.51s/eval)
+
+$$
+\begin{align}
+& \lambda(t) = \mu + \sum_{t_i < t} \Phi(t - t_i) \\
+& \Phi(t) = g \omega e^{-\omega t}
+\end{align}
+$$
+
 <details>
 <summary>Parameters</summary>
 <div align="center">
@@ -329,14 +372,14 @@ Table 10: hawkes diagnostics
 <summary>Inverse Hessian</summary>
 <p align="center">
   <img src="results/hawkes/inv_hessian.png" width="90%">
-  <br>Fig 14: hawkes inverse Hessian
+  <br>Fig 12: hawkes inverse Hessian
 </p>
 </details>
 <details>
 <summary>Convergence</summary>
 <p align="center">
   <img src="results/hawkes/optim_outputs.png" width="90%">
-  <br>Fig 15: hawkes convergence
+  <br>Fig 13: hawkes convergence
 </p>
 </details>
 
@@ -345,11 +388,19 @@ Table 10: hawkes diagnostics
 <summary>Predictions</summary>
 <p align="center">
   <img src="results/hawkes/counts.png" width="90%">
-  <br>Fig 16: hawkes predictions
+  <br>Fig 14: hawkes predictions
 </p>
 </details>
 
-#### rbf_hawkes: 27 param(s), training duration: 25.17s (0.38s/eval)
+#### rbf_hawkes: 27 param(s), training duration: 25.19s (0.38s/eval)
+
+$$
+\begin{align}
+& \lambda(t) = \text{softplus}( a + \sum_k w_k \phi_k(t) ) + \sum_{t_i < t} \Phi(t - t_i) \\
+& \Phi(t) = g \omega e^{-\omega t}
+\end{align}
+$$
+
 <details>
 <summary>Parameters</summary>
 <div align="center">
@@ -412,14 +463,14 @@ Table 12: rbf_hawkes diagnostics
 <summary>Inverse Hessian</summary>
 <p align="center">
   <img src="results/rbf_hawkes/inv_hessian.png" width="90%">
-  <br>Fig 17: rbf_hawkes inverse Hessian
+  <br>Fig 15: rbf_hawkes inverse Hessian
 </p>
 </details>
 <details>
 <summary>Convergence</summary>
 <p align="center">
   <img src="results/rbf_hawkes/optim_outputs.png" width="90%">
-  <br>Fig 18: rbf_hawkes convergence
+  <br>Fig 16: rbf_hawkes convergence
 </p>
 </details>
 
@@ -428,7 +479,7 @@ Table 12: rbf_hawkes diagnostics
 <summary>Seasonal Basis Functions</summary>
 <p align="center">
   <img src="results/rbf_hawkes/bases.png" width="90%">
-  <br>Fig 20: rbf_hawkes bases
+  <br>Fig 17: rbf_hawkes bases
 </p>
 </details>
 
@@ -436,11 +487,19 @@ Table 12: rbf_hawkes diagnostics
 <summary>Predictions</summary>
 <p align="center">
   <img src="results/rbf_hawkes/counts.png" width="90%">
-  <br>Fig 19: rbf_hawkes predictions
+  <br>Fig 18: rbf_hawkes predictions
 </p>
 </details>
 
-#### pl_hawkes: 4 param(s), training duration: 17.07s (0.35s/eval)
+#### pl_hawkes: 4 param(s), training duration: 16.66s (0.34s/eval)
+
+$$
+\begin{align}
+& \lambda(t) = \mu + \sum_{t_i < t} \Phi(t - t_i) \\
+& \Phi(t) = \frac {g \omega \beta} {( 1 + \omega t) ^ {1 + \beta}}
+\end{align}
+$$
+
 <details>
 <summary>Parameters</summary>
 <div align="center">
@@ -478,14 +537,14 @@ Table 14: pl_hawkes diagnostics
 <summary>Inverse Hessian</summary>
 <p align="center">
   <img src="results/pl_hawkes/inv_hessian.png" width="90%">
-  <br>Fig 21: pl_hawkes inverse Hessian
+  <br>Fig 19: pl_hawkes inverse Hessian
 </p>
 </details>
 <details>
 <summary>Convergence</summary>
 <p align="center">
   <img src="results/pl_hawkes/optim_outputs.png" width="90%">
-  <br>Fig 22: pl_hawkes convergence
+  <br>Fig 20: pl_hawkes convergence
 </p>
 </details>
 
@@ -494,13 +553,14 @@ Table 14: pl_hawkes diagnostics
 <summary>Predictions</summary>
 <p align="center">
   <img src="results/pl_hawkes/counts.png" width="90%">
-  <br>Fig 23: pl_hawkes predictions
+  <br>Fig 21: pl_hawkes predictions
 </p>
 </details>
 
 ## Known Limitations and Future Work
 1. `Trading Applications`
     * By integrating the models into a trading system and observing their commercial impact, it becomes clear which parts of the model to prioritise
+    * This would also give us a wider range of metrics for comparing models (e.g., PnL, Sharpe, max drawdown)
 1. [`Modelling Assumptions`](#modelling-assumptions)
     * Stationarity
         * Regimes can change very quickly as this is crypto
@@ -508,9 +568,13 @@ Table 14: pl_hawkes diagnostics
     * Multiple Events per Timestamp
         * Because multiple events may correspond to the aggressive order, the conditional iid assumption is suspect
         * This can be addressed by using a marked Hawkes process, where the mark could be the count, volume or notional value of orders filled at a timestamp, or by using a nonlinear impact kernel
+        * Care must be taken to apply impact kernels before aggregation to ensure consistency with production, where trades arrive sequentially and we cannot easily guarantee that there are no more events with the same timestamp
+1. `Time-rescaling Theorem QQ Plot`
+    * The plot was not used as, in its default form, it assumes separate events
+    * Possible adjustments include inserting (zero or jittered) timestamps which introduces bias, or dropping timestamps where more than one event happens, which would correspond to the most important times during trading
 1. `Regularisation`
     * Penalties were chosen heuristically by observing the convergence, identifiability and misspecification diagnostics
-    * Consequently, inverse Hessian matrices may be overly optimistic about  identifiability
+    * Consequently, inverse Hessian matrices may be overly optimistic about identifiability
     * Regularisation parameters can instead be systematically tuned using cross-validation
 1. `Bayesian Statistics`
     * The aforementioned regularisation parameters can be replaced with prior distributions to allow a Bayesian interpretation
@@ -521,7 +585,7 @@ Table 14: pl_hawkes diagnostics
 
 
 ## Conclusion
-The relative performance of the Power-Law Hawkes kernel is consistent with apparent long-term memory.
+The relative performance of the power-law Hawkes kernel is consistent with apparent long-term memory.
 
 However, the high SE-ratio (Robust SE / Hessian SE) suggests remaining misspecification, likely from exogenous events, non-linear feedback loops (e.g., stop losses, liquidation, automatic deleveraging) or regime shifts.
 
@@ -538,12 +602,15 @@ This work provides a baseline for future research into multivariate (buy, sell) 
 * `power_law_approx.py` Implementation and tests for power-law kernel approximation
 * `generate_reports.py` Generates `README.md`
 
-### Usage
+### Reproduction
 ```
 conda env create -f environment.yml
 conda activate order-flow
 python src/download_trades.py
 python src/point_process.py
+
+# optional: regenerate README.md
+python src/generate_reports.py
 ```
 
 ### Notable Libraries
