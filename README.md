@@ -7,9 +7,8 @@ Results show large likelihood gains from self-excitation, with power-law kernels
 
 ## Key Contributions
 * Exact likelihood for 1ms timestamp collisions (no jittering)
-* JAX MLE with exact gradients + Hessians
 * Robust SE via Godambe + identifiability diagnostics via inverse Hessian
-* O(n) power-law approximation; parallel scan for exponential kernel
+* JAX MLE with exact gradients + Hessians
 
 ## Highlights
 <p align="center">
