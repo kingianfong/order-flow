@@ -436,6 +436,8 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
             print('did not converge')
             break
 
+    jax.block_until_ready((losses_hist, grads_hist))
+    elapsed = datetime.datetime.now() - start_time
     labels = get_pytree_labels(params)
     convergence_stats = pd.Series(
         dict(
@@ -470,6 +472,7 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
                 columns=labels,
             )
             .rename(columns=lambda x: f'{x} values')
+            .sort_index(axis=1)
         )
         grads_df = (
             pd.DataFrame(
@@ -477,6 +480,7 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
                 columns=labels,
             )
             .rename(columns=lambda x: f'{x} grads')
+            .sort_index(axis=1)
         )
         optim_df = (pd.concat([metrics_df, params_df, grads_df], axis=1)
                     .astype(float))
