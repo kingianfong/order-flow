@@ -11,13 +11,12 @@ This project models the arrival process of Binance UM BTCUSDT trade messages wit
 * Gap between robust and Hessian standard errors indicates model misspecification
 
 ## Key Contributions
-* Built end-to-end pipeline point-process modelling BTCUSDT trade arrivals (JAX, Polars, 68m trades, 17m unique timestamps)
-* Derived closed-form solution for exact collision-aware likelihood during timestamp collisions while avoiding jittering,
-reduced effective data size by 74% without bias or information loss (unique timestamp aggregation)
-* Performed inference and diagnostics using exact gradients/Hessians (autodiff);
-assessed identifiability with inverse-Hessian structure;
-quantified misspecification with Godambe (sandwich) robust SEs and robust/Hessian SE ratios
-* Optimised full likelihood and gradient evaluation to run under 1 second (10 CPU M1 Max laptop, excluding IO, 17m timestamps), enabled iterative MLE (L-BFGS)
+* Derived closed-form, collision-aware likelihood for tied timestamps (no jittering), enabling exact inference
+and a 74% reduction in effective data size with no bias or information loss
+* Implemented inference with exact autodiff gradients and Hessians; assessed local identifiability via
+inverse-Hessian and misspecification diagnostics via robust (Godambe, sandwich) standard errors
+* Optimised full likelihood and gradient evaluation to run under 1 second (excluding IO, 17M unique
+timestamps after collision handling, 10-core M1 Max laptop), enabled iterative MLE (L-BFGS)
 
 ## Highlights
 <p align="center">
