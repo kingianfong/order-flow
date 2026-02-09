@@ -21,7 +21,7 @@ OUTPUT_DIR = Path(__file__).parent.parent / 'data/raw'
 
 SYMBOLS = [
     'BTCUSDT',
-    'ETHUSDT',
+    # 'ETHUSDT',
 ]
 
 

@@ -198,6 +198,27 @@ def generate_all_model_results() -> str:
 def generate_readme():
     template = Template(TEMPLATE_PATH.read_text())
 
+    data_stats_pl = (
+        pl.scan_parquet(PROJ_ROOT_DIR / 'data/raw')
+        .select(['date', 'time'])
+        .with_columns(pl.col('time').cast(pl.Datetime('ms')))
+        .group_by(
+            subset=(pl.when(pl.col('date') < VAL_START_DATE)
+                    .then(pl.lit('train'))
+                    .otherwise(pl.lit('validation'))),
+        )
+        .agg(
+            n_events=pl.len(),
+            n_unique_timestamps=pl.col('time').n_unique(),
+        )
+        .collect()
+    )
+    data_stats_pd = (
+        data_stats_pl
+        .to_pandas().set_index('subset').sort_index()
+        .pipe(convert_formats, '{:,}')
+    )
+
     loglik_mean = (
         pl.read_csv(RESULTS_DIR / 'overall/loglik_mean.csv')
         .with_columns(subset=pl.when(pl.col('is_train'))
@@ -208,8 +229,51 @@ def generate_readme():
         loglik_mean
         .with_columns(
             (pl.selectors.ends_with('_loglik') - pl.col('constant_loglik'))
-            / pl.col('constant_loglik')
         )
+    )
+    model_param_counts = {
+        'constant': 1,
+        'rbf': 25,
+        'hawkes': 3,
+        'rbf_hawkes': 27,
+        'pl_hawkes': 4,
+    }
+    loglik_cols = [c for c in loglik_mean.columns if c.endswith('_loglik')]
+    loglik_with_n = loglik_mean.join(
+        data_stats_pl.select(['subset', 'n_unique_timestamps']),
+        on='subset',
+        how='left',
+    )
+    aic_train = (
+        loglik_with_n
+        .select(
+            ['subset']
+            + [
+                (
+                    (2.0 * model_param_counts[c.replace('_loglik', '')])
+                    / pl.col('n_unique_timestamps')
+                    - 2.0 * pl.col(c)
+                ).alias(c)
+                for c in loglik_cols
+            ]
+        )
+        .filter(pl.col('subset') == 'train')
+    )
+    bic_train = (
+        loglik_with_n
+        .select(
+            ['subset']
+            + [
+                (
+                    (model_param_counts[c.replace('_loglik', '')]
+                     * pl.col('n_unique_timestamps').log())
+                    / pl.col('n_unique_timestamps')
+                    - 2.0 * pl.col(c)
+                ).alias(c)
+                for c in loglik_cols
+            ]
+        )
+        .filter(pl.col('subset') == 'train')
     )
 
     rendered = template.render(
@@ -239,22 +303,7 @@ def generate_readme():
             caption='Raw data',
         ),
         data_stats=table(
-            df=(
-                pl.scan_parquet(PROJ_ROOT_DIR / 'data/raw')
-                .with_columns(pl.col('time').cast(pl.Datetime('ms')))
-                .group_by(
-                    subset=(pl.when(pl.col('date') < VAL_START_DATE)
-                            .then(pl.lit('train'))
-                            .otherwise(pl.lit('validation'))),
-                )
-                .agg(
-                    n_events=pl.len(),
-                    n_unique_timestamps=pl.col('time').n_unique(),
-                )
-                .collect()
-                .to_pandas().set_index('subset').sort_index()
-                .pipe(convert_formats, '{:,}')
-            ),
+            df=data_stats_pd,
             caption='Sample counts'
         ),
         loglik_mean=table(
@@ -276,6 +325,26 @@ def generate_readme():
                 .pipe(convert_formats, '{:.2f}')
             ),
             caption='Mean log likelihood per timestamp minus constant baseline',
+        ),
+        aic_train=table(
+            df=(
+                aic_train
+                .to_pandas()
+                .set_index('subset')
+                .rename(columns=lambda x: x.replace('_loglik', ''))
+                .pipe(convert_formats, '{:.4f}')
+            ),
+            caption='AIC per timestamp (train only, lower is better)',
+        ),
+        bic_train=table(
+            df=(
+                bic_train
+                .to_pandas()
+                .set_index('subset')
+                .rename(columns=lambda x: x.replace('_loglik', ''))
+                .pipe(convert_formats, '{:.4f}')
+            ),
+            caption='BIC per timestamp (train only, lower is better)',
         ),
         qq_val=image(
             'overall/qq_val.png',

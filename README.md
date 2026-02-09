@@ -90,7 +90,7 @@ Table 1: Raw data
 | train      | 68,534,083 | 17,383,302            |
 | validation | 64,626,641 | 14,826,005            |
 
-Table 2: Sample counts
+Table 1: Sample counts
 </div>
 
 It is unclear whether each record corresponds to a single aggressive order or a single passive fill. From the documentation of a [similar dataset](https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams#trade-streams) and visualisations, it seems that (2) is more likely. This implies that we could be modelling `arrival of distinct passive order fills`, rather than `arrival of distinct decisions to cross the spread`.
@@ -148,6 +148,10 @@ $$
 $$
 
 We report log-likelihood per unique timestamp (not per event) because timestamps are aggregated.
+Raw log-likelihood is not adjusted for parameter count, so in-sample comparisons across models with different
+numbers of parameters should use AIC/BIC. For predictive comparison, use validation log-likelihood.
+Because $m$ is very large, per-timestamp AIC/BIC penalties are small and the values are close to $-2$ times
+the mean log-likelihood.
 
 <div align="center">
 
@@ -156,20 +160,38 @@ We report log-likelihood per unique timestamp (not per event) because timestamps
 | train      |       8.97 |  9.17 |    16.65 |        21.31 |       30.12 |
 | validation |      11.96 | 12.04 |    20.14 |        24.98 |       34.75 |
 
-Table 3: Mean log likelihood per timestamp
+Table 2: Mean log likelihood per timestamp
 </div>
 
 <div align="center">
 
 | subset     |   constant |   rbf |   hawkes |   rbf_hawkes |   pl_hawkes |
 |------------|------------|-------|----------|--------------|-------------|
-| train      |          0 |  0.02 |     0.86 |         1.38 |        2.36 |
-| validation |          0 |  0.01 |     0.68 |         1.09 |        1.9  |
+| train      |          0 |  0.2  |     7.68 |        12.34 |       21.15 |
+| validation |          0 |  0.07 |     8.17 |        13.02 |       22.78 |
 
-Table 4: Mean log likelihood per timestamp minus constant baseline
+Table 3: Mean log likelihood per timestamp minus constant baseline
 </div>
 
-Because market activity differs across days, absolute log likelihood values are not directly comparable across train/validation and comparisons are only meaningful for within each segment.
+<div align="center">
+
+| subset   |   constant |      rbf |   hawkes |   rbf_hawkes |   pl_hawkes |
+|----------|------------|----------|----------|--------------|-------------|
+| train    |   -17.9377 | -18.3352 |  -33.299 |     -42.6244 |    -60.2462 |
+
+Table 4: AIC per timestamp (train only, lower is better)
+</div>
+
+<div align="center">
+
+| subset   |   constant |      rbf |   hawkes |   rbf_hawkes |   pl_hawkes |
+|----------|------------|----------|----------|--------------|-------------|
+| train    |   -17.9377 | -18.3351 |  -33.299 |     -42.6243 |    -60.2462 |
+
+Table 5: BIC per timestamp (train only, lower is better)
+</div>
+
+Because market activity differs across days, absolute log-likelihood values are not directly comparable across train/validation and comparisons are only meaningful within each segment.
 
 ### Validation QQ Plots
 <p align="center">
@@ -212,7 +234,7 @@ $$
 | sp_inv_base_intensity | 26.4407 |
 | base_intensity        | 26.4407 |
 
-Table 5: constant parameters
+Table 6: constant parameters
 </div>
 </details>
 <details>
@@ -223,7 +245,7 @@ Table 5: constant parameters
 |------------------------|---------|-----------|-------------|-----------|-----------|------------|
 | .sp_inv_base_intensity | 26.4407 |    0.0032 |       0.022 |   1202.19 | 0.00%     |     6.8862 |
 
-Table 6: constant diagnostics
+Table 7: constant diagnostics
 </div>
 </details>
 
@@ -257,7 +279,7 @@ $$
   6.8609242  -2.1034384  -1.9483695  -8.141842   -6.910304   -4.7565765 ]           |
 | base_intensity        | 26.227629 |
 
-Table 7: rbf parameters
+Table 8: rbf parameters
 </div>
 </details>
 <details>
@@ -292,7 +314,7 @@ Table 7: rbf parameters
 | .weights[22]           | -6.9103 |    0.0158 |      0.1039 |    -66.54 | 0.00%     |     6.5881 |
 | .weights[23]           | -4.7566 |    0.0166 |      0.1132 |    -42.03 | 0.00%     |     6.8163 |
 
-Table 8: rbf diagnostics
+Table 9: rbf diagnostics
 </div>
 </details>
 
@@ -350,7 +372,7 @@ $$
 | branching_ratio       |  0.872848 |
 | decay_rate            | 12.5844   |
 
-Table 9: hawkes parameters
+Table 10: hawkes parameters
 </div>
 </details>
 <details>
@@ -363,7 +385,7 @@ Table 9: hawkes parameters
 | .logit_branching_ratio |  1.9264 |    0.0008 |      0.005  |    382.8  | 0.00%     |     6.0568 |
 | .sp_inv_decay_rate     | 12.5844 |    0.0016 |      0.0093 |   1356.29 | 0.00%     |     5.7826 |
 
-Table 10: hawkes diagnostics
+Table 11: hawkes diagnostics
 </div>
 </details>
 
@@ -417,7 +439,7 @@ $$
 | branching_ratio       | 0.83864886 |
 | decay_rate            | 134.00043  |
 
-Table 11: rbf_hawkes parameters
+Table 12: rbf_hawkes parameters
 </div>
 </details>
 <details>
@@ -454,7 +476,7 @@ Table 11: rbf_hawkes parameters
 | .weights[22]           |  -0.8622 |    0.0078 |      0.0082 |   -105.52 | 0.00%     |     1.0533 |
 | .weights[23]           |  -0.6439 |    0.008  |      0.0086 |    -74.82 | 0.00%     |     1.0766 |
 
-Table 12: rbf_hawkes diagnostics
+Table 13: rbf_hawkes diagnostics
 </div>
 </details>
 
@@ -514,7 +536,7 @@ $$
 | inv_omega             |  0.000139544 |
 | beta                  |  0.858339    |
 
-Table 13: pl_hawkes parameters
+Table 14: pl_hawkes parameters
 </div>
 </details>
 <details>
@@ -528,7 +550,7 @@ Table 13: pl_hawkes parameters
 | .sp_inv_inv_omega      | -8.8771 |    0.0002 |      0.0006 | -14660.3  | 0.00%     |     3.2892 |
 | .logit_beta            |  1.8016 |    0.0004 |      0.0006 |   3014.49 | 0.00%     |     1.3526 |
 
-Table 14: pl_hawkes diagnostics
+Table 15: pl_hawkes diagnostics
 </div>
 </details>
 

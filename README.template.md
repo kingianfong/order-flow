@@ -120,12 +120,20 @@ $$
 $$
 
 We report log-likelihood per unique timestamp (not per event) because timestamps are aggregated.
+Raw log-likelihood is not adjusted for parameter count, so in-sample comparisons across models with different
+numbers of parameters should use AIC/BIC. For predictive comparison, use validation log-likelihood.
+Because $m$ is very large, per-timestamp AIC/BIC penalties are small and the values are close to $-2$ times
+the mean log-likelihood.
 
 {{ loglik_mean }}
 
 {{ loglik_diff }}
 
-Because market activity differs across days, absolute log likelihood values are not directly comparable across train/validation and comparisons are only meaningful for within each segment.
+{{ aic_train }}
+
+{{ bic_train }}
+
+Because market activity differs across days, absolute log-likelihood values are not directly comparable across train/validation and comparisons are only meaningful within each segment.
 
 ### Validation QQ Plots
 {{ qq_val }}
