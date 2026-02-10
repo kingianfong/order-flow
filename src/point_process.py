@@ -29,23 +29,23 @@ import power_law_approx
 # %%
 
 PROJ_ROOT_DIR = Path(__file__).parent.parent
-RAW_DATA_DIR = PROJ_ROOT_DIR / 'data/raw'
-SYM = 'BTCUSDT'
+RAW_DATA_DIR = PROJ_ROOT_DIR / "data/raw"
+SYM = "BTCUSDT"
 DATA_START = datetime.datetime(2025, 9, 1)
 TRAIN_END = datetime.datetime(2025, 9, 30)
 VAL_END = datetime.datetime(2025, 10, 15)
 
 
 ALL_PREFIXES = [
-    'constant',
-    'rbf',
-    'hawkes',
-    'rbf_hawkes',
-    'pl_hawkes',
+    "constant",
+    "rbf",
+    "hawkes",
+    "rbf_hawkes",
+    "pl_hawkes",
 ]
 RESULTS_DIRS = {
-    **{prefix: PROJ_ROOT_DIR / f'results/{prefix}' for prefix in ALL_PREFIXES},
-    'overall': PROJ_ROOT_DIR / 'results/overall',
+    **{prefix: PROJ_ROOT_DIR / f"results/{prefix}" for prefix in ALL_PREFIXES},
+    "overall": PROJ_ROOT_DIR / "results/overall",
 }
 for subdir in RESULTS_DIRS.values():
     subdir.mkdir(parents=True, exist_ok=True)
@@ -56,48 +56,52 @@ for subdir in RESULTS_DIRS.values():
 
 # timestamps only hav millisecond resolution
 # there can be multiple trades per timestamp
-def load_data(raw_data_dir: Path,
-              sym: str,
-              start: datetime.datetime,
-              train_end: datetime.datetime,
-              val_end: datetime.datetime) -> pl.DataFrame:
-    assert start <= train_end <= val_end, \
-        f'{start=}, {train_end=}, {val_end=}'
+def load_data(
+    raw_data_dir: Path,
+    sym: str,
+    start: datetime.datetime,
+    train_end: datetime.datetime,
+    val_end: datetime.datetime,
+) -> pl.DataFrame:
+    assert start <= train_end <= val_end, f"{start=}, {train_end=}, {val_end=}"
     df = (
         pl.scan_parquet(raw_data_dir)
         .filter(
-            pl.col('sym') == sym,
-            pl.col('date') >= start,
-            pl.col('date') <= val_end,
+            pl.col("sym") == sym,
+            pl.col("date") >= start,
+            pl.col("date") <= val_end,
         )
         .with_columns(
-            pl.col('time').cast(pl.Datetime('ms')),
-            is_train=pl.col('date') <= train_end,
+            pl.col("time").cast(pl.Datetime("ms")),
+            is_train=pl.col("date") <= train_end,
         )
-        .drop('sym', 'date')
-        .sort('time')
-        .group_by('time', maintain_order=True)
+        .drop("sym", "date")
+        .sort("time")
+        .group_by("time", maintain_order=True)
         .agg(
-            pl.col('is_train').first(),
+            pl.col("is_train").first(),
             curr_count=pl.len(),
-            hi_price=pl.col('price').max(),
-            lo_price=pl.col('price').min(),
+            hi_price=pl.col("price").max(),
+            lo_price=pl.col("price").min(),
         )
         .with_columns(
-            time_since_prev=pl.col('time').diff(),
-            hour=((pl.col('time') - pl.col('time').dt.truncate('1d'))
-                  .dt.total_hours(fractional=True)),
+            time_since_prev=pl.col("time").diff(),
+            hour=(
+                (pl.col("time") - pl.col("time").dt.truncate("1d")).dt.total_hours(
+                    fractional=True
+                )
+            ),
         )
-        .filter(pl.col('time_since_prev').is_not_null())
+        .filter(pl.col("time_since_prev").is_not_null())
         .collect()
     )
 
-    assert df['time'].is_unique().all()
-    assert df['time'].is_sorted()
-    assert (df['curr_count'] > 0).all()
-    assert (df['time_since_prev'] > datetime.timedelta(0)).all()
-    assert (df['hour'] >= 0).all()
-    assert (df['hour'] <= 24).all()
+    assert df["time"].is_unique().all()
+    assert df["time"].is_sorted()
+    assert (df["curr_count"] > 0).all()
+    assert (df["time_since_prev"] > datetime.timedelta(0)).all()
+    assert (df["hour"] >= 0).all()
+    assert (df["hour"] <= 24).all()
     return df
 
 
@@ -139,8 +143,7 @@ class PowerLawCache(NamedTuple):
     decay_integral: Array  # for compensator
 
 
-def calc_power_law_cache(curr_count: Array,
-                         time_since_prev: Array) -> PowerLawCache:
+def calc_power_law_cache(curr_count: Array, time_since_prev: Array) -> PowerLawCache:
     decay_rates = power_law_approx.calc_decay_rates(
         min_history=ONE_MILLISECOND / 10,
         max_history=10 * ONE_MIN,
@@ -153,8 +156,9 @@ def calc_power_law_cache(curr_count: Array,
         decay_factor_exponents = time_since_prev * decay_rates
         decay_factor = jnp.exp(-decay_factor_exponents)
         curr_minus_count = prev_decayed_count * decay_factor
-        decay_integral = (prev_decayed_count *
-                          -jnp.expm1(-decay_factor_exponents)) / decay_rates
+        decay_integral = (
+            prev_decayed_count * -jnp.expm1(-decay_factor_exponents)
+        ) / decay_rates
         curr_decayed_count = curr_minus_count + count
         y = curr_decayed_count, curr_minus_count, decay_integral
         return curr_decayed_count, y
@@ -186,16 +190,14 @@ ONE_HOUR: float = 3600.0 * 1e0
 
 
 def create_dataset(df: pl.DataFrame) -> Dataset:
-    assert ONE_SECOND == 1.0, f'{ONE_SECOND=}'
+    assert ONE_SECOND == 1.0, f"{ONE_SECOND=}"
 
-    curr_count = df['curr_count'].cast(float).to_jax()
-    time_since_prev = (df['time_since_prev']
-                       .dt.total_seconds(fractional=True)
-                       .to_jax())
+    curr_count = df["curr_count"].cast(float).to_jax()
+    time_since_prev = df["time_since_prev"].dt.total_seconds(fractional=True).to_jax()
     return Dataset(
         curr_count=curr_count,
         time_since_prev=time_since_prev,
-        rbf_basis=calc_rbf_basis(df['hour'].to_jax()),
+        rbf_basis=calc_rbf_basis(df["hour"].to_jax()),
         power_law_cache=calc_power_law_cache(
             curr_count=curr_count,
             time_since_prev=time_since_prev,
@@ -204,16 +206,19 @@ def create_dataset(df: pl.DataFrame) -> Dataset:
     )
 
 
-DATASET = create_dataset(INPUT_DF.filter(pl.col('is_train')))
+DATASET = create_dataset(INPUT_DF.filter(pl.col("is_train")))
 
 
 # %%
 
 
-closed_form_intensity = (DATASET.curr_count.sum() /
-                         DATASET.time_since_prev.sum()).item()
-print(f'{closed_form_intensity=:.2f}, around {closed_form_intensity*ONE_SECOND:.2f}/second')
-print(f'{jnp.log(closed_form_intensity)=:.4f}')
+closed_form_intensity = (
+    DATASET.curr_count.sum() / DATASET.time_since_prev.sum()
+).item()
+print(
+    f"{closed_form_intensity=:.2f}, around {closed_form_intensity * ONE_SECOND:.2f}/second"
+)
+print(f"{jnp.log(closed_form_intensity)=:.4f}")
 
 
 # %%
@@ -226,8 +231,7 @@ def get_pytree_labels(params: chex.ArrayTree) -> list[str]:
     labels = []
     for path, leaf in leaves_with_path:
         # Convert path tuple (e.g., (DictKey(key='w'),)) to a string "w"
-        path_str = ".".join(
-            [str(p.key if hasattr(p, 'key') else p) for p in path])
+        path_str = ".".join([str(p.key if hasattr(p, "key") else p) for p in path])
 
         if leaf.size == 1:
             labels.append(path_str)
@@ -259,15 +263,12 @@ class ModelOutput(NamedTuple):
 type ModelFn[Params: chex.ArrayTree] = Callable[[Params, Dataset], ModelOutput]
 
 
-def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
-                                                 dataset: Dataset,
-                                                 model_fn: ModelFn[Params],
-                                                 *,
-                                                 out_dir: Path) -> None:
+def plot_fit_diagnostics[Params: chex.ArrayTree](
+    params: Params, dataset: Dataset, model_fn: ModelFn[Params], *, out_dir: Path
+) -> None:
     flat_params, unravel = ravel_pytree(params)
     n_params = len(flat_params)
-    assert n_params <= 1_000, \
-        f'{n_params=}, hessian is memory intensive'
+    assert n_params <= 1_000, f"{n_params=}, hessian is memory intensive"
     labels = get_pytree_labels(params)
 
     def per_obs_loss(flat_p, dataset):
@@ -280,11 +281,11 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
     calc_hess = chex.chexify(jax.jit(jax.hessian(flat_loss)))
     calc_jacobian = chex.chexify(jax.jit(jax.jacfwd(per_obs_loss)))
 
-    print('calculating hessian')
+    print("calculating hessian")
     start_time = datetime.datetime.now()
     hess_mat = calc_hess(flat_params, dataset=dataset)
     hess_mat.block_until_ready()
-    print(f'hessian took {datetime.datetime.now() - start_time}')
+    print(f"hessian took {datetime.datetime.now() - start_time}")
 
     eigvals = jnp.linalg.eigvalsh(hess_mat)
     if jnp.any(eigvals <= 0):
@@ -297,31 +298,34 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
     hess_corr_mat = inv_hess_mat / jnp.outer(diag_sqrt, diag_sqrt)
     mask = np.triu(np.ones_like(hess_corr_mat, dtype=bool))
 
-    print('plotting hessian')
+    print("plotting hessian")
     start_time = datetime.datetime.now()
     plt.figure(figsize=(8, 6))
     sns.heatmap(
         data=pd.DataFrame(hess_corr_mat, index=labels, columns=labels),
-        mask=mask, center=0.0, robust=False,
+        mask=mask,
+        center=0.0,
+        robust=False,
     )
     plt.title(f"Inverse Hessian Matrix {cond=:.2f}")
     plt.tight_layout()
-    plt.savefig(out_dir / 'inv_hessian.png')
+    plt.savefig(out_dir / "inv_hessian.png")
     plt.show()
-    print(f'plotting took {datetime.datetime.now() - start_time}')
+    print(f"plotting took {datetime.datetime.now() - start_time}")
 
-    print('calculating sandwich estimator errors')  # Var = B^-1 @ A @ B^-1
+    print("calculating sandwich estimator errors")  # Var = B^-1 @ A @ B^-1
     start_time = datetime.datetime.now()
     jacobian = calc_jacobian(flat_params, dataset)
-    assert jacobian.shape == (dataset.n_samples, n_params), \
-        f'{jacobian.shape=}, {dataset.n_samples=}, {n_params=}'
+    assert jacobian.shape == (dataset.n_samples, n_params), (
+        f"{jacobian.shape=}, {dataset.n_samples=}, {n_params=}"
+    )
     meat = (jacobian.T @ jacobian) / dataset.n_samples
     bread = inv_hess_mat
     # aka godambe information matrix
     robust_var = (bread @ meat @ bread) / dataset.n_samples
     robust_se = jnp.sqrt(jnp.diag(robust_var))
     robust_se.block_until_ready()
-    print(f'errors took {datetime.datetime.now() - start_time}')
+    print(f"errors took {datetime.datetime.now() - start_time}")
 
     mean = flat_params
     z_score = mean / robust_se
@@ -339,33 +343,32 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](params: Params,
         ),
         index=labels,
     )
-    results_df.to_csv(out_dir / f'diagnostics.csv')
+    results_df.to_csv(out_dir / f"diagnostics.csv")
 
     display(
-        results_df
-        .style
-        .background_gradient(
-            subset=['hess_se', 'robust_se', 'se_ratio'],
-        )
-        .format(
+        results_df.style.background_gradient(
+            subset=["hess_se", "robust_se", "se_ratio"],
+        ).format(
             dict(
-                mean='{:.4f}',
-                hess_se='{:.4f}',
-                robust_se='{:.4f}',
-                z_score='{:.2f}',
-                p_value='{:.2%}',
-                se_ratio='{:.4f}',
+                mean="{:.4f}",
+                hess_se="{:.4f}",
+                robust_se="{:.4f}",
+                z_score="{:.2f}",
+                p_value="{:.2%}",
+                se_ratio="{:.4f}",
             )
         )
     )
 
 
-def run_optim[Params: chex.ArrayTree](init_params: Params,
-                                      model_fn: ModelFn[Params],
-                                      dataset: Dataset,
-                                      verbose: bool = False,
-                                      *,
-                                      out_dir: Path) -> Params:
+def run_optim[Params: chex.ArrayTree](
+    init_params: Params,
+    model_fn: ModelFn[Params],
+    dataset: Dataset,
+    verbose: bool = False,
+    *,
+    out_dir: Path,
+) -> Params:
     timeout = datetime.timedelta(seconds=150)
     max_iter = 50
     tol = 1e-3
@@ -373,9 +376,7 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
     opt = optax.lbfgs(
         memory_size=100,
         linesearch=optax.scale_by_zoom_linesearch(
-            max_linesearch_steps=20,
-            verbose=verbose,
-            initial_guess_strategy='one'
+            max_linesearch_steps=20, verbose=verbose, initial_guess_strategy="one"
         ),
     )
 
@@ -391,7 +392,9 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
         params, state, *_ = carry
         value, grad = value_and_grad_fun(params, state=state, dataset=dataset)
         updates, state = opt.update(
-            grad, state, params,
+            grad,
+            state,
+            params,
             value=value,
             grad=grad,
             value_fn=loss_fn,
@@ -418,8 +421,9 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
         params, state, loss, grad = update((params, state), dataset=dataset)
         _, _, linesearch_state = state
 
-        assert isinstance(linesearch_state, optax.ScaleByZoomLinesearchState), \
-            f'{type(linesearch_state)=}'
+        assert isinstance(linesearch_state, optax.ScaleByZoomLinesearchState), (
+            f"{type(linesearch_state)=}"
+        )
         n_linesearch += int(linesearch_state.info.num_linesearch_steps)
         grad_norm = optax.tree.norm(grad)
         params_hist.append(params)
@@ -433,7 +437,7 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
             break
         n_iter += 1
         if n_iter == max_iter or elapsed > timeout:
-            print('did not converge')
+            print("did not converge")
             break
 
     jax.block_until_ready((losses_hist, grads_hist))
@@ -451,14 +455,14 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
     display(convergence_stats.to_frame())
 
     if out_dir is not None:
-        convergence_stats.to_json(out_dir / 'convergence_stats.json', indent=2)
+        convergence_stats.to_json(out_dir / "convergence_stats.json", indent=2)
 
     if out_dir is not None or not converged:
         last_grad_norm = grad_norms[-1]
-        print(f'{last_grad_norm=:.4f}')
+        print(f"{last_grad_norm=:.4f}")
 
         def _get_key(label):
-            return re.sub(r'\[\d+\]', '[]', label)
+            return re.sub(r"\[\d+\]", "[]", label)
 
         metrics_df = pd.DataFrame(
             dict(
@@ -471,7 +475,7 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
                 list(ravel_pytree(p)[0] for p in params_hist),
                 columns=labels,
             )
-            .rename(columns=lambda x: f'{x} values')
+            .rename(columns=lambda x: f"{x} values")
             .sort_index(axis=1)
         )
         grads_df = (
@@ -479,37 +483,36 @@ def run_optim[Params: chex.ArrayTree](init_params: Params,
                 list(ravel_pytree(g)[0] for g in grads_hist),
                 columns=labels,
             )
-            .rename(columns=lambda x: f'{x} grads')
+            .rename(columns=lambda x: f"{x} grads")
             .sort_index(axis=1)
         )
-        optim_df = (pd.concat([metrics_df, params_df, grads_df], axis=1)
-                    .astype(float))
+        optim_df = pd.concat([metrics_df, params_df, grads_df], axis=1).astype(float)
 
         col_keys = {col: _get_key(col) for col in optim_df.columns}
-        unique_keys = sorted(set(col_keys.values()),
-                             key=lambda x: (x.startswith('.'), x))
+        unique_keys = sorted(
+            set(col_keys.values()), key=lambda x: (x.startswith("."), x)
+        )
         n_rows = len(unique_keys)
-        f, axes = plt.subplots(n_rows, 1, sharex=True,
-                               figsize=(8, 1 + n_rows*2))
+        f, axes = plt.subplots(n_rows, 1, sharex=True, figsize=(8, 1 + n_rows * 2))
         key_to_ax = dict(zip(unique_keys, axes))
 
         assert n_rows > 1
         for col in optim_df.columns:
-            if col.endswith('grads'):
-                color = 'C1'
-            elif col.endswith('values'):
-                color = 'C2'
+            if col.endswith("grads"):
+                color = "C1"
+            elif col.endswith("values"):
+                color = "C2"
             else:
-                color = 'C0'
+                color = "C0"
             key = _get_key(col)
             ax = key_to_ax[key]
             ax.set_title(key, color=color)
-            ax.plot(optim_df[col], drawstyle='steps-post')
+            ax.plot(optim_df[col], drawstyle="steps-post")
             ax.grid(True, which="both", ls="--", alpha=0.2)
 
         plt.tight_layout()
         if out_dir is not None:
-            plt.savefig(out_dir / 'optim_outputs.png')
+            plt.savefig(out_dir / "optim_outputs.png")
         plt.show()
         display(optim_df)
 
@@ -529,11 +532,9 @@ def softplus_inverse(x: ArrayLike) -> Array:
     too_large_value = x
     x = jnp.where(is_too_small | is_too_large, jnp.ones_like(x), x)
     y = x + jnp.log(-jnp.expm1(-x))
-    return jnp.where(is_too_small,
-                     too_small_value,
-                     jnp.where(is_too_large,
-                               too_large_value,
-                               y))
+    return jnp.where(
+        is_too_small, too_small_value, jnp.where(is_too_large, too_large_value, y)
+    )
 
 
 def test_sp_inv():
@@ -548,86 +549,88 @@ test_sp_inv()
 # %%
 
 
-def plot_model_output(outputs: ModelOutput,
-                      input_df: pl.DataFrame,
-                      *,
-                      out_dir: Path | None = None) -> None:
-    bucket_len = '1s'
-    duration = '5m'
+def plot_model_output(
+    outputs: ModelOutput, input_df: pl.DataFrame, *, out_dir: Path | None = None
+) -> None:
+    bucket_len = "1s"
+    duration = "5m"
     df = (
-        input_df
-        .with_columns(
-            pl.col('curr_count').alias('actual_count'),
-            pl.col('time_since_prev').cast(float),
+        input_df.with_columns(
+            pl.col("curr_count").alias("actual_count"),
+            pl.col("time_since_prev").cast(float),
             expected_count=np.asarray(outputs.compensator),
         )
         .filter(
-            pl.col('time') < pl.col('time').min().dt.offset_by(duration),
+            pl.col("time") < pl.col("time").min().dt.offset_by(duration),
         )
-        .group_by(pl.col('time').dt.truncate(bucket_len), maintain_order=True)
+        .group_by(pl.col("time").dt.truncate(bucket_len), maintain_order=True)
         .agg(
-            pl.col('hi_price').max(),
-            pl.col('lo_price').min(),
-            pl.col('actual_count').sum(),
-            pl.col('expected_count').sum(),
+            pl.col("hi_price").max(),
+            pl.col("lo_price").min(),
+            pl.col("actual_count").sum(),
+            pl.col("expected_count").sum(),
         )
         .with_columns(
-            err=(pl.col('actual_count') - pl.col('expected_count'))
-            / pl.col('expected_count').sqrt(),
+            err=(pl.col("actual_count") - pl.col("expected_count"))
+            / pl.col("expected_count").sqrt(),
         )
         .to_pandas()
-        .set_index('time')
+        .set_index("time")
     )
     start = df.index.min()
     end = df.index.max()
 
     f, axes = plt.subplots(2, 1, sharex=True, sharey=False, figsize=(8, 6))
-    title = '\n'.join(
+    title = "\n".join(
         (
-            f'counts over {bucket_len} buckets in the first {duration}',
-            f'[ {start} , {end} ]',
+            f"counts over {bucket_len} buckets in the first {duration}",
+            f"[ {start} , {end} ]",
         )
     )
     f.suptitle(title)
 
     count_ax = axes[0]
-    count_ax.set_title('actual')
-    count_ax.set_yscale('log')
-    count_ax.scatter(df.index, df['actual_count'],
-                     alpha=0.4, marker='+', c='C0')
-    count_ax.set_ylabel('actual count $y$', c='C0')
+    count_ax.set_title("actual")
+    count_ax.set_yscale("log")
+    count_ax.scatter(df.index, df["actual_count"], alpha=0.4, marker="+", c="C0")
+    count_ax.set_ylabel("actual count $y$", c="C0")
 
     price_ax = count_ax.twinx()
-    price_ax.plot(df.index, df[['hi_price', 'lo_price']],
-                  alpha=0.6, drawstyle='steps-post', c='C1')
-    price_ax.set_ylabel('price (hi, lo)', c='C1')
+    price_ax.plot(
+        df.index,
+        df[["hi_price", "lo_price"]],
+        alpha=0.6,
+        drawstyle="steps-post",
+        c="C1",
+    )
+    price_ax.set_ylabel("price (hi, lo)", c="C1")
 
     expected_count_ax = axes[1]
-    expected_count_ax.set_yscale('log')
-    expected_count_ax.scatter(df.index, df['expected_count'],
-                              alpha=0.6, marker='+', c='C0')
-    expected_count_ax.set_ylabel('expected count $\\hat y$', c='C0')
+    expected_count_ax.set_yscale("log")
+    expected_count_ax.scatter(
+        df.index, df["expected_count"], alpha=0.6, marker="+", c="C0"
+    )
+    expected_count_ax.set_ylabel("expected count $\\hat y$", c="C0")
 
     err_ax = expected_count_ax.twinx()
-    err_ax.scatter(df.index, df['err'],
-                   alpha=0.4, marker='x', c='C2')
-    err_ax.set_ylabel(r'$(y - \hat y) / \sqrt{\hat y}$', c='C2')
-    err_ax.axhline(0.0, linestyle='--', c='C2', alpha=0.6)
+    err_ax.scatter(df.index, df["err"], alpha=0.4, marker="x", c="C2")
+    err_ax.set_ylabel(r"$(y - \hat y) / \sqrt{\hat y}$", c="C2")
+    err_ax.axhline(0.0, linestyle="--", c="C2", alpha=0.6)
 
     for ax in axes:
         ax.grid(True, which="both", ls="--", alpha=0.4)
-        ax.tick_params(axis='x', labelrotation=30)
+        ax.tick_params(axis="x", labelrotation=30)
 
     plt.tight_layout()
     if out_dir is not None:
-        plt.savefig(out_dir / 'counts.png')
+        plt.savefig(out_dir / "counts.png")
     plt.show()
 
 
 def print_params(params, *, out_dir: Path | None = None) -> None:
     prev = params._asdict()
-    series = pd.Series(prev, name='value')
-    series.index.name = 'param'
+    series = pd.Series(prev, name="value")
+    series.index.name = "param"
 
     prefix_transforms = dict(
         log_=jnp.exp,
@@ -637,10 +640,10 @@ def print_params(params, *, out_dir: Path | None = None) -> None:
     for k, v in prev.items():
         for prefix, transform in prefix_transforms.items():
             if k.startswith(prefix):
-                series[k.replace(prefix, '')] = transform(v)
+                series[k.replace(prefix, "")] = transform(v)
     display(series.to_frame())
     if out_dir is not None:
-        series.to_frame().to_csv(out_dir / 'params.csv')
+        series.to_frame().to_csv(out_dir / "params.csv")
 
 
 class ConstantIntensityParams(NamedTuple):
@@ -659,20 +662,22 @@ def calc_const(params: ConstantIntensityParams, dataset: Dataset) -> ModelOutput
 
 fitted_constant_intensity_params = run_optim(
     init_params=ConstantIntensityParams(
-        sp_inv_base_intensity=softplus_inverse(
-            closed_form_intensity + 1e-4),
+        sp_inv_base_intensity=softplus_inverse(closed_form_intensity + 1e-4),
     ),
     model_fn=calc_const,
     dataset=DATASET,
-    out_dir=RESULTS_DIRS['constant'],
+    out_dir=RESULTS_DIRS["constant"],
 )
-assert jnp.allclose(fitted_constant_intensity_params.sp_inv_base_intensity,
-                    softplus_inverse(closed_form_intensity))
-print_params(fitted_constant_intensity_params,
-             out_dir=RESULTS_DIRS['constant'])
-plot_model_output(calc_const(fitted_constant_intensity_params, DATASET),
-                  INPUT_DF.filter('is_train'),
-                  out_dir=RESULTS_DIRS['constant'])
+assert jnp.allclose(
+    fitted_constant_intensity_params.sp_inv_base_intensity,
+    softplus_inverse(closed_form_intensity),
+)
+print_params(fitted_constant_intensity_params, out_dir=RESULTS_DIRS["constant"])
+plot_model_output(
+    calc_const(fitted_constant_intensity_params, DATASET),
+    INPUT_DF.filter("is_train"),
+    out_dir=RESULTS_DIRS["constant"],
+)
 
 
 # %%
@@ -680,12 +685,18 @@ plot_model_output(calc_const(fitted_constant_intensity_params, DATASET),
 
 class RbfParams(NamedTuple):
     sp_inv_base_intensity: Array
-    weights: Array = jnp.zeros((N_RBF_CENTERS,),) + 0.1
+    weights: Array = (
+        jnp.zeros(
+            (N_RBF_CENTERS,),
+        )
+        + 0.1
+    )
 
 
 def calc_rbf(params: RbfParams, dataset: Dataset) -> ModelOutput:
-    intensity = jax.nn.softplus(params.sp_inv_base_intensity
-                                + dataset.rbf_basis @ params.weights)
+    intensity = jax.nn.softplus(
+        params.sp_inv_base_intensity + dataset.rbf_basis @ params.weights
+    )
     return ModelOutput(
         point_term=dataset.curr_count * jnp.log(intensity),
         compensator=intensity * dataset.time_since_prev,
@@ -699,10 +710,9 @@ def calc_rbf(params: RbfParams, dataset: Dataset) -> ModelOutput:
     )
 
 
-def plot_rbf(sp_inv_base_intensity: Array,
-             weights: Array,
-             *,
-             out_dir: Path | None = None) -> None:
+def plot_rbf(
+    sp_inv_base_intensity: Array, weights: Array, *, out_dir: Path | None = None
+) -> None:
     # exceed [0, 24] to verify periodic boundary conditions
     time_of_day = jnp.linspace(-4, 28, 500, endpoint=False)
     bases = calc_rbf_basis(time_of_day)
@@ -711,33 +721,36 @@ def plot_rbf(sp_inv_base_intensity: Array,
     per_basis = bases * weights
 
     f, axes = plt.subplots(2, 1, sharex=True)
-    f.suptitle('exogenous intensity')
+    f.suptitle("exogenous intensity")
     for ax in axes:
-        ax.axvline(0, c='k', alpha=0.2, linestyle='--')
-        ax.axvline(24, c='k', alpha=0.2, linestyle='--')
+        ax.axvline(0, c="k", alpha=0.2, linestyle="--")
+        ax.axvline(24, c="k", alpha=0.2, linestyle="--")
 
     ax1, ax2 = axes
     ax1.plot(time_of_day, intensity)
-    ax1.axhline(jax.nn.softplus(sp_inv_base_intensity),
-                label=f'baseline $\\approx${per_second:.2f}/s',
-                c='g', alpha=0.4, linestyle='-')
-    ax1.set_ylabel('intensity')
-    ax1.legend(loc='upper left')
+    ax1.axhline(
+        jax.nn.softplus(sp_inv_base_intensity),
+        label=f"baseline $\\approx${per_second:.2f}/s",
+        c="g",
+        alpha=0.4,
+        linestyle="-",
+    )
+    ax1.set_ylabel("intensity")
+    ax1.legend(loc="upper left")
 
     ax2.plot(time_of_day, per_basis, alpha=0.6)
-    ax2.set_ylabel('weighted bases')
-    ax2.set_xlabel('hour')
+    ax2.set_ylabel("weighted bases")
+    ax2.set_xlabel("hour")
     plt.tight_layout()
     if out_dir is not None:
-        plt.savefig(out_dir / 'bases.png')
+        plt.savefig(out_dir / "bases.png")
     plt.show()
 
 
 init_rbf_params = RbfParams(
     sp_inv_base_intensity=fitted_constant_intensity_params.sp_inv_base_intensity,
 )
-plot_rbf(init_rbf_params.sp_inv_base_intensity,
-         init_rbf_params.weights)
+plot_rbf(init_rbf_params.sp_inv_base_intensity, init_rbf_params.weights)
 
 
 # %%
@@ -747,14 +760,19 @@ fitted_rbf_params = run_optim(
     init_params=init_rbf_params,
     model_fn=calc_rbf,
     dataset=DATASET,
-    out_dir=RESULTS_DIRS['rbf'],
+    out_dir=RESULTS_DIRS["rbf"],
 )
-print_params(fitted_rbf_params, out_dir=RESULTS_DIRS['rbf'])
-plot_model_output(calc_rbf(fitted_rbf_params, DATASET),
-                  INPUT_DF.filter('is_train'),
-                  out_dir=RESULTS_DIRS['rbf'])
-plot_rbf(fitted_rbf_params.sp_inv_base_intensity, fitted_rbf_params.weights,
-         out_dir=RESULTS_DIRS['rbf'])
+print_params(fitted_rbf_params, out_dir=RESULTS_DIRS["rbf"])
+plot_model_output(
+    calc_rbf(fitted_rbf_params, DATASET),
+    INPUT_DF.filter("is_train"),
+    out_dir=RESULTS_DIRS["rbf"],
+)
+plot_rbf(
+    fitted_rbf_params.sp_inv_base_intensity,
+    fitted_rbf_params.weights,
+    out_dir=RESULTS_DIRS["rbf"],
+)
 
 
 # %%
@@ -786,27 +804,25 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
         count, time_since_prev = x
 
         integral_over_interval = -jnp.expm1(-decay_rate * time_since_prev)
-        compensator = \
-            base_intensity * time_since_prev  \
+        compensator = (
+            base_intensity * time_since_prev
             + branching_ratio * decayed_count * integral_over_interval
+        )
 
         decay_factor = jnp.exp(-decay_rate * time_since_prev)
         decayed_count *= decay_factor
-        point_intensity = base_intensity \
-            + branching_ratio * decay_rate * decayed_count
+        point_intensity = base_intensity + branching_ratio * decay_rate * decayed_count
 
         # log rising factorial / Pochhammer to handle excitation across
         # events within the same timestamp
         a = point_intensity
         d = branching_ratio * decay_rate
-        point_term = \
-            count * jnp.log(d) \
-            + gammaln(a / d + count) \
-            - gammaln(a / d)
+        point_term = count * jnp.log(d) + gammaln(a / d + count) - gammaln(a / d)
 
         decayed_count += count
-        forecast_intensity = base_intensity \
-            + branching_ratio * decay_rate * decayed_count
+        forecast_intensity = (
+            base_intensity + branching_ratio * decay_rate * decayed_count
+        )
         return decayed_count, (point_term, compensator, forecast_intensity)
 
     xs = dataset.curr_count, dataset.time_since_prev
@@ -818,24 +834,29 @@ def calc_hawkes_baseline(params: HawkesParams, dataset: Dataset) -> ModelOutput:
         forecast_intensity=intensity,
     )
 
+
 # %%
 
 
-def compensator_loglik_for_interval(base_intensity: Array,
-                                    branching_ratio: Array,
-                                    initial_decayed_count: Array,
-                                    decay_rate: Array,
-                                    interval_duration: Array) -> Array:
+def compensator_loglik_for_interval(
+    base_intensity: Array,
+    branching_ratio: Array,
+    initial_decayed_count: Array,
+    decay_rate: Array,
+    interval_duration: Array,
+) -> Array:
     constant_term = interval_duration * base_intensity
     integral = -jnp.expm1(-decay_rate * interval_duration)
     variable_term = branching_ratio * initial_decayed_count * integral
     return constant_term + variable_term
 
 
-def point_loglik_for_batch(exog_intensity: Array,
-                           counts_decayed_until_batch: Array,
-                           jump_size: Array,
-                           batch_size: Array) -> Array:
+def point_loglik_for_batch(
+    exog_intensity: Array,
+    counts_decayed_until_batch: Array,
+    jump_size: Array,
+    batch_size: Array,
+) -> Array:
     # rising factorial / pochhammer:
     # sum( log(a + i * d) ) = n log(d) + gammaln(a / d + n) - gammaln(a / d)
     # a = exog_intensity + jump_size * counts_decayed_until_batch
@@ -877,8 +898,7 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     )
     chex.assert_tree_all_finite(point_term)
 
-    forecast_intensity = base_intensity \
-        + branching_ratio * decay_rate * decayed_count
+    forecast_intensity = base_intensity + branching_ratio * decay_rate * decayed_count
     return ModelOutput(
         point_term=point_term,
         compensator=compensator,
@@ -892,21 +912,21 @@ def calc_hawkes(params: HawkesParams, dataset: Dataset) -> ModelOutput:
     )
 
 
-def show_hawkes(params: HawkesParams,
-                dataset: Dataset,
-                input_df: pl.DataFrame,
-                *,
-                out_dir: Path | None = None) -> None:
+def show_hawkes(
+    params: HawkesParams,
+    dataset: Dataset,
+    input_df: pl.DataFrame,
+    *,
+    out_dir: Path | None = None,
+) -> None:
     baseline_outputs = calc_hawkes_baseline(params, dataset)
 
     outputs = chex.chexify(calc_hawkes)(params, dataset)
-    assert jnp.allclose(outputs.forecast_intensity,
-                        baseline_outputs.forecast_intensity)
-    assert jnp.allclose(outputs.compensator,
-                        baseline_outputs.compensator)
-    assert jnp.allclose(outputs.point_term,
-                        baseline_outputs.point_term,
-                        rtol=1e-3, atol=1e-2)
+    assert jnp.allclose(outputs.forecast_intensity, baseline_outputs.forecast_intensity)
+    assert jnp.allclose(outputs.compensator, baseline_outputs.compensator)
+    assert jnp.allclose(
+        outputs.point_term, baseline_outputs.point_term, rtol=1e-3, atol=1e-2
+    )
     print_params(params, out_dir=out_dir)
     plot_model_output(outputs, input_df, out_dir=out_dir)
 
@@ -914,7 +934,7 @@ def show_hawkes(params: HawkesParams,
 init_hawkes_params = HawkesParams(
     sp_inv_base_intensity=fitted_constant_intensity_params.sp_inv_base_intensity,
 )
-show_hawkes(init_hawkes_params, DATASET, INPUT_DF.filter('is_train'))
+show_hawkes(init_hawkes_params, DATASET, INPUT_DF.filter("is_train"))
 
 
 # %%
@@ -924,11 +944,15 @@ fitted_hawkes_params = run_optim(
     init_params=init_hawkes_params,
     model_fn=calc_hawkes,
     dataset=DATASET,
-    out_dir=RESULTS_DIRS['hawkes'],
+    out_dir=RESULTS_DIRS["hawkes"],
 )
 hawkes_outputs = calc_hawkes(fitted_hawkes_params, DATASET)
-show_hawkes(fitted_hawkes_params, DATASET, INPUT_DF.filter('is_train'),
-            out_dir=RESULTS_DIRS['hawkes'])
+show_hawkes(
+    fitted_hawkes_params,
+    DATASET,
+    INPUT_DF.filter("is_train"),
+    out_dir=RESULTS_DIRS["hawkes"],
+)
 
 
 # %%
@@ -942,8 +966,9 @@ class RbfHawkesParams(NamedTuple):
 
 
 def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
-    base_intensity = jax.nn.softplus(params.sp_inv_base_intensity
-                                     + dataset.rbf_basis @ params.weights)
+    base_intensity = jax.nn.softplus(
+        params.sp_inv_base_intensity + dataset.rbf_basis @ params.weights
+    )
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
     decay_rate = jax.nn.softplus(params.sp_inv_decay_rate)
     decay_factors = jnp.exp(-decay_rate * dataset.time_since_prev)
@@ -967,8 +992,7 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
     )
     chex.assert_tree_all_finite(point_term)
 
-    forecast_intensity = base_intensity \
-        + branching_ratio * decay_rate * decayed_count
+    forecast_intensity = base_intensity + branching_ratio * decay_rate * decayed_count
     return ModelOutput(
         point_term=point_term,
         compensator=compensator,
@@ -983,15 +1007,21 @@ def calc_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset) -> ModelOutput:
     )
 
 
-def show_rbf_hawkes(params: RbfHawkesParams, dataset: Dataset,
-                    input_df: pl.DataFrame,
-                    *,
-                    out_dir: Path | None = None) -> None:
+def show_rbf_hawkes(
+    params: RbfHawkesParams,
+    dataset: Dataset,
+    input_df: pl.DataFrame,
+    *,
+    out_dir: Path | None = None,
+) -> None:
     outputs = chex.chexify(calc_rbf_hawkes)(params, dataset)
     print_params(params, out_dir=out_dir)
     plot_model_output(outputs, input_df, out_dir=out_dir)
-    plot_rbf(sp_inv_base_intensity=params.sp_inv_base_intensity,
-             weights=params.weights, out_dir=out_dir)
+    plot_rbf(
+        sp_inv_base_intensity=params.sp_inv_base_intensity,
+        weights=params.weights,
+        out_dir=out_dir,
+    )
 
 
 init_rbf_hawkes = RbfHawkesParams(
@@ -1000,7 +1030,7 @@ init_rbf_hawkes = RbfHawkesParams(
     sp_inv_decay_rate=fitted_hawkes_params.sp_inv_decay_rate,
     weights=fitted_rbf_params.weights,
 )
-show_rbf_hawkes(init_rbf_hawkes, DATASET, INPUT_DF.filter('is_train'))
+show_rbf_hawkes(init_rbf_hawkes, DATASET, INPUT_DF.filter("is_train"))
 
 
 # %%
@@ -1010,10 +1040,14 @@ fitted_rbf_hawkes_params = run_optim(
     init_params=init_rbf_hawkes,
     model_fn=calc_rbf_hawkes,
     dataset=DATASET,
-    out_dir=RESULTS_DIRS['rbf_hawkes'],
+    out_dir=RESULTS_DIRS["rbf_hawkes"],
 )
-show_rbf_hawkes(fitted_rbf_hawkes_params, DATASET, INPUT_DF.filter('is_train'),
-                out_dir=RESULTS_DIRS['rbf_hawkes'])
+show_rbf_hawkes(
+    fitted_rbf_hawkes_params,
+    DATASET,
+    INPUT_DF.filter("is_train"),
+    out_dir=RESULTS_DIRS["rbf_hawkes"],
+)
 
 
 # %%
@@ -1028,7 +1062,9 @@ class PowerLawHawkesParams(NamedTuple):
     logit_beta: Array = logit(0.5)
 
 
-def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> ModelOutput:
+def calc_power_law_hawkes(
+    params: PowerLawHawkesParams, dataset: Dataset
+) -> ModelOutput:
     base_intensity = jax.nn.softplus(params.sp_inv_base_intensity)
     branching_ratio = jax.nn.sigmoid(params.logit_branching_ratio)
     omega = 1.0 / jax.nn.softplus(params.sp_inv_inv_omega)
@@ -1051,9 +1087,9 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     jump_size = branching_ratio / actual_basis_integral
 
     compensator_integral = cache.decay_integral @ raw_weights
-    compensator = \
-        dataset.time_since_prev * base_intensity \
-        + jump_size * compensator_integral
+    compensator = (
+        dataset.time_since_prev * base_intensity + jump_size * compensator_integral
+    )
     chex.assert_tree_all_finite(compensator)
 
     point_term = point_loglik_for_batch(
@@ -1064,8 +1100,7 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     )
     chex.assert_tree_all_finite(point_term)
 
-    forecast_intensity = base_intensity \
-        + jump_size * cache.decayed_count @ raw_weights
+    forecast_intensity = base_intensity + jump_size * cache.decayed_count @ raw_weights
 
     return ModelOutput(
         point_term=point_term,
@@ -1081,11 +1116,13 @@ def calc_power_law_hawkes(params: PowerLawHawkesParams, dataset: Dataset) -> Mod
     )
 
 
-def show_power_law_hawkes(params: PowerLawHawkesParams,
-                          dataset: Dataset,
-                          input_df: pl.DataFrame,
-                          *,
-                          out_dir: Path | None = None) -> None:
+def show_power_law_hawkes(
+    params: PowerLawHawkesParams,
+    dataset: Dataset,
+    input_df: pl.DataFrame,
+    *,
+    out_dir: Path | None = None,
+) -> None:
     outputs = calc_power_law_hawkes(params, dataset)
     print_params(params, out_dir=out_dir)
     plot_model_output(outputs=outputs, input_df=input_df, out_dir=out_dir)
@@ -1095,8 +1132,7 @@ init_pl_hawkes_params = PowerLawHawkesParams(
     sp_inv_base_intensity=fitted_hawkes_params.sp_inv_base_intensity,
     logit_branching_ratio=fitted_hawkes_params.logit_branching_ratio,
 )
-show_power_law_hawkes(init_pl_hawkes_params, DATASET,
-                      INPUT_DF.filter('is_train'))
+show_power_law_hawkes(init_pl_hawkes_params, DATASET, INPUT_DF.filter("is_train"))
 
 
 # %%
@@ -1106,11 +1142,14 @@ fitted_power_law_hawkes_params = run_optim(
     init_params=init_pl_hawkes_params,
     model_fn=calc_power_law_hawkes,
     dataset=DATASET,
-    out_dir=RESULTS_DIRS['pl_hawkes'],
+    out_dir=RESULTS_DIRS["pl_hawkes"],
 )
-show_power_law_hawkes(fitted_power_law_hawkes_params, DATASET,
-                      INPUT_DF.filter('is_train'),
-                      out_dir=RESULTS_DIRS['pl_hawkes'])
+show_power_law_hawkes(
+    fitted_power_law_hawkes_params,
+    DATASET,
+    INPUT_DF.filter("is_train"),
+    out_dir=RESULTS_DIRS["pl_hawkes"],
+)
 
 
 # %%
@@ -1119,32 +1158,31 @@ show_power_law_hawkes(fitted_power_law_hawkes_params, DATASET,
 DATASET_INCLUDING_VALIDATION_DATA = create_dataset(INPUT_DF)
 
 
-def _calc_model_outputs[Params: chex.ArrayTree](prefix: str,
-                                                params: Params,
-                                                model_fn: ModelFn[Params]) -> dict[str, np.ndarray]:
+def _calc_model_outputs[Params: chex.ArrayTree](
+    prefix: str, params: Params, model_fn: ModelFn[Params]
+) -> dict[str, np.ndarray]:
     # full dataset is used to avoid bias from a separate "warm up" step
     # without having to pass state across datasets
     outputs = model_fn(params, DATASET_INCLUDING_VALIDATION_DATA)
     return {
-        f'{prefix}_compensator': np.asarray(outputs.compensator),
-        f'{prefix}_loglik': np.asarray(outputs.loglik),
+        f"{prefix}_compensator": np.asarray(outputs.compensator),
+        f"{prefix}_loglik": np.asarray(outputs.loglik),
     }
 
 
-WITH_MODEL_OUTPUTS = (
-    INPUT_DF
-    .with_columns(
-        **_calc_model_outputs('constant', fitted_constant_intensity_params, calc_const),
-        **_calc_model_outputs('rbf', fitted_rbf_params, calc_rbf),
-        **_calc_model_outputs('hawkes', fitted_hawkes_params, calc_hawkes),
-        **_calc_model_outputs('rbf_hawkes', fitted_rbf_hawkes_params, calc_rbf_hawkes),
-        **_calc_model_outputs('pl_hawkes', fitted_power_law_hawkes_params, calc_power_law_hawkes),
-    )
-    .with_columns(
-        pl.col('curr_count').alias('actual_count'),
-        pl.selectors.ends_with('_compensator')
-        .name.replace('_compensator', '_expected_count')
-    )
+WITH_MODEL_OUTPUTS = INPUT_DF.with_columns(
+    **_calc_model_outputs("constant", fitted_constant_intensity_params, calc_const),
+    **_calc_model_outputs("rbf", fitted_rbf_params, calc_rbf),
+    **_calc_model_outputs("hawkes", fitted_hawkes_params, calc_hawkes),
+    **_calc_model_outputs("rbf_hawkes", fitted_rbf_hawkes_params, calc_rbf_hawkes),
+    **_calc_model_outputs(
+        "pl_hawkes", fitted_power_law_hawkes_params, calc_power_law_hawkes
+    ),
+).with_columns(
+    pl.col("curr_count").alias("actual_count"),
+    pl.selectors.ends_with("_compensator").name.replace(
+        "_compensator", "_expected_count"
+    ),
 )
 
 
@@ -1154,101 +1192,105 @@ display(WITH_MODEL_OUTPUTS)
 
 
 LOGLIK_MEAN = (
-    WITH_MODEL_OUTPUTS
-    .group_by('is_train')
-    .agg(pl.selectors.ends_with('_loglik').mean())
-    .sort('is_train', descending=True)
+    WITH_MODEL_OUTPUTS.group_by("is_train")
+    .agg(pl.selectors.ends_with("_loglik").mean())
+    .sort("is_train", descending=True)
 )
-LOGLIK_MEAN.write_csv(RESULTS_DIRS['overall'] / 'loglik_mean.csv')
+LOGLIK_MEAN.write_csv(RESULTS_DIRS["overall"] / "loglik_mean.csv")
 (
-    LOGLIK_MEAN
-    .to_pandas()
-    .set_index('is_train')
-    .rename(columns=lambda x: x.replace('_loglik', ''))
-    .style
-    .background_gradient(axis=1)
-    .format('{:.2f}')
+    LOGLIK_MEAN.to_pandas()
+    .set_index("is_train")
+    .rename(columns=lambda x: x.replace("_loglik", ""))
+    .style.background_gradient(axis=1)
+    .format("{:.2f}")
 )
 
 
 # %%
 
 
-def plot_results(start: datetime.datetime,
-                 end: datetime.datetime,
-                 *,
-                 duration: str,
-                 prefixes: list[str] | None = None,
-                 plot_path: Path | None = None) -> None:
+def plot_results(
+    start: datetime.datetime,
+    end: datetime.datetime,
+    *,
+    duration: str,
+    prefixes: list[str] | None = None,
+    plot_path: Path | None = None,
+) -> None:
     df = (
-        WITH_MODEL_OUTPUTS
-        .filter(
-            pl.col('time') >= start,
-            pl.col('time') <= end,
+        WITH_MODEL_OUTPUTS.filter(
+            pl.col("time") >= start,
+            pl.col("time") <= end,
         )
         .with_columns(
-            pl.col('time_since_prev').cast(float),
+            pl.col("time_since_prev").cast(float),
         )
-        .group_by(pl.col('time').dt.truncate(duration), maintain_order=True)
+        .group_by(pl.col("time").dt.truncate(duration), maintain_order=True)
         .agg(
-            pl.col('hi_price').max(),
-            pl.col('lo_price').min(),
-            pl.col('actual_count').sum(),
-            pl.selectors.ends_with('_expected_count').sum(),
+            pl.col("hi_price").max(),
+            pl.col("lo_price").min(),
+            pl.col("actual_count").sum(),
+            pl.selectors.ends_with("_expected_count").sum(),
         )
         .with_columns(
             (
-                -pl.selectors.ends_with('_expected_count')
-                .name.replace('_expected_count', '_err')
-                + pl.col('actual_count')
+                -pl.selectors.ends_with("_expected_count").name.replace(
+                    "_expected_count", "_err"
+                )
+                + pl.col("actual_count")
             )
-            / pl.selectors.ends_with('_expected_count').sqrt(),
+            / pl.selectors.ends_with("_expected_count").sqrt(),
         )
         .to_pandas()
-        .set_index('time')
+        .set_index("time")
     )
 
     prefixes = prefixes or ALL_PREFIXES
-    f, axes = plt.subplots(1 + len(prefixes), 1,
-                           sharex=True, sharey=False, figsize=(8, 12))
-    title = '\n'.join(
+    f, axes = plt.subplots(
+        1 + len(prefixes), 1, sharex=True, sharey=False, figsize=(8, 12)
+    )
+    title = "\n".join(
         (
-            f'counts over {duration} buckets',
-            f'[ {start} , {end} ]',
+            f"counts over {duration} buckets",
+            f"[ {start} , {end} ]",
         )
     )
     f.suptitle(title)
     count_ax = axes[0]
-    count_ax.set_title('actual')
-    count_ax.set_yscale('log')
-    count_ax.scatter(df.index, df['actual_count'],
-                     alpha=0.4, marker='+', c='C0')
-    count_ax.set_ylabel('actual count $y$', c='C0')
+    count_ax.set_title("actual")
+    count_ax.set_yscale("log")
+    count_ax.scatter(df.index, df["actual_count"], alpha=0.4, marker="+", c="C0")
+    count_ax.set_ylabel("actual count $y$", c="C0")
 
     price_ax = count_ax.twinx()
-    price_ax.plot(df.index, df[['hi_price', 'lo_price']],
-                  alpha=0.6, drawstyle='steps-post', c='C1')
-    price_ax.set_ylabel('price (hi, lo)', c='C1')
+    price_ax.plot(
+        df.index,
+        df[["hi_price", "lo_price"]],
+        alpha=0.6,
+        drawstyle="steps-post",
+        c="C1",
+    )
+    price_ax.set_ylabel("price (hi, lo)", c="C1")
 
     for i, prefix in enumerate(prefixes):
         ax1 = axes[1 + i]
         ax1.set_title(prefix)
-        ax1.set_yscale('log')
-        ax1.scatter(df.index, df[f'{prefix}_expected_count'],
-                    alpha=0.6, marker='+', c='C0')
-        ax1.set_ylabel('expected count $\\hat y$', c='C0')
+        ax1.set_yscale("log")
+        ax1.scatter(
+            df.index, df[f"{prefix}_expected_count"], alpha=0.6, marker="+", c="C0"
+        )
+        ax1.set_ylabel("expected count $\\hat y$", c="C0")
 
         ax2 = ax1.twinx()
-        ax2.scatter(df.index, df[f'{prefix}_err'],
-                    alpha=0.4, marker='x', c='C2')
-        ax2.set_ylabel(r'$(y - \hat y) / \sqrt{\hat y}$', c='C2')
-        ax2.axhline(0.0, linestyle='--', c='C2', alpha=0.6)
+        ax2.scatter(df.index, df[f"{prefix}_err"], alpha=0.4, marker="x", c="C2")
+        ax2.set_ylabel(r"$(y - \hat y) / \sqrt{\hat y}$", c="C2")
+        ax2.axhline(0.0, linestyle="--", c="C2", alpha=0.6)
 
     for ax in axes:
         ax.grid(True, which="both", ls="--", alpha=0.4)
-        ax.tick_params(axis='x', labelrotation=30)
+        ax.tick_params(axis="x", labelrotation=30)
         if start <= TRAIN_END and TRAIN_END <= end:
-            ax.axvline(TRAIN_END, linestyle='--', c='k', alpha=0.4)
+            ax.axvline(TRAIN_END, linestyle="--", c="k", alpha=0.4)
 
     plt.tight_layout()
     if plot_path is not None:
@@ -1256,72 +1298,89 @@ def plot_results(start: datetime.datetime,
     plt.show()
 
 
-plot_results(DATA_START, VAL_END, duration='2h',
-             plot_path=RESULTS_DIRS['overall'] / 'train_val.png')
+plot_results(
+    DATA_START,
+    VAL_END,
+    duration="2h",
+    plot_path=RESULTS_DIRS["overall"] / "train_val.png",
+)
 
 
 # %%
 # arbitrary training date
-plot_results(datetime.datetime(2025, 9, 17, hour=9),
-             datetime.datetime(2025, 9, 18, hour=6),
-             duration='2m',
-             plot_path=RESULTS_DIRS['overall'] / 'train1.png')
-plot_results(datetime.datetime(2025, 9, 17, hour=17),
-             datetime.datetime(2025, 9, 17, hour=20),
-             duration='20s', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'],
-             plot_path=RESULTS_DIRS['overall'] / 'train2.png')
+plot_results(
+    datetime.datetime(2025, 9, 17, hour=9),
+    datetime.datetime(2025, 9, 18, hour=6),
+    duration="2m",
+    plot_path=RESULTS_DIRS["overall"] / "train1.png",
+)
+plot_results(
+    datetime.datetime(2025, 9, 17, hour=17),
+    datetime.datetime(2025, 9, 17, hour=20),
+    duration="20s",
+    prefixes=["hawkes", "rbf_hawkes", "pl_hawkes"],
+    plot_path=RESULTS_DIRS["overall"] / "train2.png",
+)
 # %%
-plot_results(datetime.datetime(2025, 9, 17, hour=17, minute=59, second=45,
-                               microsecond=0),
-             datetime.datetime(2025, 9, 17, hour=18, minute=0, second=15,
-                               microsecond=0),
-             duration='100ms', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'],
-             plot_path=RESULTS_DIRS['overall'] / 'train3.png')
+plot_results(
+    datetime.datetime(2025, 9, 17, hour=17, minute=59, second=45, microsecond=0),
+    datetime.datetime(2025, 9, 17, hour=18, minute=0, second=15, microsecond=0),
+    duration="100ms",
+    prefixes=["hawkes", "rbf_hawkes", "pl_hawkes"],
+    plot_path=RESULTS_DIRS["overall"] / "train3.png",
+)
 
 
 # %%
 # 2025/10/10 volatility event
-plot_results(datetime.datetime(2025, 10, 10, hour=9),
-             datetime.datetime(2025, 10, 11, hour=6),
-             duration='90s',
-             plot_path=RESULTS_DIRS['overall'] / 'val1.png')
-plot_results(datetime.datetime(2025, 10, 10, hour=19),
-             datetime.datetime(2025, 10, 11, hour=1),
-             duration='30s', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'],
-             plot_path=RESULTS_DIRS['overall'] / 'val2.png')
+plot_results(
+    datetime.datetime(2025, 10, 10, hour=9),
+    datetime.datetime(2025, 10, 11, hour=6),
+    duration="90s",
+    plot_path=RESULTS_DIRS["overall"] / "val1.png",
+)
+plot_results(
+    datetime.datetime(2025, 10, 10, hour=19),
+    datetime.datetime(2025, 10, 11, hour=1),
+    duration="30s",
+    prefixes=["hawkes", "rbf_hawkes", "pl_hawkes"],
+    plot_path=RESULTS_DIRS["overall"] / "val2.png",
+)
 # %%
-plot_results(datetime.datetime(2025, 10, 10, hour=21, minute=12, second=45),
-             datetime.datetime(2025, 10, 10, hour=21, minute=13, second=45),
-             duration='100ms', prefixes=['hawkes', 'rbf_hawkes', 'pl_hawkes'],
-             plot_path=RESULTS_DIRS['overall'] / 'val3.png')
+plot_results(
+    datetime.datetime(2025, 10, 10, hour=21, minute=12, second=45),
+    datetime.datetime(2025, 10, 10, hour=21, minute=13, second=45),
+    duration="100ms",
+    prefixes=["hawkes", "rbf_hawkes", "pl_hawkes"],
+    plot_path=RESULTS_DIRS["overall"] / "val3.png",
+)
 
 # %%
 
 
-def plot_qq(subset: pl.DataFrame,
-            duration: str = '100ms',
-            *,
-            out_path: Path | None = None):
-    assert (subset['curr_count'] > 0).all(), \
-        'need to sum compensators by event'
+def plot_qq(
+    subset: pl.DataFrame, duration: str = "100ms", *, out_path: Path | None = None
+):
+    assert (subset["curr_count"] > 0).all(), "need to sum compensators by event"
 
     subset = (
-        subset
-        .group_by(pl.col('time').dt.truncate(duration), maintain_order=True)
+        subset.group_by(pl.col("time").dt.truncate(duration), maintain_order=True)
         .agg(
-            pl.col('curr_count').sum(),
+            pl.col("curr_count").sum(),
             (
-                pl.selectors.ends_with('_compensator')
-                .name.replace('_compensator', '_expected_count').sum()
+                pl.selectors.ends_with("_compensator")
+                .name.replace("_compensator", "_expected_count")
+                .sum()
             ),
         )
         .with_columns(
             (
-                -pl.selectors.ends_with('_expected_count')
-                .name.replace('_expected_count', '_resid')
-                + pl.col('curr_count')
+                -pl.selectors.ends_with("_expected_count").name.replace(
+                    "_expected_count", "_resid"
+                )
+                + pl.col("curr_count")
             )
-            / pl.selectors.ends_with('_expected_count').sqrt(),
+            / pl.selectors.ends_with("_expected_count").sqrt(),
         )
     )
 
@@ -1331,23 +1390,25 @@ def plot_qq(subset: pl.DataFrame,
         subset = subset.sample(n=max_subsamples, seed=0)
 
     f, axes = plt.subplots(3, 2, sharex=True, sharey=False, figsize=(6, 8))
-    f.suptitle('Pearson Residual QQ (Normal Approx)'
-               f'\n{duration} buckets, n={subset.height:,}/{full_size:,}'
-               f'\n[ {subset['time'].min()} , {subset['time'].max()}]')
+    f.suptitle(
+        "Pearson Residual QQ (Normal Approx)"
+        f"\n{duration} buckets, n={subset.height:,}/{full_size:,}"
+        f"\n[ {subset['time'].min()} , {subset['time'].max()}]"
+    )
 
     for i, prefix in enumerate(ALL_PREFIXES):
-        resid = subset[f'{prefix}_resid'].to_numpy()
+        resid = subset[f"{prefix}_resid"].to_numpy()
         std = np.std(resid)
 
         ax = axes[i // 2, i % 2]
-        scipy.stats.probplot(resid, dist='norm', plot=ax, rvalue=True)
-        ax.set_title(f'{prefix}, {std=:.2f}')
-        ax.set_ylabel(r'$(y - \hat y) / \sqrt{ \hat y} $')
-        ax.set_xlabel('Z ~ Normal(0, 1)')
+        scipy.stats.probplot(resid, dist="norm", plot=ax, rvalue=True)
+        ax.set_title(f"{prefix}, {std=:.2f}")
+        ax.set_ylabel(r"$(y - \hat y) / \sqrt{ \hat y} $")
+        ax.set_xlabel("Z ~ Normal(0, 1)")
         ax.grid(True, alpha=0.3)
 
     for j in range(len(ALL_PREFIXES), len(axes.flatten())):
-        axes.flatten()[j].axis('off')
+        axes.flatten()[j].axis("off")
 
     plt.tight_layout()
     if out_path is not None:
@@ -1355,12 +1416,18 @@ def plot_qq(subset: pl.DataFrame,
     plt.show()
 
 
-plot_qq(WITH_MODEL_OUTPUTS.filter(pl.col('is_train')),
-        out_path=RESULTS_DIRS['overall'] / 'qq_train.png')
-plot_qq(WITH_MODEL_OUTPUTS.filter(~pl.col('is_train')),
-        out_path=RESULTS_DIRS['overall'] / 'qq_val.png')
-plot_qq(WITH_MODEL_OUTPUTS.filter(pl.col('time').dt.date() == datetime.date(2025, 10, 10)),
-        out_path=RESULTS_DIRS['overall'] / 'qq_10-10.png')
+plot_qq(
+    WITH_MODEL_OUTPUTS.filter(pl.col("is_train")),
+    out_path=RESULTS_DIRS["overall"] / "qq_train.png",
+)
+plot_qq(
+    WITH_MODEL_OUTPUTS.filter(~pl.col("is_train")),
+    out_path=RESULTS_DIRS["overall"] / "qq_val.png",
+)
+plot_qq(
+    WITH_MODEL_OUTPUTS.filter(pl.col("time").dt.date() == datetime.date(2025, 10, 10)),
+    out_path=RESULTS_DIRS["overall"] / "qq_10-10.png",
+)
 
 
 # %%

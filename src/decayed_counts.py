@@ -1,4 +1,3 @@
-
 import jax
 import jax.numpy as jnp
 import pytest
@@ -21,6 +20,7 @@ def calculate_decayed_counts(decay_factors: Array, counts: Array) -> Array:
 
 def get_scan_baseline(decay_factors: Array, counts: Array) -> Array:
     """Reference implementation using sequential jax.lax.scan."""
+
     @jax.jit
     def linear_scan_step(carry, xs):
         prev_decayed = carry
@@ -51,17 +51,20 @@ def test_decayed_counts_correctness(seed):
 
 
 @pytest.mark.parametrize("n", [1_000_000, 10_000_000, 100_000_000])
-@pytest.mark.parametrize("func", [
-    calculate_decayed_counts,
-    get_scan_baseline,
-])
+@pytest.mark.parametrize(
+    "func",
+    [
+        calculate_decayed_counts,
+        get_scan_baseline,
+    ],
+)
 def test_performance(benchmark, n, func):
     """
     Optional: Performance regression check.
     Note: Real-world benchmarks usually belong in a separate suite (e.g., pytest-benchmark).
     """
 
-    benchmark.group = f'size-{n:,}'
+    benchmark.group = f"size-{n:,}"
 
     key = jax.random.PRNGKey(0)
 
