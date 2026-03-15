@@ -260,9 +260,6 @@ class ModelOutput(NamedTuple):
         return self.point_term - self.compensator
 
 
-type ModelFn[Params: chex.ArrayTree] = Callable[[Params, Dataset], ModelOutput]
-
-
 class FitDiagnostics(NamedTuple):
     results_df: pd.DataFrame
     hess_corr_mat: np.ndarray
@@ -273,27 +270,27 @@ class FitDiagnostics(NamedTuple):
 
 def compute_fit_diagnostics[Params: chex.ArrayTree](
     params: Params,
-    dataset: Dataset,
-    model_fn: ModelFn[Params],
+    per_obs_loss_fn: Callable,
+    n_samples: int,
+    data: chex.ArrayTree = None,
 ) -> FitDiagnostics:
     flat_params, unravel = ravel_pytree(params)
     n_params = len(flat_params)
     assert n_params <= 1_000, f"{n_params=}, hessian is memory intensive"
     labels = get_pytree_labels(params)
 
-    def per_obs_loss(flat_p, dataset):
-        out = model_fn(unravel(flat_p), dataset)
-        return -out.loglik + out.reg_penalty / dataset.n_samples
+    def flat_per_obs_loss(flat_p, data):
+        return per_obs_loss_fn(unravel(flat_p), data=data)
 
-    def flat_loss(flat_p, dataset):
-        return jnp.mean(per_obs_loss(flat_p, dataset))
+    def flat_loss(flat_p, data):
+        return jnp.mean(flat_per_obs_loss(flat_p, data))
 
     calc_hess = chex.chexify(jax.jit(jax.hessian(flat_loss)))
-    calc_jacobian = chex.chexify(jax.jit(jax.jacfwd(per_obs_loss)))
+    calc_jacobian = chex.chexify(jax.jit(jax.jacfwd(flat_per_obs_loss)))
 
     print("calculating hessian")
     start_time = datetime.datetime.now()
-    hess_mat = calc_hess(flat_params, dataset=dataset)
+    hess_mat = calc_hess(flat_params, data)
     hess_mat.block_until_ready()
     print(f"hessian took {datetime.datetime.now() - start_time}")
 
@@ -304,19 +301,19 @@ def compute_fit_diagnostics[Params: chex.ArrayTree](
     cond = jnp.linalg.cond(hess_mat).item()
     inv_hess_mat = jnp.linalg.pinv(hess_mat)
     diag_sqrt = jnp.sqrt(jnp.diag(inv_hess_mat))
-    hess_se = diag_sqrt / jnp.sqrt(dataset.n_samples)
+    hess_se = diag_sqrt / jnp.sqrt(n_samples)
     hess_corr_mat = inv_hess_mat / jnp.outer(diag_sqrt, diag_sqrt)
     mask = np.triu(np.ones_like(hess_corr_mat, dtype=bool))
 
     print("calculating sandwich estimator errors")
     start_time = datetime.datetime.now()
-    jacobian = calc_jacobian(flat_params, dataset)
-    assert jacobian.shape == (dataset.n_samples, n_params), (
-        f"{jacobian.shape=}, {dataset.n_samples=}, {n_params=}"
+    jacobian = calc_jacobian(flat_params, data)
+    assert jacobian.shape == (n_samples, n_params), (
+        f"{jacobian.shape=}, {n_samples=}, {n_params=}"
     )
-    meat = (jacobian.T @ jacobian) / dataset.n_samples
+    meat = (jacobian.T @ jacobian) / n_samples
     bread = inv_hess_mat
-    robust_var = (bread @ meat @ bread) / dataset.n_samples
+    robust_var = (bread @ meat @ bread) / n_samples
     robust_se = jnp.sqrt(jnp.diag(robust_var))
     robust_se.block_until_ready()
     print(f"errors took {datetime.datetime.now() - start_time}")
@@ -385,13 +382,16 @@ class OptimResult[Params: chex.ArrayTree](NamedTuple):
     params: Params
     convergence_stats: pd.Series
     optim_df: pd.DataFrame | None
-    diagnostics: FitDiagnostics
+    diagnostics: FitDiagnostics | None = None
 
 
 def run_optim_pure[Params: chex.ArrayTree](
     init_params: Params,
-    model_fn: ModelFn[Params],
-    dataset: Dataset,
+    loss_fn: Callable,
+    data: chex.ArrayTree,
+    *,
+    per_obs_loss_fn: Callable,
+    n_samples: int,
     verbose: bool = False,
 ) -> OptimResult[Params]:
     timeout = datetime.timedelta(seconds=150)
@@ -405,17 +405,13 @@ def run_optim_pure[Params: chex.ArrayTree](
         ),
     )
 
-    def loss_fn(params: Params, dataset: Dataset) -> Array:
-        output = model_fn(params, dataset)
-        return -output.loglik.mean() + output.reg_penalty / dataset.n_samples
-
     value_and_grad_fun = optax.value_and_grad_from_state(loss_fn)
 
     @chex.chexify
     @jax.jit
-    def update(carry, dataset):
+    def update(carry, data):
         params, state, *_ = carry
-        value, grad = value_and_grad_fun(params, state=state, dataset=dataset)
+        value, grad = value_and_grad_fun(params, state=state, data=data)
         updates, state = opt.update(
             grad,
             state,
@@ -423,7 +419,7 @@ def run_optim_pure[Params: chex.ArrayTree](
             value=value,
             grad=grad,
             value_fn=loss_fn,
-            dataset=dataset,
+            data=data,
         )
         params = optax.apply_updates(params, updates)
         return params, state, value, grad
@@ -441,7 +437,7 @@ def run_optim_pure[Params: chex.ArrayTree](
     converged = False
 
     while True:
-        params, state, loss, grad = update((params, state), dataset=dataset)
+        params, state, loss, grad = update((params, state), data=data)
         _, _, linesearch_state = state
 
         assert isinstance(linesearch_state, optax.ScaleByZoomLinesearchState), (
@@ -501,7 +497,11 @@ def run_optim_pure[Params: chex.ArrayTree](
     )
     optim_df = pd.concat([metrics_df, params_df, grads_df], axis=1).astype(float)
 
-    diagnostics = compute_fit_diagnostics(params, dataset, model_fn)
+    diagnostics = None
+    if per_obs_loss_fn is not None and n_samples is not None:
+        diagnostics = compute_fit_diagnostics(
+            params, per_obs_loss_fn, n_samples, data=data
+        )
 
     return OptimResult(
         params=params,
@@ -547,21 +547,32 @@ def plot_optim(result: OptimResult, *, out_dir: Path) -> None:
     plt.show()
     display(result.optim_df)
 
-    plot_fit_diagnostics(result.diagnostics, out_dir=out_dir)
+    if result.diagnostics is not None:
+        plot_fit_diagnostics(result.diagnostics, out_dir=out_dir)
 
 
 def run_optim[Params: chex.ArrayTree](
     init_params: Params,
-    model_fn: ModelFn[Params],
+    model_fn: Callable[[Params, Dataset], ModelOutput],
     dataset: Dataset,
     verbose: bool = False,
     *,
     out_dir: Path,
 ) -> Params:
+    def loss_fn(params: Params, *, data: Dataset) -> Array:
+        output = model_fn(params, data)
+        return -output.loglik.mean() + output.reg_penalty / data.n_samples
+
+    def per_obs_loss_fn(params: Params, *, data: Dataset) -> Array:
+        output = model_fn(params, data)
+        return -output.loglik + output.reg_penalty / data.n_samples
+
     optim_res = run_optim_pure(
         init_params=init_params,
-        model_fn=model_fn,
-        dataset=dataset,
+        loss_fn=loss_fn,
+        data=dataset,
+        per_obs_loss_fn=per_obs_loss_fn,
+        n_samples=dataset.n_samples,
         verbose=verbose,
     )
     plot_optim(optim_res, out_dir=out_dir)
@@ -1206,7 +1217,7 @@ DATASET_INCLUDING_VALIDATION_DATA = create_dataset(INPUT_DF)
 
 
 def _calc_model_outputs[Params: chex.ArrayTree](
-    prefix: str, params: Params, model_fn: ModelFn[Params]
+    prefix: str, params: Params, model_fn: Callable[[Params, Dataset], ModelOutput]
 ) -> dict[str, np.ndarray]:
     # full dataset is used to avoid bias from a separate "warm up" step
     # without having to pass state across datasets
