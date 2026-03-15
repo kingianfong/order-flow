@@ -325,20 +325,13 @@ Table 10: rbf diagnostics
   <br>Fig 8: rbf inverse Hessian
 </p>
 </details>
-<details>
-<summary>Convergence</summary>
-<p align="center">
-  <img src="results/rbf/optim_outputs.png" width="90%">
-  <br>Fig 9: rbf convergence
-</p>
-</details>
 
 
 <details>
 <summary>Seasonal Basis Functions</summary>
 <p align="center">
   <img src="results/rbf/bases.png" width="90%">
-  <br>Fig 10: rbf bases
+  <br>Fig 9: rbf bases
 </p>
 </details>
 
@@ -346,7 +339,7 @@ Table 10: rbf diagnostics
 <summary>Predictions</summary>
 <p align="center">
   <img src="results/rbf/counts.png" width="90%">
-  <br>Fig 11: rbf predictions
+  <br>Fig 10: rbf predictions
 </p>
 </details>
 
@@ -393,14 +386,7 @@ Table 12: hawkes diagnostics
 <summary>Inverse Hessian</summary>
 <p align="center">
   <img src="results/hawkes/inv_hessian.png" width="90%">
-  <br>Fig 12: hawkes inverse Hessian
-</p>
-</details>
-<details>
-<summary>Convergence</summary>
-<p align="center">
-  <img src="results/hawkes/optim_outputs.png" width="90%">
-  <br>Fig 13: hawkes convergence
+  <br>Fig 11: hawkes inverse Hessian
 </p>
 </details>
 
@@ -409,7 +395,7 @@ Table 12: hawkes diagnostics
 <summary>Predictions</summary>
 <p align="center">
   <img src="results/hawkes/counts.png" width="90%">
-  <br>Fig 14: hawkes predictions
+  <br>Fig 12: hawkes predictions
 </p>
 </details>
 
@@ -484,14 +470,7 @@ Table 14: rbf_hawkes diagnostics
 <summary>Inverse Hessian</summary>
 <p align="center">
   <img src="results/rbf_hawkes/inv_hessian.png" width="90%">
-  <br>Fig 15: rbf_hawkes inverse Hessian
-</p>
-</details>
-<details>
-<summary>Convergence</summary>
-<p align="center">
-  <img src="results/rbf_hawkes/optim_outputs.png" width="90%">
-  <br>Fig 16: rbf_hawkes convergence
+  <br>Fig 13: rbf_hawkes inverse Hessian
 </p>
 </details>
 
@@ -500,7 +479,7 @@ Table 14: rbf_hawkes diagnostics
 <summary>Seasonal Basis Functions</summary>
 <p align="center">
   <img src="results/rbf_hawkes/bases.png" width="90%">
-  <br>Fig 17: rbf_hawkes bases
+  <br>Fig 14: rbf_hawkes bases
 </p>
 </details>
 
@@ -508,7 +487,7 @@ Table 14: rbf_hawkes diagnostics
 <summary>Predictions</summary>
 <p align="center">
   <img src="results/rbf_hawkes/counts.png" width="90%">
-  <br>Fig 18: rbf_hawkes predictions
+  <br>Fig 15: rbf_hawkes predictions
 </p>
 </details>
 
@@ -558,14 +537,7 @@ Table 16: pl_hawkes diagnostics
 <summary>Inverse Hessian</summary>
 <p align="center">
   <img src="results/pl_hawkes/inv_hessian.png" width="90%">
-  <br>Fig 19: pl_hawkes inverse Hessian
-</p>
-</details>
-<details>
-<summary>Convergence</summary>
-<p align="center">
-  <img src="results/pl_hawkes/optim_outputs.png" width="90%">
-  <br>Fig 20: pl_hawkes convergence
+  <br>Fig 16: pl_hawkes inverse Hessian
 </p>
 </details>
 
@@ -574,7 +546,7 @@ Table 16: pl_hawkes diagnostics
 <summary>Predictions</summary>
 <p align="center">
   <img src="results/pl_hawkes/counts.png" width="90%">
-  <br>Fig 21: pl_hawkes predictions
+  <br>Fig 17: pl_hawkes predictions
 </p>
 </details>
 

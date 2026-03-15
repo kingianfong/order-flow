@@ -4,7 +4,6 @@
 from pathlib import Path
 from typing import NamedTuple, Callable
 import datetime
-import re
 
 from IPython.display import display
 from jax import Array
@@ -381,7 +380,6 @@ def plot_fit_diagnostics(diag: FitDiagnostics, *, out_dir: Path) -> None:
 class OptimResult[Params: chex.ArrayTree](NamedTuple):
     params: Params
     convergence_stats: pd.Series
-    optim_df: pd.DataFrame | None
     diagnostics: FitDiagnostics | None = None
 
 
@@ -430,10 +428,6 @@ def run_optim_pure[Params: chex.ArrayTree](
     start_time = datetime.datetime.now()
     n_iter = 0
     n_linesearch = 0
-    params_hist = []
-    losses_hist = []
-    grads_hist = []
-    grad_norms = []
     converged = False
 
     while True:
@@ -445,10 +439,6 @@ def run_optim_pure[Params: chex.ArrayTree](
         )
         n_linesearch += int(linesearch_state.info.num_linesearch_steps)
         grad_norm = optax.tree.norm(grad)
-        params_hist.append(params)
-        losses_hist.append(loss)
-        grads_hist.append(grad)
-        grad_norms.append(grad_norm)
 
         elapsed = datetime.datetime.now() - start_time
         if grad_norm <= tol:
@@ -459,43 +449,19 @@ def run_optim_pure[Params: chex.ArrayTree](
             print("did not converge")
             break
 
-    jax.block_until_ready((losses_hist, grads_hist))
+    jax.block_until_ready(grad_norm)
     elapsed = datetime.datetime.now() - start_time
-    labels = get_pytree_labels(params)
+    n_params = len(ravel_pytree(params)[0])
 
     convergence_stats = pd.Series(
         dict(
             converged=converged,
             n_iter=n_iter,
             n_linesearch=n_linesearch,
-            n_params=len(labels),
+            n_params=n_params,
             elapsed_seconds=elapsed.total_seconds(),
         ),
     )
-
-    def _get_key(label):
-        return re.sub(r"\[\d+\]", "[]", label)
-
-    metrics_df = pd.DataFrame(
-        dict(loss=losses_hist, grad_norm=grad_norms),
-    )
-    params_df = (
-        pd.DataFrame(
-            list(ravel_pytree(p)[0] for p in params_hist),
-            columns=labels,
-        )
-        .rename(columns=lambda x: f"{x} values")
-        .sort_index(axis=1)
-    )
-    grads_df = (
-        pd.DataFrame(
-            list(ravel_pytree(g)[0] for g in grads_hist),
-            columns=labels,
-        )
-        .rename(columns=lambda x: f"{x} grads")
-        .sort_index(axis=1)
-    )
-    optim_df = pd.concat([metrics_df, params_df, grads_df], axis=1).astype(float)
 
     diagnostics = None
     if per_obs_loss_fn is not None and n_samples is not None:
@@ -506,7 +472,6 @@ def run_optim_pure[Params: chex.ArrayTree](
     return OptimResult(
         params=params,
         convergence_stats=convergence_stats,
-        optim_df=optim_df,
         diagnostics=diagnostics,
     )
 
@@ -514,38 +479,6 @@ def run_optim_pure[Params: chex.ArrayTree](
 def plot_optim(result: OptimResult, *, out_dir: Path) -> None:
     display(result.convergence_stats.to_frame())
     result.convergence_stats.to_json(out_dir / "convergence_stats.json", indent=2)
-    assert result.optim_df is not None
-
-    last_grad_norm = result.optim_df["grad_norm"].iloc[-1]
-    print(f"{last_grad_norm=:.4f}")
-
-    def _get_key(col):
-        return re.sub(r"\[\d+\]", "[]", col)
-
-    col_keys = {col: _get_key(col) for col in result.optim_df.columns}
-    unique_keys = sorted(set(col_keys.values()), key=lambda x: (x.startswith("."), x))
-    n_rows = len(unique_keys)
-    f, axes = plt.subplots(n_rows, 1, sharex=True, figsize=(8, 1 + n_rows * 2))
-    key_to_ax = dict(zip(unique_keys, axes))
-
-    assert n_rows > 1
-    for col in result.optim_df.columns:
-        if col.endswith("grads"):
-            color = "C1"
-        elif col.endswith("values"):
-            color = "C2"
-        else:
-            color = "C0"
-        key = _get_key(col)
-        ax = key_to_ax[key]
-        ax.set_title(key, color=color)
-        ax.plot(result.optim_df[col], drawstyle="steps-post")
-        ax.grid(True, which="both", ls="--", alpha=0.2)
-
-    plt.tight_layout()
-    plt.savefig(out_dir / "optim_outputs.png")
-    plt.show()
-    display(result.optim_df)
 
     if result.diagnostics is not None:
         plot_fit_diagnostics(result.diagnostics, out_dir=out_dir)
