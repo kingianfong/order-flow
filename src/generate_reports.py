@@ -104,10 +104,6 @@ $$
 <summary>Inverse Hessian</summary>
 {{ inv_hessian }}
 </details>
-<details>
-<summary>Convergence</summary>
-{{ convergence }}
-</details>
 {% endif %}
 {% if prefix in ["rbf", "rbf_hawkes"] %}
 <details>
@@ -159,9 +155,6 @@ $$
     if prefix != "constant":
         render_kwargs["inv_hessian"] = image(
             f"{prefix}/inv_hessian.png", f"{prefix} inverse Hessian"
-        )
-        render_kwargs["convergence"] = image(
-            f"{prefix}/optim_outputs.png", f"{prefix} convergence"
         )
     if prefix.startswith("rbf"):
         render_kwargs["bases"] = image(f"{prefix}/bases.png", f"{prefix} bases")
