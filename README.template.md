@@ -199,13 +199,12 @@ This work provides a baseline for future research into multivariate (buy, sell) 
 
 ### Reproduction
 ```
-conda env create -f environment.yml
-conda activate order-flow
-python src/download_trades.py
-python src/point_process.py
+uv sync
+uv run src/download_trades.py
+uv run src/point_process.py
 
 # optional: regenerate README.md
-python src/generate_reports.py
+uv run src/generate_reports.py
 ```
 
 ### Notable Libraries

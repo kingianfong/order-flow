@@ -5,7 +5,7 @@
 !README.template.md
 !.gitignore
 !LICENSE
-!environment.yml
+!pyproject.toml
 
 !src
 !src/**

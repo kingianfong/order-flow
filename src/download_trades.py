@@ -91,7 +91,7 @@ def download_and_save(sym_date: tuple[str, datetime.date]) -> None:
 
 def main():
     print(f"downloading to {OUTPUT_DIR}")
-    OUTPUT_DIR.mkdir(parents=False, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     with ThreadPoolExecutor(max_workers=8) as executor:
         executor.map(download_and_save, itertools.product(SYMBOLS, DATES))
