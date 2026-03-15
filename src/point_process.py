@@ -263,9 +263,19 @@ class ModelOutput(NamedTuple):
 type ModelFn[Params: chex.ArrayTree] = Callable[[Params, Dataset], ModelOutput]
 
 
-def plot_fit_diagnostics[Params: chex.ArrayTree](
-    params: Params, dataset: Dataset, model_fn: ModelFn[Params], *, out_dir: Path
-) -> None:
+class FitDiagnostics(NamedTuple):
+    results_df: pd.DataFrame
+    hess_corr_mat: np.ndarray
+    mask: np.ndarray
+    cond: float
+    labels: list[str]
+
+
+def compute_fit_diagnostics[Params: chex.ArrayTree](
+    params: Params,
+    dataset: Dataset,
+    model_fn: ModelFn[Params],
+) -> FitDiagnostics:
     flat_params, unravel = ravel_pytree(params)
     n_params = len(flat_params)
     assert n_params <= 1_000, f"{n_params=}, hessian is memory intensive"
@@ -298,22 +308,7 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](
     hess_corr_mat = inv_hess_mat / jnp.outer(diag_sqrt, diag_sqrt)
     mask = np.triu(np.ones_like(hess_corr_mat, dtype=bool))
 
-    print("plotting hessian")
-    start_time = datetime.datetime.now()
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(
-        data=pd.DataFrame(hess_corr_mat, index=labels, columns=labels),
-        mask=mask,
-        center=0.0,
-        robust=False,
-    )
-    plt.title(f"Inverse Hessian Matrix {cond=:.2f}")
-    plt.tight_layout()
-    plt.savefig(out_dir / "inv_hessian.png")
-    plt.show()
-    print(f"plotting took {datetime.datetime.now() - start_time}")
-
-    print("calculating sandwich estimator errors")  # Var = B^-1 @ A @ B^-1
+    print("calculating sandwich estimator errors")
     start_time = datetime.datetime.now()
     jacobian = calc_jacobian(flat_params, dataset)
     assert jacobian.shape == (dataset.n_samples, n_params), (
@@ -321,7 +316,6 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](
     )
     meat = (jacobian.T @ jacobian) / dataset.n_samples
     bread = inv_hess_mat
-    # aka godambe information matrix
     robust_var = (bread @ meat @ bread) / dataset.n_samples
     robust_se = jnp.sqrt(jnp.diag(robust_var))
     robust_se.block_until_ready()
@@ -343,10 +337,36 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](
         ),
         index=labels,
     )
-    results_df.to_csv(out_dir / f"diagnostics.csv")
+
+    return FitDiagnostics(
+        results_df=results_df,
+        hess_corr_mat=np.asarray(hess_corr_mat),
+        mask=mask,
+        cond=cond,
+        labels=labels,
+    )
+
+
+def plot_fit_diagnostics(diag: FitDiagnostics, *, out_dir: Path) -> None:
+    diag.results_df.to_csv(out_dir / "diagnostics.csv")
+
+    print("plotting hessian")
+    start_time = datetime.datetime.now()
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(
+        data=pd.DataFrame(diag.hess_corr_mat, index=diag.labels, columns=diag.labels),
+        mask=diag.mask,
+        center=0.0,
+        robust=False,
+    )
+    plt.title(f"Inverse Hessian Matrix cond={diag.cond:.2f}")
+    plt.tight_layout()
+    plt.savefig(out_dir / "inv_hessian.png")
+    plt.show()
+    print(f"plotting took {datetime.datetime.now() - start_time}")
 
     display(
-        results_df.style.background_gradient(
+        diag.results_df.style.background_gradient(
             subset=["hess_se", "robust_se", "se_ratio"],
         ).format(
             dict(
@@ -361,14 +381,19 @@ def plot_fit_diagnostics[Params: chex.ArrayTree](
     )
 
 
-def run_optim[Params: chex.ArrayTree](
+class OptimResult[Params: chex.ArrayTree](NamedTuple):
+    params: Params
+    convergence_stats: pd.Series
+    optim_df: pd.DataFrame | None
+    diagnostics: FitDiagnostics
+
+
+def run_optim_pure[Params: chex.ArrayTree](
     init_params: Params,
     model_fn: ModelFn[Params],
     dataset: Dataset,
     verbose: bool = False,
-    *,
-    out_dir: Path,
-) -> Params:
+) -> OptimResult[Params]:
     timeout = datetime.timedelta(seconds=150)
     max_iter = 50
     tol = 1e-3
@@ -407,7 +432,6 @@ def run_optim[Params: chex.ArrayTree](
     state = opt.init(init_params)
 
     start_time = datetime.datetime.now()
-    elapsed = datetime.timedelta()
     n_iter = 0
     n_linesearch = 0
     params_hist = []
@@ -416,7 +440,6 @@ def run_optim[Params: chex.ArrayTree](
     grad_norms = []
     converged = False
 
-    # this loop may force syncs between GPU and CPU
     while True:
         params, state, loss, grad = update((params, state), dataset=dataset)
         _, _, linesearch_state = state
@@ -443,6 +466,7 @@ def run_optim[Params: chex.ArrayTree](
     jax.block_until_ready((losses_hist, grads_hist))
     elapsed = datetime.datetime.now() - start_time
     labels = get_pytree_labels(params)
+
     convergence_stats = pd.Series(
         dict(
             converged=converged,
@@ -452,73 +476,96 @@ def run_optim[Params: chex.ArrayTree](
             elapsed_seconds=elapsed.total_seconds(),
         ),
     )
-    display(convergence_stats.to_frame())
 
-    if out_dir is not None:
-        convergence_stats.to_json(out_dir / "convergence_stats.json", indent=2)
+    def _get_key(label):
+        return re.sub(r"\[\d+\]", "[]", label)
 
-    if out_dir is not None or not converged:
-        last_grad_norm = grad_norms[-1]
-        print(f"{last_grad_norm=:.4f}")
-
-        def _get_key(label):
-            return re.sub(r"\[\d+\]", "[]", label)
-
-        metrics_df = pd.DataFrame(
-            dict(
-                loss=losses_hist,
-                grad_norm=grad_norms,
-            ),
+    metrics_df = pd.DataFrame(
+        dict(loss=losses_hist, grad_norm=grad_norms),
+    )
+    params_df = (
+        pd.DataFrame(
+            list(ravel_pytree(p)[0] for p in params_hist),
+            columns=labels,
         )
-        params_df = (
-            pd.DataFrame(
-                list(ravel_pytree(p)[0] for p in params_hist),
-                columns=labels,
-            )
-            .rename(columns=lambda x: f"{x} values")
-            .sort_index(axis=1)
+        .rename(columns=lambda x: f"{x} values")
+        .sort_index(axis=1)
+    )
+    grads_df = (
+        pd.DataFrame(
+            list(ravel_pytree(g)[0] for g in grads_hist),
+            columns=labels,
         )
-        grads_df = (
-            pd.DataFrame(
-                list(ravel_pytree(g)[0] for g in grads_hist),
-                columns=labels,
-            )
-            .rename(columns=lambda x: f"{x} grads")
-            .sort_index(axis=1)
-        )
-        optim_df = pd.concat([metrics_df, params_df, grads_df], axis=1).astype(float)
+        .rename(columns=lambda x: f"{x} grads")
+        .sort_index(axis=1)
+    )
+    optim_df = pd.concat([metrics_df, params_df, grads_df], axis=1).astype(float)
 
-        col_keys = {col: _get_key(col) for col in optim_df.columns}
-        unique_keys = sorted(
-            set(col_keys.values()), key=lambda x: (x.startswith("."), x)
-        )
-        n_rows = len(unique_keys)
-        f, axes = plt.subplots(n_rows, 1, sharex=True, figsize=(8, 1 + n_rows * 2))
-        key_to_ax = dict(zip(unique_keys, axes))
+    diagnostics = compute_fit_diagnostics(params, dataset, model_fn)
 
-        assert n_rows > 1
-        for col in optim_df.columns:
-            if col.endswith("grads"):
-                color = "C1"
-            elif col.endswith("values"):
-                color = "C2"
-            else:
-                color = "C0"
-            key = _get_key(col)
-            ax = key_to_ax[key]
-            ax.set_title(key, color=color)
-            ax.plot(optim_df[col], drawstyle="steps-post")
-            ax.grid(True, which="both", ls="--", alpha=0.2)
+    return OptimResult(
+        params=params,
+        convergence_stats=convergence_stats,
+        optim_df=optim_df,
+        diagnostics=diagnostics,
+    )
 
-        plt.tight_layout()
-        if out_dir is not None:
-            plt.savefig(out_dir / "optim_outputs.png")
-        plt.show()
-        display(optim_df)
 
-    plot_fit_diagnostics(params, dataset, model_fn, out_dir=out_dir)
+def plot_optim(result: OptimResult, *, out_dir: Path) -> None:
+    display(result.convergence_stats.to_frame())
+    result.convergence_stats.to_json(out_dir / "convergence_stats.json", indent=2)
+    assert result.optim_df is not None
 
-    return params
+    last_grad_norm = result.optim_df["grad_norm"].iloc[-1]
+    print(f"{last_grad_norm=:.4f}")
+
+    def _get_key(col):
+        return re.sub(r"\[\d+\]", "[]", col)
+
+    col_keys = {col: _get_key(col) for col in result.optim_df.columns}
+    unique_keys = sorted(set(col_keys.values()), key=lambda x: (x.startswith("."), x))
+    n_rows = len(unique_keys)
+    f, axes = plt.subplots(n_rows, 1, sharex=True, figsize=(8, 1 + n_rows * 2))
+    key_to_ax = dict(zip(unique_keys, axes))
+
+    assert n_rows > 1
+    for col in result.optim_df.columns:
+        if col.endswith("grads"):
+            color = "C1"
+        elif col.endswith("values"):
+            color = "C2"
+        else:
+            color = "C0"
+        key = _get_key(col)
+        ax = key_to_ax[key]
+        ax.set_title(key, color=color)
+        ax.plot(result.optim_df[col], drawstyle="steps-post")
+        ax.grid(True, which="both", ls="--", alpha=0.2)
+
+    plt.tight_layout()
+    plt.savefig(out_dir / "optim_outputs.png")
+    plt.show()
+    display(result.optim_df)
+
+    plot_fit_diagnostics(result.diagnostics, out_dir=out_dir)
+
+
+def run_optim[Params: chex.ArrayTree](
+    init_params: Params,
+    model_fn: ModelFn[Params],
+    dataset: Dataset,
+    verbose: bool = False,
+    *,
+    out_dir: Path,
+) -> Params:
+    optim_res = run_optim_pure(
+        init_params=init_params,
+        model_fn=model_fn,
+        dataset=dataset,
+        verbose=verbose,
+    )
+    plot_optim(optim_res, out_dir=out_dir)
+    return optim_res.params
 
 
 def softplus_inverse(x: ArrayLike) -> Array:
